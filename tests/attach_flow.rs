@@ -462,6 +462,51 @@ async fn an_oversized_b64_field_is_413() {
     assert!(stub.calls.lock().expect("stub mutex").is_empty());
 }
 
+/// The three malformed-payload refusals (bad base64, bad gzip, non-UTF-8
+/// content) all answer 400 without touching Discourse. They are refusals the
+/// reporter sees as a generic failure, so the handler traces each branch;
+/// these tests pin that the wire contract stays a plain 400 while it does.
+#[tokio::test]
+async fn a_malformed_payload_is_400_and_never_reaches_discourse() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+
+    let bad_gzip = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"not a gzip stream",
+    );
+    let non_utf8 = {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[0xff, 0xfe, 0x80, 0x00])
+            .expect("gzip write");
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            enc.finish().expect("gzip finish"),
+        )
+    };
+    for (nonce, log_gz_b64) in [
+        ([20u8; 16], "%%%not-base64%%%".to_owned()),
+        ([21u8; 16], bad_gzip),
+        ([22u8; 16], non_utf8),
+    ] {
+        let sid = state.attach.create(42, now_unix()).expect("create");
+        let body = format!(r#"{{"sid":"{sid}","topic_id":42,"log_gz_b64":"{log_gz_b64}"}}"#);
+        let response = router(state.clone())
+            .oneshot(signed_attach_request(&key, &body, nonce))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(stub.calls.lock().expect("stub mutex").is_empty());
+}
+
 #[tokio::test]
 async fn garbage_headers_are_unauthorized() {
     let key = SigningKey::from_bytes(&[7u8; 32]);

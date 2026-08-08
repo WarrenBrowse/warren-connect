@@ -729,8 +729,23 @@ async fn forum_attach_logs(
         &state.nonces,
     )?;
 
-    let req: AttachLogsBody = serde_json::from_slice(&body).map_err(|_| AuthError::Payload)?;
+    // Every refusal below reaches the reporter as a generic failure, so each
+    // branch names itself here: without this, four attach attempts against a
+    // live service left zero server-side trace and the incident was
+    // reconstructed from Discourse's request log alone.
+    let req: AttachLogsBody = serde_json::from_slice(&body).map_err(|_| {
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            "attach-logs refused: body is not valid JSON"
+        );
+        AuthError::Payload
+    })?;
     if req.log_gz_b64.len() > attach::MAX_LOG_GZ_B64_CHARS {
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            b64_chars = req.log_gz_b64.len(),
+            "attach-logs refused: base64 field over the size cap"
+        );
         return Err(AuthError::PayloadTooLarge);
     }
     let kind = state.attach.begin(&req.sid, req.topic_id, now)?;
@@ -741,8 +756,20 @@ async fn forum_attach_logs(
     if kind == AttachKind::PreTopic {
         let gz =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.log_gz_b64)
-                .map_err(|_| AuthError::Payload)?;
-        let log_text = attach::gunzip_capped(&gz)?;
+                .map_err(|_| {
+                    tracing::info!(
+                        pubkey = %redact(&identity.pubkey_ss58),
+                        "attach-logs refused: log_gz_b64 is not valid base64"
+                    );
+                    AuthError::Payload
+                })?;
+        let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
+            tracing::info!(
+                pubkey = %redact(&identity.pubkey_ss58),
+                gz_bytes = gz.len(),
+                "attach-logs refused: payload does not gunzip to UTF-8 under the cap"
+            );
+        })?;
         let (version, os) = attach::parse_report_metadata(&log_text);
         state
             .attach
@@ -772,8 +799,22 @@ async fn forum_attach_logs(
     }
 
     let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.log_gz_b64)
-        .map_err(|_| AuthError::Payload)?;
-    let log_text = attach::gunzip_capped(&gz)?;
+        .map_err(|_| {
+            tracing::info!(
+                pubkey = %redact(&identity.pubkey_ss58),
+                topic_id = req.topic_id,
+                "attach-logs refused: log_gz_b64 is not valid base64"
+            );
+            AuthError::Payload
+        })?;
+    let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            topic_id = req.topic_id,
+            gz_bytes = gz.len(),
+            "attach-logs refused: payload does not gunzip to UTF-8 under the cap"
+        );
+    })?;
     let meta = attach::parse_report_metadata(&log_text);
 
     // Discourse writes; the session is marked done only after all of them, so
