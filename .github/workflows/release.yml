@@ -1,0 +1,201 @@
+name: Release
+
+# Build the static musl binary and publish the runtime image to GHCR.
+#
+# Trigger: `push` of a `v*` tag, or a manual dispatch to rebuild a ref after a
+# registry prune. Tag-only by design, matching warren-core: a push to `main`
+# builds nothing.
+#
+# Before this existed the image was produced by hand, from a binary
+# cross-compiled on somebody's machine and copied onto the forum host, so
+# shipping a fix meant compiling on the production box. Deploying is now
+# `docker compose pull` against a tag anyone can cut.
+#
+# Compile-on-runner, never inside `docker build`: the x64 pool is a Rosetta
+# container, and inside BuildKit there is no PID-1 reaper, so a rustc that
+# crashes under emulation becomes a zombie holding its GNU jobserver token and
+# cargo waits forever. Same rationale, same shape as warren-core's docker.yml.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # GHCR requires lowercase image paths while `github.repository` preserves the
+  # source casing. The `Lowercase image prefix` step derives the real prefix;
+  # never interpolate this raw value into an image reference.
+  IMAGE_REPO_RAW: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_TARGET: x86_64-unknown-linux-musl
+  # musl-gcc builds the C dependencies (ring). cc-rs only applies a plain CC
+  # when host equals target, so the cross-build needs the target-scoped name.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build + push image
+    runs-on: [self-hosted, linux, x64, docker, warren]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The version guard compares against every existing tag, so the
+          # shallow default would let a lower tag through unnoticed.
+          fetch-depth: 0
+
+      # A shipped version IS its tag here: the operator sets
+      # WARREN_CONNECT_VERSION to the tag and compose pulls that image. So a
+      # wrong tag is a wrongly-labelled deployment, and `git tag -l | tail`
+      # sorts lexicographically (v0.10.0 before v0.9.2), which is exactly how a
+      # regression once shipped as a release elsewhere in this project.
+      - name: Guard the release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          CARGO_VERSION="v$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml $CARGO_VERSION"
+            exit 1
+          fi
+          HIGHEST="$(git tag -l 'v[0-9]*' | sort -V | tail -1)"
+          if [ "$TAG" != "$HIGHEST" ]; then
+            echo "::error::tag $TAG is not the highest version tag ($HIGHEST)"
+            exit 1
+          fi
+          echo "releasing $TAG"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the musl toolchain
+        run: |
+          set -eux
+          rustup target add "$CARGO_TARGET"
+          # The runner's NOPASSWD sudo is scoped to apt, and the image ships
+          # with empty apt lists, so update before install.
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+
+      - name: Build the release binary on the runner
+        run: |
+          set -euo pipefail
+          # $HOME is the runner container's persistent volume, so the target dir
+          # and the cargo registry survive across runs without a cache round-trip.
+          export CARGO_TARGET_DIR="$HOME/warren-connect-target"
+
+          # Retries only the two Rosetta failure modes that are not real errors:
+          # a crashed rustc that never returns its jobserver token (cargo then
+          # waits forever, so `timeout` kills it with 124/137), and an
+          # intermittent SIGSEGV on a random crate. A real compile error fails
+          # on the first pass.
+          retry_flaky() {
+            for attempt in 1 2 3; do
+              if timeout -k 60s 25m "$@" 2>&1 | tee /tmp/cargo-out.txt; then return 0; fi
+              rc=${PIPESTATUS[0]}
+              if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                echo "::warning::cargo hung under Rosetta and was killed (attempt $attempt/3); retrying"
+                continue
+              fi
+              if grep -qE "SIGSEGV|signal: 11|signal: 4|signal: 6|Illegal instruction" /tmp/cargo-out.txt; then
+                echo "::warning::rustc crashed under Rosetta (attempt $attempt/3); retrying"
+                continue
+              fi
+              return "$rc"
+            done
+            return 1
+          }
+
+          retry_flaky cargo build --locked --release --target "$CARGO_TARGET" --bin warren-connect
+
+          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-connect"
+          file "$BIN"
+          # The Dockerfile COPYs from this canonical cargo path, so the context
+          # reproduces it rather than flattening the binary to the root.
+          install -D -m0755 "$BIN" \
+            "$RUNNER_TEMP/ctx/target/$CARGO_TARGET/release/warren-connect"
+          cp Dockerfile "$RUNNER_TEMP/ctx/Dockerfile"
+
+      - name: Lowercase image prefix
+        id: vars
+        env:
+          REPO: ${{ env.IMAGE_REPO_RAW }}
+        run: echo "prefix=${REGISTRY}/${REPO,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.prefix }}
+          # `v`-prefixed, matching the git ref verbatim, so an operator sets
+          # WARREN_CONNECT_VERSION to the tag without stripping anything.
+          tags: |
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=warren-connect
+            org.opencontainers.image.description=Warren wallet-to-SSO identity broker for the community forum
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Warren
+
+      # GHCR's token exchange occasionally answers `denied` on the push, and the
+      # push happens inside build-push-action so no re-login can be slotted
+      # between build and push. The whole step re-runs once (a COPY-only build,
+      # seconds) after a fresh login. A real failure fails twice.
+      - name: Build + push
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/ctx
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Login to GHCR (refresh before push retry)
+        if: steps.build.outcome == 'failure'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push (retry)
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/ctx
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

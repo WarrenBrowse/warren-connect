@@ -1,0 +1,99 @@
+name: CI
+
+# Runs exclusively on the WarrenBrowse org self-hosted runners. Do not switch
+# to a GitHub-hosted runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: fmt + clippy + test
+    # Self-hosted runners: never execute fork PRs. Same-repo PRs and pushes only.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # warren-contract is a private git dependency. The ENGINE_TOKEN secret is
+      # an enrichment, never a precondition: when it is unset the step warns and
+      # falls through to the runner's own git credentials, which can fetch the
+      # dependency on their own. Failing hard on a missing secret would redden
+      # runs the runner could have completed.
+      - name: authenticate the private git dependency (best effort)
+        env:
+          ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          if [ -z "${ENGINE_TOKEN:-}" ]; then
+            echo "::warning::ENGINE_TOKEN is unset; relying on the runner's own git credentials"
+            exit 0
+          fi
+          # Ephemeral XDG_CONFIG_HOME so the token never lands in a persistent
+          # file on a shared runner.
+          mkdir -p "$RUNNER_TEMP/gitconfig/git"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/gitconfig" >> "$GITHUB_ENV"
+          git config --file "$RUNNER_TEMP/gitconfig/git/config" \
+            "url.https://x-access-token:${ENGINE_TOKEN}@github.com/WarrenBrowse/.insteadOf" \
+            "https://github.com/WarrenBrowse/"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Three #[sqlx::test] tests need a real Postgres (DATABASE_URL). The
+      # self-hosted runner has no Docker daemon, so a `services:` container is
+      # unavailable: run a throwaway user-owned cluster from the postgresql
+      # binaries on the runner, exactly as warren-core's CI does. Keeping the two
+      # identical means a runner-image drift is diagnosed once, not twice.
+      - name: Start PostgreSQL for the #[sqlx::test] tests
+        run: |
+          # Auto-detect the installed PostgreSQL bin dir instead of hardcoding a
+          # major version: the runner image's PG version drifts, and a hardcoded
+          # path that vanishes turns `initdb` into exit-127, reddening this gate
+          # on EVERY push, which is how a real regression hides behind a
+          # permanently-red CI everyone learned to ignore.
+          PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$PG_BIN" ]; then
+            echo "postgres not found on runner; installing via apt"
+            sudo apt-get update -qq && sudo apt-get install -y -qq postgresql
+            PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)"
+          fi
+          if [ -z "$PG_BIN" ]; then
+            echo "::error::no PostgreSQL server binaries under /usr/lib/postgresql/*/bin and apt install failed on this runner"
+            exit 1
+          fi
+          echo "using PostgreSQL at $PG_BIN"
+          export PATH="$PG_BIN:$PATH"
+          pkill -u "$(id -u)" -x postgres 2>/dev/null || true
+          PGDATA="$RUNNER_TEMP/pgdata"
+          rm -rf "$PGDATA"
+          initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=trust >/dev/null
+          # -k /tmp: the default unix-socket dir is not writable by the
+          # unprivileged runner user. Tests connect over TCP (localhost:5432).
+          pg_ctl -D "$PGDATA" -o "-p 5432 -k /tmp" -l "$RUNNER_TEMP/pg.log" -w start
+          echo "DATABASE_URL=postgres://postgres@localhost:5432/postgres" >> "$GITHUB_ENV"
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets

@@ -1,0 +1,62 @@
+[package]
+name = "warren-connect"
+version = "0.13.3"
+edition = "2024"
+rust-version = "1.89"
+license = "AGPL-3.0-or-later"
+description = "Warren wallet-to-SSO identity broker: DiscourseConnect provider for the community forum (Ed25519 wallet login, frozen X-Warren canonical request, pairwise public handles, no email, no password)."
+repository = "https://github.com/WarrenBrowse/warren-connect"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+
+[dependencies]
+# Wire contract: SS58 codec + the frozen X-Warren canonical request format.
+warren-contract = { git = "https://github.com/WarrenBrowse/warren-contract.git", branch = "main" }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "migrate", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+urlencoding = "2"
+subtle = "2.6.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+flate2 = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+http-body-util = "0.1"
+sha2 = "0.10"
+tower = "0.5"
+urlencoding = "2"
+
+[profile.release]
+strip = true
+panic = "abort"
+lto = "thin"
