@@ -46,16 +46,35 @@ pub struct SsoUser {
     pub admin: bool,
 }
 
+/// Whether `url` lives on `origin` (scheme, host and port all equal).
+///
+/// A prefix test with the separator included, so `https://forum.example.com`
+/// does not match `https://forum.example.com.attacker.test/`, and no userinfo
+/// (`https://forum.example.com@attacker.test/`) can slip a different host past
+/// it either: both put a character other than `/` where the separator has to be.
+fn on_origin(url: &str, origin: &str) -> bool {
+    url.len() == origin.len() && url == origin
+        || url.len() > origin.len()
+            && url.starts_with(origin)
+            && url.as_bytes().get(origin.len()) == Some(&b'/')
+}
+
 /// Verifies `sig` against the raw `sso` parameter and decodes the payload.
+///
+/// `allowed_return_origin` pins where the signed response may be sent. Only
+/// the holder of the shared secret can craft a payload at all, so this is
+/// defence in depth: it turns a leak of `DISCOURSE_CONNECT_SECRET` from "a
+/// signed open redirect carrying a valid identity assertion" into nothing.
 ///
 /// # Errors
 /// [`AuthError::SsoSignature`] on HMAC mismatch, [`AuthError::SsoMalformed`]
 /// if the payload is not base64 urlencoded form data with the two required
-/// fields.
+/// fields, [`AuthError::SsoReturnUrl`] if it points off the forum origin.
 pub fn verify_incoming(
     sso_b64: &str,
     sig_hex: &str,
     connect_secret: &[u8],
+    allowed_return_origin: &str,
 ) -> Result<IncomingSso, AuthError> {
     // Constant-time comparison via HMAC's own verify (never a plain `==` on the
     // recomputed hex, which would leak the MAC through timing).
@@ -81,6 +100,9 @@ pub fn verify_incoming(
         .get("return_sso_url")
         .cloned()
         .ok_or(AuthError::SsoMalformed)?;
+    if !on_origin(&return_sso_url, allowed_return_origin) {
+        return Err(AuthError::SsoReturnUrl);
+    }
     Ok(IncomingSso {
         nonce,
         return_sso_url,
@@ -155,6 +177,63 @@ fn hmac_hex(secret: &[u8], data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const FORUM: &str = crate::FORUM_PUBLIC_URL;
+
+    #[test]
+    fn a_return_url_off_the_forum_origin_is_refused() {
+        // Reached only by the holder of the shared secret, so this is the
+        // barrier that keeps a leaked secret from turning this endpoint into a
+        // redirector that hands a valid identity assertion to a stranger.
+        let secret = b"a-connect-secret";
+        for hostile in [
+            "https://attacker.test/session/sso_login",
+            // Suffix: the naive `starts_with` without the separator lets this
+            // through, and it is a domain anyone can register.
+            "https://forum.warrenbrowse.com.attacker.test/session/sso_login",
+            // Userinfo: the real host is `attacker.test`.
+            "https://forum.warrenbrowse.com@attacker.test/session/sso_login",
+            // Scheme downgrade on the right host still leaves TLS behind.
+            "http://forum.warrenbrowse.com/session/sso_login",
+        ] {
+            let payload = format!(
+                "nonce=abc123&return_sso_url={}",
+                urlencoding::encode(hostile)
+            );
+            let sso = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                payload.as_bytes(),
+            );
+            let sig = hmac_hex(secret, sso.as_bytes());
+
+            let err = verify_incoming(&sso, &sig, secret, FORUM)
+                .expect_err("a correctly signed payload is still refused off-origin");
+            assert!(
+                matches!(err, AuthError::SsoReturnUrl),
+                "{hostile} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_origin_test_accepts_only_the_forum_itself() {
+        assert!(on_origin(FORUM, FORUM), "the bare origin is the origin");
+        assert!(on_origin(
+            "https://forum.warrenbrowse.com/session/sso_login",
+            FORUM
+        ));
+        assert!(!on_origin(
+            "https://forum.warrenbrowse.com.attacker.test/",
+            FORUM
+        ));
+        assert!(!on_origin(
+            "https://forum.warrenbrowse.com@attacker.test/",
+            FORUM
+        ));
+        assert!(!on_origin("http://forum.warrenbrowse.com/", FORUM));
+        assert!(!on_origin("https://attacker.test/", FORUM));
+        assert!(!on_origin("", FORUM));
+    }
+
     /// The exact example published in the official DiscourseConnect spec
     /// (meta.discourse.org topic 13045): payload with Ruby's trailing
     /// newline, secret `d836444a9e4084d5b224a60c208dce14`.
@@ -164,7 +243,7 @@ mod tests {
         let sig = "2828aa29899722b35a2f191d34ef9b3ce695e0e6eeec47deb46d588d70c7cb56";
         // The example payload has no return_sso_url, so decode stops at
         // signature verification success + missing-field error.
-        let err = verify_incoming(sso, sig, b"d836444a9e4084d5b224a60c208dce14")
+        let err = verify_incoming(sso, sig, b"d836444a9e4084d5b224a60c208dce14", FORUM)
             .expect_err("payload lacks return_sso_url");
         assert!(matches!(err, AuthError::SsoMalformed));
     }
@@ -173,7 +252,7 @@ mod tests {
     fn tampered_signature_is_rejected_before_decoding() {
         let sso = "bm9uY2U9Y2I2ODI1MWVlZmI1MjExZTU4YzAwZmYxMzk1ZjBjMGI=\n";
         let bad = "0000aa29899722b35a2f191d34ef9b3ce695e0e6eeec47deb46d588d70c7cb56";
-        let err = verify_incoming(sso, bad, b"d836444a9e4084d5b224a60c208dce14")
+        let err = verify_incoming(sso, bad, b"d836444a9e4084d5b224a60c208dce14", FORUM)
             .expect_err("wrong HMAC must be rejected");
         assert!(matches!(err, AuthError::SsoSignature));
     }
@@ -188,7 +267,7 @@ mod tests {
         );
         let sig = hmac_hex(secret, sso.as_bytes());
 
-        let parsed = verify_incoming(&sso, &sig, secret).expect("valid payload");
+        let parsed = verify_incoming(&sso, &sig, secret, FORUM).expect("valid payload");
         assert_eq!(parsed.nonce, "abc123");
         assert_eq!(
             parsed.return_sso_url,

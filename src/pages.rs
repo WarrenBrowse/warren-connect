@@ -72,13 +72,38 @@ pub fn deep_link(sid: &str, host: &str) -> String {
     deep_link_with_scheme(scheme(), sid, host)
 }
 
+/// The deep link carried by the QR, on the configured scheme.
+///
+/// It carries the session's SECOND id plus `xd=1`. Both halves matter: the id
+/// is what lets the service refuse to assert staff on this path, and the flag
+/// is what lets the app say plainly that the sign-in is happening on another
+/// device, which is the only thing that can make a relayed approval look
+/// wrong to the person approving it.
+#[must_use]
+pub fn cross_device_deep_link_with_scheme(scheme: &str, qr_sid: &str, host: &str) -> String {
+    format!("{scheme}://forum-login?sid={qr_sid}&host={host}&xd=1")
+}
+
+/// The QR's deep link on the configured scheme.
+#[must_use]
+pub fn cross_device_deep_link(qr_sid: &str, host: &str) -> String {
+    cross_device_deep_link_with_scheme(scheme(), qr_sid, host)
+}
+
 /// Approval page shown to the browser while waiting for the app's signature.
 #[must_use]
-pub fn approval_page(lang: Lang, sid: &str, host: &str) -> String {
+pub fn approval_page(
+    lang: Lang,
+    ids: &crate::sessions::SessionIds,
+    host: &str,
+    nonce: &str,
+) -> String {
     let s = lang.strings();
     let code = lang.code();
+    let sid = ids.sid.as_str();
     let link = deep_link(sid, host);
-    let qr_svg = QrCode::new(link.as_bytes()).map_or_else(
+    let qr_link = cross_device_deep_link(&ids.qr_sid, host);
+    let qr_svg = QrCode::new(qr_link.as_bytes()).map_or_else(
         |_| String::new(),
         |c| {
             c.render::<svg::Color<'_>>()
@@ -95,7 +120,7 @@ pub fn approval_page(lang: Lang, sid: &str, host: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>{tab}</title>
-<style>{style}
+<style nonce="{nonce}">{style}
   body{{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem;}}
   .card{{background:var(--card);border:1px solid var(--border);border-radius:16px;
     padding:2.4rem 2rem;max-width:27rem;width:100%;text-align:center;
@@ -130,7 +155,7 @@ pub fn approval_page(lang: Lang, sid: &str, host: &str) -> String {
   <hr class="rule">
   <p class="foot tagline">{tagline}</p>
 </div>
-<script>
+<script nonce="{nonce}">
   const el = document.getElementById('state');
   const poll = async () => {{
     try {{
@@ -151,6 +176,7 @@ pub fn approval_page(lang: Lang, sid: &str, host: &str) -> String {
 </body>
 </html>"##,
         style = STYLE,
+        nonce = nonce,
         tab = s.a_tab,
         label = s.a_label,
         heading = s.a_heading,
@@ -182,14 +208,13 @@ pub fn attach_deep_link(sid: &str, topic_id: u64, host: &str) -> String {
     attach_deep_link_with_scheme(scheme(), sid, topic_id, host)
 }
 
-/// Public forum base, target of the topic-mode success redirect.
-const FORUM_PUBLIC_URL: &str = "https://forum.warrenbrowse.com";
+use crate::FORUM_PUBLIC_URL;
 
 /// Attach-logs page (topic mode): explains the flow, auto-attempts the deep
 /// link, offers a manual click, polls the attach session every 2 s, and on
 /// success redirects back to the topic.
 #[must_use]
-pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str) -> String {
+pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str, nonce: &str) -> String {
     let s = lang.strings();
     // On done: show the success text briefly, then land back on the topic.
     let settle = format!(
@@ -203,6 +228,7 @@ pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str) -> String {
         s.l_expires,
         s.l_done,
         &settle,
+        nonce,
     )
 }
 
@@ -211,7 +237,7 @@ pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str) -> String {
 /// return there (and tries `window.close()`, which succeeds when this tab was
 /// script-opened) instead of redirecting.
 #[must_use]
-pub fn attach_page_pre(lang: Lang, sid: &str, host: &str) -> String {
+pub fn attach_page_pre(lang: Lang, sid: &str, host: &str, nonce: &str) -> String {
     let s = lang.strings();
     let settle = "if (s.status === 'received' || s.status === 'done') {\n        \
          say(el.dataset.done, false);\n        \
@@ -223,6 +249,7 @@ pub fn attach_page_pre(lang: Lang, sid: &str, host: &str) -> String {
         s.l_expires_pre,
         s.l_received,
         settle,
+        nonce,
     )
 }
 
@@ -236,6 +263,7 @@ fn attach_page_shell(
     expires: &str,
     done_text: &str,
     settle_js: &str,
+    nonce: &str,
 ) -> String {
     let s = lang.strings();
     let code = lang.code();
@@ -247,7 +275,7 @@ fn attach_page_shell(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>{tab}</title>
-<style>{style}
+<style nonce="{nonce}">{style}
   body{{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem;}}
   .card{{background:var(--card);border:1px solid var(--border);border-radius:16px;
     padding:2.4rem 2rem;max-width:27rem;width:100%;text-align:center;
@@ -288,7 +316,7 @@ fn attach_page_shell(
   <hr class="rule">
   <p class="foot tagline">{tagline}</p>
 </div>
-<script>
+<script nonce="{nonce}">
   setTimeout(() => {{ window.location = '{link}'; }}, 300);
   const el = document.getElementById('state');
   const msg = document.getElementById('msg');
@@ -320,6 +348,7 @@ fn attach_page_shell(
 </body>
 </html>"##,
         style = STYLE,
+        nonce = nonce,
         tab = s.l_tab,
         label = s.a_label,
         heading = s.l_heading,
@@ -338,7 +367,7 @@ fn attach_page_shell(
 /// Public transparency page: what this service and the forum can and cannot
 /// see. Kept in lockstep with doc 55 of warren-core.
 #[must_use]
-pub fn transparency_page(lang: Lang) -> String {
+pub fn transparency_page(lang: Lang, nonce: &str) -> String {
     let s = lang.strings();
     let code = lang.code();
     format!(
@@ -348,7 +377,7 @@ pub fn transparency_page(lang: Lang) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{tab}</title>
-<style>{style}
+<style nonce="{nonce}">{style}
   body{{max-width:47rem;margin:0 auto;padding:2.5rem 1.25rem 4rem;}}
   .brand{{display:block;margin-bottom:.2rem;}}
   h1{{font-size:1.9rem;margin:.4rem 0 1.4rem;}}
@@ -391,6 +420,7 @@ pub fn transparency_page(lang: Lang) -> String {
 </body>
 </html>"##,
         style = STYLE,
+        nonce = nonce,
         tab = s.t_tab,
         label = s.a_label,
         heading = s.t_heading,
@@ -447,9 +477,23 @@ mod tests {
         assert_eq!(configured_scheme_from(Some("warren-beta")), "warren-beta");
     }
 
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn ids(sid: &str, qr_sid: &str) -> crate::sessions::SessionIds {
+        crate::sessions::SessionIds {
+            sid: sid.to_owned(),
+            qr_sid: qr_sid.to_owned(),
+        }
+    }
+
     #[test]
     fn approval_page_contains_link_qr_and_poll() {
-        let page = approval_page(Lang::En, "deadbeef", "connect.warrenbrowse.com");
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
         assert!(page.contains("warren://forum-login?sid=deadbeef"));
         assert!(page.contains("<svg"), "QR must be rendered inline");
         assert!(page.contains("/v1/session/deadbeef/status"));
@@ -458,11 +502,39 @@ mod tests {
     }
 
     #[test]
+    fn the_button_and_the_qr_never_carry_the_same_id() {
+        // The button opens the app on THIS machine; the QR is read from
+        // another one. Serving one id for both would erase the distinction the
+        // login handler needs to refuse asserting staff over a relayed link.
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
+        assert!(
+            page.contains(
+                r#"href="warren://forum-login?sid=deadbeef&host=connect.warrenbrowse.com""#
+            ),
+            "the button keeps the same-device id"
+        );
+        assert!(
+            !page.contains("sid=cafe&host=connect.warrenbrowse.com\""),
+            "the cross-device id must never be the button's"
+        );
+        assert_eq!(
+            cross_device_deep_link_with_scheme("warren", "cafe", "connect.warrenbrowse.com"),
+            "warren://forum-login?sid=cafe&host=connect.warrenbrowse.com&xd=1",
+            "the marker is part of the frozen link shape the app parses"
+        );
+    }
+
+    #[test]
     fn approval_page_is_localized() {
-        let fr = approval_page(Lang::Fr, "s", "h");
+        let fr = approval_page(Lang::Fr, &ids("s", "q"), "h", NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("Ouvrir l'application Warren"));
-        let ro = approval_page(Lang::Ro, "s", "h");
+        let ro = approval_page(Lang::Ro, &ids("s", "q"), "h", NONCE);
         assert!(ro.contains("lang=\"ro\""));
     }
 
@@ -480,7 +552,7 @@ mod tests {
 
     #[test]
     fn attach_page_contains_link_autopen_and_poll() {
-        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com");
+        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE);
         assert!(
             page.contains(
                 "warren://attach-logs?sid=deadbeef&topic=42&host=connect.warrenbrowse.com"
@@ -494,23 +566,23 @@ mod tests {
 
     #[test]
     fn attach_page_is_localized() {
-        let fr = attach_page(Lang::Fr, "s", 1, "h");
+        let fr = attach_page(Lang::Fr, "s", 1, "h", NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("Ouvrir l'application Warren"));
-        let ro = attach_page(Lang::Ro, "s", 1, "h");
+        let ro = attach_page(Lang::Ro, "s", 1, "h", NONCE);
         assert!(ro.contains("lang=\"ro\""));
     }
 
     #[test]
     fn attach_page_redirects_to_the_topic_on_done() {
-        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com");
+        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE);
         assert!(page.contains("location.replace('https://forum.warrenbrowse.com/t/42')"));
         assert!(page.contains("1500"), "brief success text before redirect");
     }
 
     #[test]
     fn attach_page_pre_deep_links_topic_zero_and_closes() {
-        let page = attach_page_pre(Lang::En, "deadbeef", "connect.warrenbrowse.com");
+        let page = attach_page_pre(Lang::En, "deadbeef", "connect.warrenbrowse.com", NONCE);
         assert!(
             page.contains(
                 "warren://attach-logs?sid=deadbeef&topic=0&host=connect.warrenbrowse.com"
@@ -530,18 +602,18 @@ mod tests {
 
     #[test]
     fn attach_page_pre_is_localized() {
-        let fr = attach_page_pre(Lang::Fr, "s", "h");
+        let fr = attach_page_pre(Lang::Fr, "s", "h", NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("l'onglet du forum"));
-        let ro = attach_page_pre(Lang::Ro, "s", "h");
+        let ro = attach_page_pre(Lang::Ro, "s", "h", NONCE);
         assert!(ro.contains("lang=\"ro\""));
     }
 
     #[test]
     fn transparency_page_is_localized() {
-        assert!(transparency_page(Lang::En).contains("How forum sign-in protects you"));
-        assert!(transparency_page(Lang::Fr).contains("transparence"));
-        assert!(transparency_page(Lang::Ro).contains("Discourse"));
+        assert!(transparency_page(Lang::En, NONCE).contains("How forum sign-in protects you"));
+        assert!(transparency_page(Lang::Fr, NONCE).contains("transparence"));
+        assert!(transparency_page(Lang::Ro, NONCE).contains("Discourse"));
     }
 
     #[test]
@@ -556,7 +628,7 @@ mod tests {
             (Lang::Fr, "base de liaison"),
             (Lang::Ro, "baza de date privat"),
         ] {
-            let page = transparency_page(lang);
+            let page = transparency_page(lang, NONCE);
             assert!(
                 !page.contains(stale),
                 "no wallet is stored at rest: the page must not present a reversing database as the only barrier"
@@ -566,8 +638,8 @@ mod tests {
                 "the page must name what is kept instead of the address"
             );
         }
-        assert!(transparency_page(Lang::En).contains("two years"));
-        assert!(transparency_page(Lang::Fr).contains("deux ans"));
-        assert!(transparency_page(Lang::Ro).contains("doi ani"));
+        assert!(transparency_page(Lang::En, NONCE).contains("two years"));
+        assert!(transparency_page(Lang::Fr, NONCE).contains("deux ans"));
+        assert!(transparency_page(Lang::Ro, NONCE).contains("doi ani"));
     }
 }

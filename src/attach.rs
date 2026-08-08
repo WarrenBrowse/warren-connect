@@ -183,7 +183,27 @@ impl AttachStore {
         now_unix: u64,
     ) -> Result<String, AuthError> {
         if sessions.len() >= MAX_SESSIONS {
-            return Err(AuthError::Session);
+            // At capacity, displace the oldest session that is holding no
+            // report rather than refusing. Both entry points are
+            // unauthenticated by design (`GET /attach?topic=`, `POST
+            // /v1/attach/new`) and this vhost pins the forwarded IP to a
+            // constant for the no-log guarantee, so there is no per-client
+            // budget to draw. Failing closed therefore let anyone take the
+            // whole attach feature down for a TTL by minting sessions;
+            // displacing means a flood only ever evicts its own idle
+            // sessions, since a real one is claimed within seconds.
+            let oldest = sessions
+                .iter()
+                .filter(|(_, s)| !s.holds_log())
+                .min_by_key(|(_, s)| s.created_unix)
+                .map(|(sid, _)| sid.clone());
+            // Every session holding a report is a user waiting on it, and
+            // MAX_LOG_SESSIONS caps how many those can be, so this is
+            // unreachable unless that cap is raised to the session cap.
+            let Some(oldest) = oldest else {
+                return Err(AuthError::Session);
+            };
+            sessions.remove(&oldest);
         }
         let mut raw = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut raw);
@@ -409,6 +429,13 @@ impl AttachStore {
     }
 }
 
+/// Longest a report-derived fact (version, os) may be. Clamped where it is
+/// PARSED, not only where it is published: the value also reaches the browser
+/// through `/v1/attach/{sid}/meta` and the composer prefill, and a report is
+/// client-authored, so one unbounded line was two consumers away from a
+/// megabyte-long "version".
+pub const MAX_FACT_CHARS: usize = 80;
+
 /// Extracts `warren-product-version` and `os` from the report's metadata
 /// section: `key: value` lines after an optional `System information:` header,
 /// terminated by the first empty line (mirrors mullvad-problem-report's
@@ -424,9 +451,10 @@ pub fn parse_report_metadata(report: &str) -> ReportMeta {
         let Some((key, value)) = line.split_once(": ") else {
             continue;
         };
+        let clamped = || value.chars().take(MAX_FACT_CHARS).collect::<String>();
         match key {
-            "warren-product-version" => version = Some(value.to_owned()),
-            "os" => os = Some(value.to_owned()),
+            "warren-product-version" => version = Some(clamped()),
+            "os" => os = Some(clamped()),
             _ => {}
         }
     }
@@ -580,12 +608,56 @@ mod tests {
     }
 
     #[test]
-    fn store_capacity_fails_closed() {
+    fn a_flood_of_idle_sessions_displaces_itself_instead_of_the_feature() {
+        // Nothing authenticates the two mint paths and the forwarded IP is
+        // pinned to a constant here, so refusing at capacity handed anyone a
+        // way to take attach-logs down for a whole TTL. The newcomer now
+        // evicts the oldest idle session instead.
         let store = AttachStore::default();
-        for topic in 0..MAX_SESSIONS as u64 {
-            store.create(topic, 0).expect("fill");
+        // One session strictly older than the rest, so "the oldest" has a
+        // single answer and the assertion cannot pass by luck. Every
+        // timestamp stays well inside the TTL, so nothing here expires.
+        let oldest = store.create(1, 0).expect("oldest");
+        for topic in 2..=MAX_SESSIONS as u64 {
+            store.create(topic, 1).expect("fill");
         }
-        assert!(store.create(u64::MAX, 0).is_err(), "cap reached");
+
+        let newcomer = store
+            .create(u64::MAX, 2)
+            .expect("a real user must still be able to start an attach");
+
+        assert!(
+            store.status(&oldest, 2).is_err(),
+            "the oldest idle session is the one displaced"
+        );
+        assert_eq!(
+            store.status(&newcomer, 2).expect("the newcomer is live"),
+            AttachStatus::Pending
+        );
+    }
+
+    #[test]
+    fn a_session_holding_a_report_is_never_displaced_by_the_flood() {
+        // The user behind it is waiting on that upload, and dropping it would
+        // lose a report the app already sent.
+        let store = AttachStore::default();
+        let holder = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&holder, "u", "log".into(), None, None, 0)
+            .expect("report delivered");
+        // The holder is the OLDEST session, so only the log filter can save it.
+        for topic in 1..MAX_SESSIONS as u64 {
+            store.create(topic, 1).expect("fill");
+        }
+
+        store.create(u64::MAX, 2).expect("still accepted");
+
+        assert_eq!(
+            store
+                .status(&holder, 2)
+                .expect("the report holder survives"),
+            AttachStatus::Received
+        );
     }
 
     fn gz(data: &[u8]) -> Vec<u8> {
@@ -833,6 +905,20 @@ mod tests {
         \n\
         ==== warren.log ====\n\
         line one\nos: not-metadata\n";
+
+    #[test]
+    fn report_metadata_clamps_a_forged_field_at_the_parser() {
+        // The report is client-authored and its fields reach two consumers:
+        // the public note and the composer prefill the browser reads. Clamping
+        // only at publication left the second one unbounded.
+        let report = format!("os: {}\n\n", "x".repeat(5_000));
+        let (_, os) = parse_report_metadata(&report);
+        assert_eq!(
+            os.expect("parsed").chars().count(),
+            MAX_FACT_CHARS,
+            "the cap belongs where the value is produced"
+        );
+    }
 
     #[test]
     fn report_metadata_extracts_version_and_os() {

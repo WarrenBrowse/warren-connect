@@ -16,6 +16,27 @@
 use sqlx::PgPool;
 use sqlx::Row as _;
 
+/// A coarse, value-free category for an sqlx error, safe to log under the
+/// no-log policy.
+///
+/// The full `Display`/`Debug` of an `sqlx::Error` embeds the Postgres error
+/// DETAIL, which echoes the offending row values: a unique-constraint
+/// violation on `forum_links` would put a handle or a keyed `external_id` in
+/// the line. Every call site that logs an sqlx failure goes through this,
+/// which `tests/log_privacy.rs` enforces.
+#[must_use]
+pub fn error_kind(err: &sqlx::Error) -> &'static str {
+    match err {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::RowNotFound => "row_not_found",
+        sqlx::Error::PoolTimedOut => "pool_timed_out",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        _ => "other",
+    }
+}
+
 /// Runs the embedded migrations for the `forum_auth` database.
 ///
 /// # Errors

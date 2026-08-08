@@ -223,7 +223,13 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!(purged = n, "forum_links retention sweep applied");
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::error!(kind = ?e, "forum_links retention sweep failed"),
+                    // The KIND only: an sqlx error's Debug carries the Postgres
+                    // error detail, which echoes the row values (a handle, a
+                    // keyed external_id).
+                    Err(err) => tracing::error!(
+                        kind = store::error_kind(&err),
+                        "forum_links retention sweep failed"
+                    ),
                 }
             }
         });

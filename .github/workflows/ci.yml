@@ -97,3 +97,16 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+      # This service holds the DiscourseConnect secret, the forum handle HMAC
+      # key and a Discourse admin API key, so a known-vulnerable dependency is
+      # a real finding here rather than hygiene. Installed on demand: the
+      # runner image carries no cargo-deny and a docker action is unavailable
+      # (no daemon on this pool).
+      - name: cargo deny (advisories, bans, licenses, sources)
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-deny >/dev/null 2>&1; then
+            cargo install --locked cargo-deny
+          fi
+          cargo deny check advisories bans licenses sources

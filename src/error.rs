@@ -15,6 +15,10 @@ pub enum AuthError {
     /// The `sso` payload is not valid base64/urlencoded form data.
     #[error("sso payload malformed")]
     SsoMalformed,
+    /// The `sso` payload asks for the signed response to be delivered
+    /// somewhere other than the forum origin.
+    #[error("sso return url is not on the forum origin")]
+    SsoReturnUrl,
     /// A required `X-Warren-*` header is missing or malformed.
     #[error("missing or malformed auth header")]
     Header,

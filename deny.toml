@@ -1,0 +1,64 @@
+# cargo-deny: dependency gate for the broker that holds the DiscourseConnect
+# secret, the forum handle HMAC key and a Discourse admin API key.
+#
+# Run locally with `cargo deny check`; CI runs the same four checks.
+
+[advisories]
+# A yanked crate is a warning, not a gate: crates.io can yank a version at any
+# moment for reasons that have nothing to do with this build, and a red CI
+# nobody caused is a red CI everyone learns to ignore. A real vulnerability
+# still fails, because that is a `vulnerability` advisory, not a yank.
+yanked = "warn"
+# Every entry states WHY it cannot hurt this service, and disappears the day
+# the dependency moves. Nothing is silenced by class.
+ignore = [
+    # atomic-polyfill is unmaintained (archived upstream). It arrives four
+    # levels down, through warren-contract -> warrenguard-wire -> postcard ->
+    # heapless 0.7, and exists to emulate atomics on single-core targets that
+    # lack them. This service runs on x86_64 with native atomics, so the
+    # polyfill is compiled out of the path it would take. Nothing in this
+    # repo can move it: it goes when heapless reaches 0.8 upstream.
+    { id = "RUSTSEC-2023-0089", reason = "transitive via heapless 0.7, inert on x86_64, not upgradable from this repo" },
+]
+
+[bans]
+multiple-versions = "allow"
+# Nothing in this service should ever pull an unmaintained TLS stack or a
+# second crypto backend in behind our backs: rustls is the only one wanted.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[licenses]
+# The crate is AGPL-3.0-or-later, so a dependency has to be compatible with
+# distributing it under that. Copyleft-incompatible terms fail the build.
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # webpki-roots ships Mozilla's CA set under a data licence, not a code one.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The two Warren git dependencies: the frozen wire contract, and the engine
+# crate it pulls for the wire types. Any other git source is a finding.
+allow-git = [
+    "https://github.com/WarrenBrowse/warren-contract.git",
+    "https://github.com/WarrenBrowse/warrenguard.git",
+]

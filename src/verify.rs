@@ -7,7 +7,7 @@
 //! AFTER the signature verifies so an attacker cannot burn a victim's nonce
 //! with a garbage signature.
 
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 use warren_contract::auth::canonical_message;
 
@@ -57,6 +57,12 @@ pub fn verify_signed_request(
     let pubkey =
         warren_contract::ss58::decode(&headers.pubkey_ss58).map_err(|_| AuthError::Pubkey)?;
     let verifying = VerifyingKey::from_bytes(&pubkey).map_err(|_| AuthError::Pubkey)?;
+    // A small-order key accepts signatures nobody had to produce, so it is not
+    // a proof of anything. No wallet ever derives one, so refusing it costs no
+    // legitimate user a login.
+    if verifying.is_weak() {
+        return Err(AuthError::Pubkey);
+    }
 
     if now_unix.abs_diff(headers.timestamp) > TIMESTAMP_WINDOW_SECS {
         return Err(AuthError::Clock);
@@ -78,12 +84,12 @@ pub fn verify_signed_request(
         &headers.nonce_hex,
         &body_hash_hex,
     );
-    // `verify` (not `verify_strict`) to stay byte-for-byte parity with the
-    // production `WarrenAuthVerifier` in warren-core: the SDK/backend wire
-    // contract is the source of truth and must not diverge. Forgery still
-    // requires the private key; replay is blocked by the nonce store below.
+    // `verify_strict`: it rejects non-canonical encodings and mixed-order
+    // points, which the permissive `verify` accepts. Every signature a real
+    // wallet produces passes both, so this only narrows what an adversarially
+    // chosen key can claim, and the wire contract is unchanged for clients.
     verifying
-        .verify(canonical.as_bytes(), &signature)
+        .verify_strict(canonical.as_bytes(), &signature)
         .map_err(|_| AuthError::Signature)?;
 
     // Authorization decisions (admin allowlist, subscription lookup) and the
@@ -184,6 +190,24 @@ mod tests {
         h.signature_hex = good_sig;
         verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
             .expect("the legitimate request must still pass afterwards");
+    }
+
+    #[test]
+    fn rejects_a_small_order_pubkey_before_looking_at_the_signature() {
+        // The identity point is a well-formed encoding whose "signatures" are
+        // satisfiable without any private key, so it proves no key control.
+        // It must be refused as a KEY, not left to fail as a signature: the
+        // distinction is what stops a forged one from ever being verified.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
+        h.pubkey_ss58 = warren_contract::ss58::encode(&identity);
+        let nonces = NonceStore::default();
+
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
+            .expect_err("a small-order key must be refused");
+        assert!(matches!(err, AuthError::Pubkey), "got {err:?}");
     }
 
     #[test]

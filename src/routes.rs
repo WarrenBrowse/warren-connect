@@ -89,20 +89,7 @@ fn now_unix() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// A coarse, value-free category for an sqlx error, safe to log under the
-/// no-log policy (the full `Display` can echo identity values from a Postgres
-/// error detail, e.g. on a unique-constraint violation).
-fn sqlx_error_kind(err: &sqlx::Error) -> &'static str {
-    match err {
-        sqlx::Error::Database(_) => "database",
-        sqlx::Error::RowNotFound => "row_not_found",
-        sqlx::Error::PoolTimedOut => "pool_timed_out",
-        sqlx::Error::PoolClosed => "pool_closed",
-        sqlx::Error::Io(_) => "io",
-        sqlx::Error::Tls(_) => "tls",
-        _ => "other",
-    }
-}
+use crate::store::error_kind as sqlx_error_kind;
 
 /// Forum access policy. A login is allowed when the wallet has paid for Warren
 /// at least once (the anti-sybil paywall: a free wallet is unlimited and there
@@ -113,9 +100,94 @@ fn login_allowed(ever_paid: bool, is_admin: bool) -> bool {
     ever_paid || is_admin
 }
 
+/// Whether this login may assert staff to Discourse.
+///
+/// The allowlist is a bootstrap floor, and Discourse keeps a grant it already
+/// holds because an ordinary login omits the field entirely. So withholding
+/// the claim on a cross-device approval costs an operator nothing: signing in
+/// from their phone still logs them in, still passes the paywall, and still
+/// finds them admin on the forum. What it removes is the ability to MINT staff
+/// through a link somebody else relayed to them, which is the whole payload of
+/// the QR-phishing path.
+fn staff_claim(is_admin: bool, approach: crate::sessions::Approach) -> bool {
+    is_admin && approach == crate::sessions::Approach::SameDevice
+}
+
+/// Content-Security-Policy of the server-rendered pages.
+///
+/// `default-src 'none'` is affordable because the pages are self-contained by
+/// design: no web font, no CDN, the QR is an inline SVG element. What is left
+/// is exactly the style block, the poll script and the poll itself, so the
+/// style and the script are admitted by a per-response nonce rather than by
+/// `'unsafe-inline'`. `frame-ancestors 'none'` is the load-bearing one: it
+/// stops the approval page being wrapped in a page of somebody else's making.
+fn content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; \
+         connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// A per-response CSP nonce: 16 bytes of OS entropy, hex.
+fn csp_nonce() -> String {
+    use rand::RngCore as _;
+    let mut raw = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    hex::encode(raw)
+}
+
+/// Renders an HTML page and serves it with its own CSP.
+///
+/// `cacheable` is false for anything carrying a session id: the approval and
+/// attach pages put theirs in the markup, and a stored copy would leave that
+/// capability in the browser cache after the login is over.
+fn html_page(render: impl FnOnce(&str) -> String, cacheable: bool) -> Response {
+    let nonce = csp_nonce();
+    let body = render(&nonce);
+    let mut response = Html(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        content_security_policy(&nonce)
+            .parse()
+            .expect("the policy is ASCII by construction"),
+    );
+    if !cacheable {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+/// Headers every response carries, HTML or JSON.
+///
+/// `X-Frame-Options` duplicates the CSP `frame-ancestors` for browsers that
+/// predate it. HSTS is emitted here rather than only at the edge so it
+/// survives an edge config that drifts; a browser ignores it over plain HTTP,
+/// so a local run is unaffected.
+async fn base_security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+        ("strict-transport-security", "max-age=31536000"),
+    ] {
+        headers.insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    response
+}
+
 /// The only browser origin allowed to call the attach session API (the forum
 /// theme's composer integration).
-const ATTACH_CORS_ORIGIN: &str = "https://forum.warrenbrowse.com";
+const ATTACH_CORS_ORIGIN: &str = crate::FORUM_PUBLIC_URL;
 
 /// CORS for the attach session endpoints, scoped to the forum origin only.
 /// Handles the OPTIONS preflight itself. A predicate (not `exact`) so a
@@ -205,6 +277,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/internal/by-handle/{username}", get(lookup_by_handle))
         .route("/internal/forum/digest", get(forum_digest))
         .route("/healthz", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(base_security_headers))
         .with_state(state)
 }
 
@@ -218,13 +291,21 @@ async fn sso_entry(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(params): Query<SsoParams>,
-) -> Result<Html<String>, AuthError> {
-    let incoming = discourse::verify_incoming(&params.sso, &params.sig, &state.connect_secret)?;
-    let sid = state
+) -> Result<Response, AuthError> {
+    let incoming = discourse::verify_incoming(
+        &params.sso,
+        &params.sig,
+        &state.connect_secret,
+        crate::FORUM_PUBLIC_URL,
+    )?;
+    let ids = state
         .sessions
         .create(incoming.nonce, incoming.return_sso_url, now_unix())?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    Ok(Html(pages::approval_page(lang, &sid, &state.public_host)))
+    Ok(html_page(
+        |nonce| pages::approval_page(lang, &ids, &state.public_host, nonce),
+        false,
+    ))
 }
 
 /// Extracts the raw `Accept-Language` header value, if present and valid UTF-8.
@@ -256,6 +337,11 @@ async fn forum_login(
     )?;
 
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
+
+    // Which of the session's two ids this approval arrived on. The QR is read
+    // from a second device, which is exactly the shape of a relayed
+    // (phished) approval, so nothing that GRANTS anything may ride on it.
+    let (primary_sid, approach) = state.sessions.resolve(&login.sid, now)?;
 
     // Staff is an allowlist, independent of payment: admins are operators and
     // must not be locked out of their own forum by the paywall.
@@ -309,14 +395,14 @@ async fn forum_login(
     };
 
     state.sessions.approve(
-        &login.sid,
+        &primary_sid,
         SsoUser {
             external_id: forum.external_id,
             username: forum.username,
             email: forum.email,
             member: status.ever_paid,
             subscriber: status.active,
-            admin,
+            admin: staff_claim(admin, approach),
         },
         now,
     )?;
@@ -587,24 +673,25 @@ async fn attach_entry(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(params): Query<AttachParams>,
-) -> Result<Html<String>, AuthError> {
+) -> Result<Response, AuthError> {
     forum_api_enabled(&state)?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
     match (params.topic, params.sid) {
         // Topic mode: mints (or reuses) a session bound to an existing topic.
         (Some(topic), _) if topic >= 1 => {
             let sid = state.attach.create(topic, now_unix())?;
-            Ok(Html(pages::attach_page(
-                lang,
-                &sid,
-                topic,
-                &state.public_host,
-            )))
+            Ok(html_page(
+                |nonce| pages::attach_page(lang, &sid, topic, &state.public_host, nonce),
+                false,
+            ))
         }
         // Pre-topic mode: reuses the session minted by /v1/attach/new.
         (None, Some(sid)) => {
             state.attach.pre_exists(&sid, now_unix())?;
-            Ok(Html(pages::attach_page_pre(lang, &sid, &state.public_host)))
+            Ok(html_page(
+                |nonce| pages::attach_page_pre(lang, &sid, &state.public_host, nonce),
+                false,
+            ))
         }
         _ => Err(AuthError::Payload),
     }
@@ -1050,6 +1137,15 @@ async fn help_reply(
     {
         return Err(AuthError::InvalidTicket);
     }
+    // A closed or archived topic refuses a post from the low-privilege intake
+    // bot, so without this the guest would meet a 502 and retry it forever.
+    // Answering with the code error instead is both the truthful outcome (the
+    // code no longer opens anything) and the one the help form already
+    // renders, and it hands staff the only revocation lever these codes have:
+    // closing the conversation ends it.
+    if topic.locked {
+        return Err(AuthError::InvalidTicket);
+    }
 
     let linked = upload_attachments(&intake.api, attachments).await?;
     let raw = crate::intake::reply_raw(&req.message, &linked);
@@ -1083,9 +1179,10 @@ fn dead_topic(err: forum_api::ForumApiError) -> AuthError {
     }
 }
 
-async fn transparency(headers: HeaderMap) -> Html<String> {
+async fn transparency(headers: HeaderMap) -> Response {
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    Html(pages::transparency_page(lang))
+    // No session id in the markup, so this one may be cached.
+    html_page(|nonce| pages::transparency_page(lang, nonce), true)
 }
 
 /// Constant-time-ish bearer check for the internal support endpoints. Empty
@@ -1180,7 +1277,7 @@ fn extract_signed_headers(headers: &HeaderMap) -> Result<SignedHeaders, AuthErro
 
 #[cfg(test)]
 mod tests {
-    use super::{login_allowed, login_approved_body};
+    use super::{login_allowed, login_approved_body, staff_claim};
 
     #[test]
     fn approved_login_echoes_the_handle_and_slot_and_nothing_else() {
@@ -1230,5 +1327,35 @@ mod tests {
         // An operator must never be locked out of their own forum by the
         // anti-sybil paywall, even with no subscription row.
         assert!(login_allowed(false, true));
+    }
+
+    #[test]
+    fn staff_is_asserted_only_on_a_same_device_approval() {
+        use crate::sessions::Approach;
+
+        assert!(staff_claim(true, Approach::SameDevice));
+        assert!(
+            !staff_claim(true, Approach::CrossDevice),
+            "a QR is read from another device, which is the exact shape of a relayed approval: \
+             no grant may ride on it"
+        );
+        assert!(!staff_claim(false, Approach::SameDevice));
+        assert!(!staff_claim(false, Approach::CrossDevice));
+    }
+
+    #[test]
+    fn a_cross_device_login_still_signs_in() {
+        use crate::sessions::Approach;
+
+        // The fix must not cost the feature: an operator signing in from their
+        // phone is still let through the paywall and still logs in. Only the
+        // staff CLAIM is withheld, and Discourse keeps the grant it holds.
+        assert!(
+            login_allowed(false, true),
+            "the gate reads the allowlist, not the approach"
+        );
+        let body = login_approved_body("lusab-babad-dovok", Some(1));
+        assert_eq!(body["status"], "approved");
+        assert!(!staff_claim(true, Approach::CrossDevice));
     }
 }

@@ -43,6 +43,8 @@ struct StubState {
     topic_author: Option<String>,
     /// Makes every topic fetch answer 404, as a deleted topic would.
     topic_missing: bool,
+    /// Reports the topic as closed, as staff marking a report resolved does.
+    topic_closed: bool,
     /// Answers post creations without a `post_number`, as an older or a
     /// changed Discourse could.
     omit_post_number: bool,
@@ -80,6 +82,7 @@ async fn stub_topic(
         "title": format!("[Install] guest report ({topic_id})"),
         "details": { "created_by": { "username": author } },
         "tags": [],
+        "closed": s.topic_closed,
     }))
     .into_response()
 }
@@ -416,6 +419,41 @@ async fn a_code_whose_topic_is_gone_reads_as_an_unknown_code() {
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_code_stops_working_once_staff_close_the_conversation() {
+    // Discourse refuses a post from the low-privilege intake bot on a closed
+    // topic, so the guest used to meet a 502 and retry it forever. Closing is
+    // also the only revocation these codes have: a code that leaked stops
+    // being a way to post the moment the conversation is over.
+    let (url, _stub) = spawn_stub().await;
+    let state = test_state(Some(intake_state(&url, RateLimiter::default())));
+    let code = file_report(state, "203.0.113.1").await;
+
+    let (url, stub) = spawn_stub_with(Arc::new(StubState {
+        topic_closed: true,
+        ..Default::default()
+    }))
+    .await;
+    let state = test_state(Some(intake_state(&url, RateLimiter::default())));
+    let response = router(state)
+        .oneshot(reply_request(
+            &reply_body(&code, "Reopening this, it came back yesterday."),
+            Some("203.0.113.1"),
+        ))
+        .await
+        .expect("infallible");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the form already renders this one, so the guest is told plainly"
+    );
+    assert!(
+        stub.calls.lock().expect("stub mutex").is_empty(),
+        "nothing may be posted into a closed conversation"
+    );
 }
 
 #[tokio::test]

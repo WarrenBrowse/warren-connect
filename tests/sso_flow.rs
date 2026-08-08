@@ -54,7 +54,9 @@ fn signed_sso(payload: &str) -> (String, String) {
 #[tokio::test]
 async fn sso_entry_renders_the_approval_page() {
     let app = router(test_state());
-    let (sso, sig) = signed_sso("nonce=n1&return_sso_url=https%3A%2F%2Ff%2Fsession%2Fsso_login");
+    let (sso, sig) = signed_sso(
+        "nonce=n1&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login",
+    );
 
     let response = app
         .oneshot(
@@ -78,9 +80,74 @@ async fn sso_entry_renders_the_approval_page() {
 }
 
 #[tokio::test]
+async fn the_approval_page_is_served_unframeable_uncached_and_under_its_own_csp() {
+    // The page carries a session id and a link that opens the wallet. Framed
+    // in a page of somebody else's making it becomes a clickjacking surface,
+    // and cached it leaves that capability behind on a shared machine.
+    let app = router(test_state());
+    let (sso, sig) = signed_sso(
+        "nonce=n1&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login",
+    );
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/sso?sso={}&sig={sig}", urlencoding::encode(&sso)))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(header("cache-control"), "no-store");
+    assert_eq!(header("x-frame-options"), "DENY");
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(header("referrer-policy"), "no-referrer");
+    assert!(header("strict-transport-security").contains("max-age="));
+
+    let csp = header("content-security-policy");
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(
+        !csp.contains("'unsafe-inline'"),
+        "the inline style and script are admitted by nonce, never wholesale: {csp}"
+    );
+
+    // The nonce in the policy has to be the one the markup carries, or the
+    // page renders blank in a compliant browser.
+    let nonce = csp
+        .split("script-src 'nonce-")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .expect("the policy names a script nonce")
+        .to_owned();
+    assert_eq!(nonce.len(), 32, "16 bytes of entropy, hex");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let html = String::from_utf8(body.to_vec()).expect("utf8");
+    assert!(
+        html.contains(&format!(r#"<script nonce="{nonce}">"#)),
+        "the script tag must carry the policy's nonce"
+    );
+    assert!(html.contains(&format!(r#"<style nonce="{nonce}">"#)));
+}
+
+#[tokio::test]
 async fn sso_entry_rejects_a_forged_signature() {
     let app = router(test_state());
-    let (sso, _) = signed_sso("nonce=n1&return_sso_url=https%3A%2F%2Ff%2Fsso");
+    let (sso, _) = signed_sso("nonce=n1&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsso");
 
     let response = app
         .oneshot(

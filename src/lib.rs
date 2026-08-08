@@ -9,6 +9,16 @@
 //! warren-core, referenced throughout this crate, is Warren's private backend
 //! repo; its design docs are internal records and are not publicly readable.
 
+/// Public origin of the forum this broker authenticates for.
+///
+/// One constant for the four things that must agree: the cross-links written
+/// into Discourse posts, the success redirect of the attach page, the CORS
+/// grant of the attach session API, and the origin an incoming
+/// DiscourseConnect payload is allowed to send the user back to. They were
+/// three separate literals, which is one edit away from a broker that trusts
+/// a return URL it will never link to.
+pub const FORUM_PUBLIC_URL: &str = "https://forum.warrenbrowse.com";
+
 /// Days of inactivity after which a `forum_links` row (keyed hash + public
 /// handle, no cleartext wallet) is purged by the retention sweep. Two years
 /// is generous for a long-lived forum account while still bounding how long a

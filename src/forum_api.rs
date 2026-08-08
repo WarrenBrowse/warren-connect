@@ -14,9 +14,8 @@ use serde::Deserialize;
 use crate::error::AuthError;
 
 /// Public base of the forum, used in the PM/whisper cross-links (the API
-/// itself is reached through [`ForumApi::base_url`], typically the internal
-/// docker alias).
-pub(crate) const FORUM_PUBLIC_URL: &str = "https://forum.warrenbrowse.com";
+/// itself is reached over the internal docker alias this client is built with).
+pub(crate) use crate::FORUM_PUBLIC_URL;
 
 /// A Discourse API failure, redacted by construction.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +72,10 @@ pub struct TopicInfo {
     /// Current tags, needed because Discourse's topic update REPLACES the
     /// whole tag list rather than appending to it.
     pub tags: Vec<String>,
+    /// Closed or archived. Both mean Discourse refuses a post from a
+    /// non-staff author, so a guest follow-up aimed at one could only ever
+    /// come back as a backend error the sender would retry forever.
+    pub locked: bool,
 }
 
 /// A completed upload (an attach-flow log, or a guest intake screenshot).
@@ -92,9 +95,9 @@ pub struct ForumApi {
     client: reqwest::Client,
 }
 
-/// Longest a report-derived fact (version, os) may be once published, so a
-/// forged report cannot flood the public topic.
-const MAX_FACT_LEN: usize = 80;
+/// Longest a report-derived fact (version, os) may be once published. The
+/// parser already clamps at the same length, so this is the second of two.
+use crate::attach::MAX_FACT_CHARS as MAX_FACT_LEN;
 
 /// Neutralizes Discourse markdown in an untrusted string that will be
 /// interpolated into a post authored by the system/staff account: strips
@@ -105,7 +108,11 @@ const MAX_FACT_LEN: usize = 80;
 pub(crate) fn escape_md_inline(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
-        if ch.is_control() {
+        // `is_control` only covers C0/C1. The bidirectional overrides are
+        // category Cf and survive it, and they reorder the glyphs AROUND
+        // themselves: dropped into a staff PM or a public note they let an
+        // untrusted string render as something it does not say.
+        if ch.is_control() || is_bidi_control(ch) {
             out.push(' ');
         } else {
             if ch.is_ascii_punctuation() {
@@ -115,6 +122,14 @@ pub(crate) fn escape_md_inline(input: &str) -> String {
         }
     }
     out
+}
+
+/// Unicode bidirectional formatting characters: the marks, the embeddings and
+/// overrides, and the isolates. None of them has a legitimate place in a topic
+/// title, a filename or a report field, and every one of them can make the
+/// rendered order differ from the stored order.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// `escape_md_inline` plus a length clamp, for the attacker-controlled report
@@ -272,6 +287,10 @@ impl ForumApi {
             post_stream: Option<PostStream>,
             #[serde(default)]
             tags: Vec<String>,
+            #[serde(default)]
+            closed: bool,
+            #[serde(default)]
+            archived: bool,
         }
 
         let body: TopicJson = self
@@ -296,6 +315,7 @@ impl ForumApi {
             title: body.title,
             author_username: author,
             tags: body.tags,
+            locked: body.closed || body.archived,
         })
     }
 
@@ -596,6 +616,32 @@ mod tests {
         // A newline could forge an extra "staff-only" style line in the note.
         let raw = public_note_raw(Some("1.0\n\nFAKE LINE"), None).expect("some fact");
         assert!(!raw.contains('\n'), "no injected newline from metadata");
+    }
+
+    #[test]
+    fn a_bidi_override_cannot_reorder_what_a_staff_post_shows() {
+        // U+202E is category Cf, so `is_control` never saw it: a topic title
+        // could carry one and make the staff PM render its text backwards
+        // from what is stored, which is a lie told with our own account.
+        let raw = pm_raw(
+            42,
+            "safe\u{202E}gnp.exe",
+            "lusab-babad-dovok",
+            "f.log",
+            "upload://a.log",
+        );
+        assert!(
+            !raw.contains('\u{202E}'),
+            "no bidi override may survive into a post we author"
+        );
+        assert!(raw.contains("safe"), "the text itself is preserved");
+
+        for control in ['\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{2069}'] {
+            assert!(
+                !escape_md_inline(&format!("a{control}b")).contains(control),
+                "{control:?} must not survive"
+            );
+        }
     }
 
     #[test]

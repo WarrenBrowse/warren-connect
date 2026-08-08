@@ -77,6 +77,16 @@ const FORBIDDEN_LITERAL_SUBSTRINGS: &[&str] = &[
     "sso = ?",
     "payload = %",
     "payload = ?",
+    // A bare `e` binding at a tracing call site is an unmapped error, in
+    // practice an `sqlx::Error` whose Debug carries the Postgres error DETAIL,
+    // which echoes the offending row values (a handle, a keyed external_id).
+    // Every sqlx call site goes through `store::error_kind` instead, which
+    // yields a coarse `&'static str`. The closing character is part of the
+    // pattern so a properly named error (`error = %err`) is not caught.
+    "= ?e,",
+    "= ?e)",
+    "= %e,",
+    "= %e)",
 ];
 
 fn read_module(path: &str) -> String {
