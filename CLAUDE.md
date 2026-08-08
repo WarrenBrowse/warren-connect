@@ -53,6 +53,17 @@ ceiling still in force and gets refused outright.
 park the DECOMPRESSED log, so those two constants move together or a cap raise
 multiplies into gigabytes on a small box.
 
+## Deploys are CI-only: a tag push, never a hand-built image
+
+The only way this service reaches the host is the `Release` workflow on a
+`v*` tag: it builds the image, pushes it to ghcr and redeploys the compose
+service. Never `docker build` on the host and never point the compose file at
+a locally-built image. On 2026-08-08 three hand-built images (v0.12.2,
+v0.13.0, v0.13.2) served production in one afternoon with no traceable
+source: when the attach flow failed that evening, nobody could say what code
+had been running, and the build checkout on the host keeps only a Dockerfile.
+A CI image is the commit its tag names; a hand-built one is a guess.
+
 ## Verify before commit
 
 ```bash
