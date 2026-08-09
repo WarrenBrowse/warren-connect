@@ -225,10 +225,11 @@ pub async fn unread_by_username(
             AND n.read = false
             AND n.id > COALESCE(u.seen_notification_id, 0)
             AND (t.id IS NULL OR t.deleted_at IS NULL)
-            AND n.notification_type <> 12
+            AND NOT (n.notification_type = ANY($2))
           GROUP BY u.username",
     )
     .bind(max_age_days)
+    .bind(crate::notifications::HIDDEN_NOTIFICATION_TYPES.as_slice())
     .fetch_all(discourse_pool)
     .await?;
     Ok(rows
@@ -258,6 +259,9 @@ pub struct NotificationRow {
     pub title: Option<String>,
     /// Username that caused the notification.
     pub actor: Option<String>,
+    /// Group whose inbox a summary points at. Only a group message summary
+    /// carries one, and it is the only thing that row has to open.
+    pub group_name: Option<String>,
     /// Body of the post it points at, still untrimmed.
     pub raw: Option<String>,
 }
@@ -294,6 +298,7 @@ pub async fn notifications_for_username(
                 (n.data::jsonb)->>'topic_title' AS title,
                 COALESCE((n.data::jsonb)->>'display_username',
                          (n.data::jsonb)->>'original_username') AS actor,
+                (n.data::jsonb)->>'group_name'  AS group_name,
                 left(p.raw, 400)           AS raw
            FROM notifications n
            JOIN users u ON u.id = n.user_id
@@ -304,13 +309,14 @@ pub async fn notifications_for_username(
                  AND p.deleted_at IS NULL
           WHERE u.username = $1
             AND n.created_at > now() - make_interval(days => $2)
-            AND n.notification_type <> 12
+            AND NOT (n.notification_type = ANY($4))
           ORDER BY n.created_at DESC
           LIMIT $3",
     )
     .bind(username)
     .bind(max_age_days)
     .bind(limit)
+    .bind(crate::notifications::HIDDEN_NOTIFICATION_TYPES.as_slice())
     .fetch_all(discourse_pool)
     .await?;
     Ok(rows
@@ -324,6 +330,7 @@ pub async fn notifications_for_username(
             post_number: r.get::<Option<i32>, _>("post_number"),
             title: r.get::<Option<String>, _>("title"),
             actor: r.get::<Option<String>, _>("actor"),
+            group_name: r.get::<Option<String>, _>("group_name"),
             raw: r.get::<Option<String>, _>("raw"),
         })
         .collect())
@@ -837,6 +844,63 @@ laisse passer ?', NULL),
             rows.iter().all(|r| r.notification_type != 12),
             "and it must not appear in the panel either"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_site_health_warning_reaches_neither_the_count_nor_the_list(pool: PgPool) {
+        // `admin_problems` (38) is Discourse telling an ADMIN that the site has
+        // maintenance items. It has no title, no actor and nothing to open, so
+        // in the panel it was a row that said "New forum activity" and did
+        // nothing when clicked.
+        seed_fake_discourse(&pool).await;
+        sqlx::query(
+            "INSERT INTO notifications (user_id, notification_type, read, created_at, data) \
+             VALUES (1, 38, false, now(), '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("admin problem");
+
+        let counts = unread_by_username(&pool, 90).await.expect("count");
+        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            counts,
+            vec![("lusab-babad-dovok".to_owned(), 2)],
+            "a maintenance warning must not raise the badge"
+        );
+        assert!(
+            rows.iter().all(|r| r.notification_type != 38),
+            "and it must not appear in the panel either"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_group_inbox_summary_carries_its_group(pool: PgPool) {
+        // It has no topic, so the group name is the only thing that can point
+        // the row at anything openable.
+        seed_fake_discourse(&pool).await;
+        sqlx::query(
+            "INSERT INTO notifications (user_id, notification_type, read, created_at, data) \
+             VALUES (1, 16, false, now(), \
+             '{\"group_name\":\"staff\",\"inbox_count\":15,\"username\":\"lusab-babad-dovok\"}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("group summary");
+
+        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
+            .await
+            .expect("list");
+        let summary = rows
+            .iter()
+            .find(|r| r.notification_type == 16)
+            .expect("the summary is listed");
+
+        assert_eq!(summary.group_name.as_deref(), Some("staff"));
+        assert_eq!(summary.topic_id, None, "a summary points at no topic");
     }
 
     #[sqlx::test(migrations = "./migrations")]

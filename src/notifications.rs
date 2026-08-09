@@ -15,6 +15,19 @@ const MAX_EXCERPT_CHARS: usize = 240;
 /// view, and Discourse itself is one click away for the rest.
 pub const MAX_NOTIFICATIONS: i64 = 50;
 
+/// Discourse notification types the panel never shows.
+///
+/// Dropped from the unread COUNT in the same breath, or the badge would offer
+/// a number the list cannot account for.
+///
+/// - 12 `granted_badge`: the most numerous thing this forum emits and the only
+///   one caused by nobody. The panel is about what people did.
+/// - 38 `admin_problems`: the site-health warning Discourse raises for admins.
+///   It carries no title, no actor and nothing to open, so it can only render
+///   as a dead row, and it is actionable on the admin dashboard rather than in
+///   a reader's panel.
+pub const HIDDEN_NOTIFICATION_TYPES: [i32; 2] = [12, 38];
+
 /// Stable label for a Discourse `notification_type`.
 ///
 /// The integers are Discourse's own `Notification.types` enum. Only the
@@ -56,6 +69,34 @@ pub fn topic_path(topic_id: Option<i64>, post_number: Option<i32>) -> Option<Str
         Some(n) if n > 1 => format!("/t/{topic_id}/{n}"),
         _ => format!("/t/{topic_id}"),
     })
+}
+
+/// Discourse `notification_type` of a group inbox summary, the one kind that
+/// opens something while carrying no topic.
+const GROUP_MESSAGE_SUMMARY: i32 = 16;
+
+/// Where a notification row opens, or `None` when it opens nothing.
+///
+/// One entry point rather than a branch at the call site, so a type that needs
+/// its own destination is added here and nowhere else.
+#[must_use]
+pub fn path_for(
+    notification_type: i32,
+    topic_id: Option<i64>,
+    post_number: Option<i32>,
+    recipient: &str,
+    group_name: Option<&str>,
+) -> Option<String> {
+    if let Some(path) = topic_path(topic_id, post_number) {
+        return Some(path);
+    }
+    // A summary says "your group inbox moved" and names no post, so the inbox
+    // is the only thing there is to open. Path shape taken from Discourse's own
+    // `group-message-summary` notification type.
+    if notification_type == GROUP_MESSAGE_SUMMARY {
+        return group_name.map(|group| format!("/u/{recipient}/messages/group/{group}"));
+    }
+    None
 }
 
 /// One-line excerpt of a post body: whitespace collapsed so a row stays a
@@ -137,6 +178,53 @@ mod tests {
             topic_path(Some(86), Some(1)).as_deref(),
             Some("/t/86"),
             "post 1 is the topic, and the bare path is the one users recognise"
+        );
+    }
+
+    #[test]
+    fn the_site_health_warning_never_reaches_a_reader() {
+        // Discourse raises `admin_problems` (38) for admins when the site has
+        // maintenance items. It carries no title, no actor and no link, so the
+        // panel could only ever render it as a dead row.
+        assert!(HIDDEN_NOTIFICATION_TYPES.contains(&38));
+        assert!(
+            HIDDEN_NOTIFICATION_TYPES.contains(&12),
+            "badge awards stay hidden too"
+        );
+    }
+
+    #[test]
+    fn a_group_inbox_summary_opens_that_inbox() {
+        // The one kind with no topic that is still worth opening: it points at
+        // the group's message list rather than at a post.
+        assert_eq!(
+            path_for(16, None, None, "gunak-sibuf-havon", Some("staff")).as_deref(),
+            Some("/u/gunak-sibuf-havon/messages/group/staff")
+        );
+    }
+
+    #[test]
+    fn a_group_summary_missing_its_group_has_no_link() {
+        assert_eq!(path_for(16, None, None, "someone", None), None);
+    }
+
+    #[test]
+    fn a_reply_still_links_to_its_own_post() {
+        assert_eq!(
+            path_for(2, Some(86), Some(4), "someone", None).as_deref(),
+            Some("/t/86/4"),
+            "adding the group case must not disturb the ordinary one"
+        );
+    }
+
+    #[test]
+    fn a_direct_message_links_to_the_message_itself() {
+        // Types 6 and 7 carry a topic, so they take the ordinary path even
+        // though they share the `private_message` kind with the summary.
+        assert_eq!(
+            path_for(6, Some(120), Some(1), "someone", Some("staff")).as_deref(),
+            Some("/t/120"),
+            "a real message opens itself, not the group inbox"
         );
     }
 

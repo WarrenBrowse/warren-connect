@@ -496,7 +496,13 @@ async fn forum_notifications(
                 "title": r.title,
                 "actor": r.actor,
                 "excerpt": crate::notifications::excerpt(r.raw.as_deref()),
-                "path": crate::notifications::topic_path(r.topic_id, r.post_number),
+                "path": crate::notifications::path_for(
+                    r.notification_type,
+                    r.topic_id,
+                    r.post_number,
+                    &forum.username,
+                    r.group_name.as_deref(),
+                ),
             })
         })
         .collect();
