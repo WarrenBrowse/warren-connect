@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/warren-logo.svg" alt="Warren" width="130"/>
+</p>
+
 # warren-connect
 
 DiscourseConnect SSO provider for the Warren community forum
