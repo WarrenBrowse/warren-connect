@@ -53,6 +53,23 @@ ceiling still in force and gets refused outright.
 park the DECOMPRESSED log, so those two constants move together or a cap raise
 multiplies into gigabytes on a small box.
 
+## Discourse is a third party, so read its JSON tolerantly
+
+This service deserializes Discourse responses and reads Discourse's own tables
+directly. Both are upgraded by rebuilding that container, on nobody's schedule
+but the operator's, and a strict `Vec<String>` on ONE field once failed the
+whole topic body and answered 502 to every attach on a tagged topic for three
+days.
+
+**A field whose shape is theirs to change gets a reader that accepts the old
+shape and the new one** (see `TagJson`), and the live payload gets pinned in a
+test. A stub speaks what we believe, so the integration suite stayed green
+throughout: `tests/attach_flow.rs` now stubs the shape the live forum sends.
+
+Any new dependency on a Discourse field, column or setting is added to the
+probe in the `warren-forum-upgrade` skill in the same commit; that file is the
+inventory of what an upgrade can break.
+
 ## Only CI images reach production, never a hand-built one
 
 The `Release` workflow on a `v*` tag builds the image and pushes it to ghcr;
