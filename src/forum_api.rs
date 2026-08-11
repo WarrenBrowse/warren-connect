@@ -226,6 +226,84 @@ pub fn public_note_raw(version: Option<&str>, os: Option<&str>) -> Option<String
     ))
 }
 
+/// Coarse operation name of the topic fetch, in errors and traces.
+const TOPIC_OP: &str = "topic_fetch";
+
+#[derive(Deserialize)]
+struct CreatedBy {
+    username: String,
+}
+
+#[derive(Deserialize)]
+struct Details {
+    created_by: Option<CreatedBy>,
+}
+
+#[derive(Deserialize)]
+struct TopicPostJson {
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PostStream {
+    posts: Vec<TopicPostJson>,
+}
+
+/// One tag as Discourse serializes it. Up to 2026.7 it was the bare name;
+/// `TopicTagsMixin` now emits `{id, name, slug}`. Both are accepted: a strict
+/// shape refuses the WHOLE topic body, so the day the forum changed its mind
+/// every attach on a tagged topic died as a malformed response, with no way to
+/// tell that from a broken topic.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TagJson {
+    Name(String),
+    Object { name: String },
+}
+
+impl TagJson {
+    fn into_name(self) -> String {
+        match self {
+            TagJson::Name(name) | TagJson::Object { name } => name,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TopicJson {
+    title: String,
+    details: Option<Details>,
+    post_stream: Option<PostStream>,
+    #[serde(default)]
+    tags: Vec<TagJson>,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    archived: bool,
+}
+
+/// Maps a fetched topic to the fields the attach flow needs.
+fn topic_info(body: TopicJson) -> Result<TopicInfo, ForumApiError> {
+    // `details.created_by` is the canonical author; the first post of the
+    // stream is the fallback for API shapes that omit `details`.
+    let author = body
+        .details
+        .and_then(|d| d.created_by)
+        .map(|c| c.username)
+        .or_else(|| {
+            body.post_stream
+                .and_then(|p| p.posts.into_iter().next())
+                .and_then(|p| p.username)
+        })
+        .ok_or(ForumApiError::Malformed { op: TOPIC_OP })?;
+    Ok(TopicInfo {
+        title: body.title,
+        author_username: author,
+        tags: body.tags.into_iter().map(TagJson::into_name).collect(),
+        locked: body.closed || body.archived,
+    })
+}
+
 impl ForumApi {
     /// Builds a client for a Discourse instance.
     #[must_use]
@@ -263,60 +341,13 @@ impl ForumApi {
     /// [`ForumApiError`] on transport failure, non-success status, or a body
     /// without a resolvable author.
     pub async fn topic(&self, topic_id: u64) -> Result<TopicInfo, ForumApiError> {
-        const OP: &str = "topic_fetch";
-        #[derive(Deserialize)]
-        struct CreatedBy {
-            username: String,
-        }
-        #[derive(Deserialize)]
-        struct Details {
-            created_by: Option<CreatedBy>,
-        }
-        #[derive(Deserialize)]
-        struct PostJson {
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostStream {
-            posts: Vec<PostJson>,
-        }
-        #[derive(Deserialize)]
-        struct TopicJson {
-            title: String,
-            details: Option<Details>,
-            post_stream: Option<PostStream>,
-            #[serde(default)]
-            tags: Vec<String>,
-            #[serde(default)]
-            closed: bool,
-            #[serde(default)]
-            archived: bool,
-        }
-
         let body: TopicJson = self
             .send(
-                OP,
+                TOPIC_OP,
                 self.request(reqwest::Method::GET, &format!("/t/{topic_id}.json")),
             )
             .await?;
-        // `details.created_by` is the canonical author; the first post of the
-        // stream is the fallback for API shapes that omit `details`.
-        let author = body
-            .details
-            .and_then(|d| d.created_by)
-            .map(|c| c.username)
-            .or_else(|| {
-                body.post_stream
-                    .and_then(|p| p.posts.into_iter().next())
-                    .and_then(|p| p.username)
-            })
-            .ok_or(ForumApiError::Malformed { op: OP })?;
-        Ok(TopicInfo {
-            title: body.title,
-            author_username: author,
-            tags: body.tags,
-            locked: body.closed || body.archived,
-        })
+        topic_info(body)
     }
 
     /// Adds [`LOGS_ATTACHED_TAG`] to a topic, preserving the tags it already
@@ -553,6 +584,74 @@ impl ForumApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_topic(json: &str) -> Result<TopicInfo, ForumApiError> {
+        topic_info(
+            serde_json::from_str(json).map_err(|_| ForumApiError::Malformed { op: TOPIC_OP })?,
+        )
+    }
+
+    #[test]
+    fn reads_a_tag_serialized_as_an_object() {
+        // Discourse 2026.7.1 serializes a topic's tags as {id, name, slug}
+        // objects (`TopicTagsMixin`); older releases sent the bare names. The
+        // strict shape refused the whole body, so from the upgrade on, every
+        // attach on a TAGGED topic failed, which is every bug report the form
+        // files with a device tag.
+        let info = parse_topic(
+            r#"{"title":"Mise a jour bloquee",
+                "tags":[{"id":1,"name":"macos","slug":"macos"}],
+                "closed":false,"archived":false,
+                "details":{"created_by":{"id":9,"username":"tovad-vimuh-fibuv"}}}"#,
+        )
+        .expect("a tagged topic parses");
+        assert_eq!(info.tags, vec!["macos".to_owned()]);
+        assert_eq!(info.author_username, "tovad-vimuh-fibuv");
+    }
+
+    #[test]
+    fn reads_a_tag_serialized_as_a_bare_name() {
+        let info = parse_topic(
+            r#"{"title":"Connexion impossible","tags":["windows"],
+                "details":{"created_by":{"username":"lusab-babad-dovok"}}}"#,
+        )
+        .expect("the pre-2026.7 shape still parses");
+        assert_eq!(info.tags, vec!["windows".to_owned()]);
+    }
+
+    #[test]
+    fn preserved_tag_names_are_what_the_topic_update_replays() {
+        // Discourse REPLACES the tag list on update, so the names read here
+        // are re-sent verbatim: an object leaking into that write would drop
+        // the topic's existing tags.
+        let info = parse_topic(
+            r#"{"title":"t","tags":[{"id":11,"name":"logs-attached","slug":"logs-attached"},
+                {"id":3,"name":"windows","slug":"windows"}],
+                "details":{"created_by":{"username":"a"}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            info.tags,
+            vec!["logs-attached".to_owned(), "windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_first_poster_when_details_are_absent() {
+        let info = parse_topic(
+            r#"{"title":"t","post_stream":{"posts":[{"username":"first"},{"username":"second"}]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(info.author_username, "first");
+        assert!(info.tags.is_empty());
+    }
+
+    #[test]
+    fn a_topic_with_no_resolvable_author_is_malformed() {
+        let err = parse_topic(r#"{"title":"t","post_stream":{"posts":[]}}"#)
+            .expect_err("no author is malformed");
+        assert!(matches!(err, ForumApiError::Malformed { op } if op == TOPIC_OP));
+    }
 
     #[test]
     fn pm_title_names_the_topic() {

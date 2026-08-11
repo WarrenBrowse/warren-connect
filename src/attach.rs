@@ -18,7 +18,15 @@ use crate::error::AuthError;
 
 /// How long the user has to approve the consent popup in the app (and maybe
 /// read the report first). Longer than the login TTL on purpose.
-const ATTACH_TTL_SECS: u64 = 600;
+///
+/// This clock starts in the BROWSER, and everything it has to cover happens
+/// elsewhere: the app opening, the report being collected, the user finding
+/// that window, reading what is about to be sent, and only then approving. Ten
+/// minutes looked generous and was not: a reporter took eleven, uploaded a
+/// valid report, and got an expired session. A topic-bound session parks no
+/// report until that upload lands, so it costs a map entry and nothing else,
+/// and there is no reason for it to be shorter than the pre-topic one.
+const ATTACH_TTL_SECS: u64 = 1_800;
 
 /// Pre-topic sessions span composing a whole report form, so they live longer.
 const ATTACH_PRE_TTL_SECS: u64 = 1_800;
@@ -157,10 +165,13 @@ impl AttachStore {
     pub fn create(&self, topic_id: u64, now_unix: u64) -> Result<String, AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         sessions.retain(|_, s| !s.expired(now_unix));
-        if let Some((sid, _)) = sessions
-            .iter()
+        if let Some((sid, session)) = sessions
+            .iter_mut()
             .find(|(_, s)| s.topic_id == Some(topic_id) && !s.done && s.cancelled.is_none())
         {
+            // Returning to this page is the user starting over, so the
+            // deadline starts over with them.
+            session.created_unix = now_unix;
             return Ok(sid.clone());
         }
         Self::insert(&mut sessions, Some(topic_id), now_unix)
@@ -599,6 +610,23 @@ mod tests {
     }
 
     #[test]
+    fn reusing_a_pending_session_restarts_its_deadline() {
+        // The TTL measures a human: switching to the app, reading the consent,
+        // maybe opening the report before approving. A reporter who runs out
+        // of it is told to start again from the forum page, so that page has
+        // to hand back a session with a full life, not the seconds left on the
+        // one it reuses.
+        let store = AttachStore::default();
+        let sid = store.create(42, 0).expect("first");
+        let late = ATTACH_TTL_SECS - 1;
+        assert_eq!(store.create(42, late).expect("refresh"), sid);
+        assert!(
+            store.begin(&sid, 42, late + ATTACH_TTL_SECS - 1).is_ok(),
+            "the reused session lives a full TTL from the refresh"
+        );
+    }
+
+    #[test]
     fn a_new_attach_after_completion_is_a_fresh_session() {
         let store = AttachStore::default();
         let a = store.create(42, 0).expect("first");
@@ -800,16 +828,17 @@ mod tests {
     }
 
     #[test]
-    fn pre_sessions_live_longer_than_topic_sessions() {
+    fn both_kinds_of_session_live_half_an_hour() {
         let store = AttachStore::default();
         let topic = store.create(42, 0).expect("create");
         let pre = store.create_pre(0).expect("create_pre");
-        assert!(store.status(&topic, 600).is_err(), "topic TTL is 600 s");
-        assert_eq!(
-            store.status(&pre, 1799).expect("still live"),
-            AttachStatus::Pending
-        );
-        assert!(store.status(&pre, 1800).is_err(), "pre TTL is 1800 s");
+        for sid in [&topic, &pre] {
+            assert_eq!(
+                store.status(sid, 1799).expect("still live"),
+                AttachStatus::Pending
+            );
+            assert!(store.status(sid, 1800).is_err(), "the TTL is 1800 s");
+        }
     }
 
     #[test]

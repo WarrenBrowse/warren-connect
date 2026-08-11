@@ -37,15 +37,30 @@ struct StubState {
     upload_ok: bool,
     /// Tags the topic already carries, echoed back by the topic endpoint.
     existing_tags: Vec<String>,
+    /// Serialize those tags the way Discourse 2026.7 does, as `{id, name,
+    /// slug}` objects, rather than as the bare names older releases sent.
+    tags_as_objects: bool,
     calls: Mutex<Vec<StubCall>>,
 }
 
 async fn stub_topic(State(s): State<Arc<StubState>>) -> Json<serde_json::Value> {
+    let tags = if s.tags_as_objects {
+        s.existing_tags
+            .iter()
+            .enumerate()
+            .map(|(i, name)| serde_json::json!({"id": i + 1, "name": name, "slug": name}))
+            .collect::<Vec<_>>()
+    } else {
+        s.existing_tags
+            .iter()
+            .map(|name| serde_json::json!(name))
+            .collect::<Vec<_>>()
+    };
     Json(serde_json::json!({
         "title": "Connexion impossible",
         "details": { "created_by": { "username": s.author } },
         "post_stream": { "posts": [ { "username": s.author } ] },
-        "tags": s.existing_tags,
+        "tags": tags,
     }))
 }
 
@@ -106,15 +121,28 @@ async fn spawn_stub(author: &str, upload_ok: bool) -> (String, Arc<StubState>) {
     spawn_stub_tagged(author, upload_ok, Vec::new()).await
 }
 
+/// Default stub: the tag shape the LIVE forum sends. A stub that kept speaking
+/// the older dialect is what let this suite stay green while every attach on a
+/// tagged topic failed in production.
 async fn spawn_stub_tagged(
     author: &str,
     upload_ok: bool,
     existing_tags: Vec<String>,
 ) -> (String, Arc<StubState>) {
+    spawn_stub_with_tag_shape(author, upload_ok, existing_tags, true).await
+}
+
+async fn spawn_stub_with_tag_shape(
+    author: &str,
+    upload_ok: bool,
+    existing_tags: Vec<String>,
+    tags_as_objects: bool,
+) -> (String, Arc<StubState>) {
     let state = Arc::new(StubState {
         author: author.to_owned(),
         upload_ok,
         existing_tags,
+        tags_as_objects,
         calls: Mutex::new(Vec::new()),
     });
     let app = axum::Router::new()
@@ -1225,6 +1253,35 @@ async fn tagging_preserves_the_tags_the_topic_already_carries() {
     assert!(tags.contains(&"android".to_owned()), "{tags:?}");
     assert!(tags.contains(&"wallet".to_owned()), "{tags:?}");
     assert!(tags.contains(&"logs-attached".to_owned()), "{tags:?}");
+}
+
+#[tokio::test]
+async fn a_forum_that_still_sends_bare_tag_names_attaches_too() {
+    // The forum's tag shape changed under us once; it must be able to change
+    // back, or a Discourse rollback becomes a second outage.
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (url, stub) =
+        spawn_stub_with_tag_shape(&author_username(&key), true, vec!["macos".into()], false).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = state.attach.create(42, now_unix()).expect("create");
+    let body = serde_json::json!({
+        "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
+    })
+    .to_string();
+    let response = router(state)
+        .oneshot(signed_attach_request(&key, &body, [22; 16]))
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = stub.calls.lock().expect("stub mutex");
+    let tag_call = calls.iter().find(|c| c.op == "tag").expect("topic tagged");
+    assert!(tag_call.body.contains("macos"), "{}", tag_call.body);
 }
 
 #[tokio::test]
