@@ -186,8 +186,8 @@ pub fn author_pm_raw(topic_id: u64, topic_title: &str) -> String {
     format!(
         "Merci, les journaux de votre application Warren ont bien \u{e9}t\u{e9} re\u{e7}us pour le sujet \
          \u{ab}\u{a0}{title}\u{a0}\u{bb}.\n\n\
-         Ils sont visibles uniquement par l'\u{e9}quipe support, jamais publiquement, et \
-         n'apparaissent pas dans votre sujet.\n\n\
+         Ils sont visibles uniquement par l'\u{e9}quipe support et n'apparaissent pas \
+         dans votre sujet.\n\n\
          Si vous reproduisez le probl\u{e8}me plus tard, vous pouvez envoyer une version plus \
          r\u{e9}cente depuis le bouton en bas du sujet, autant de fois que n\u{e9}cessaire.\n\n\
          Votre sujet : {FORUM_PUBLIC_URL}/t/{topic_id}"
@@ -221,7 +221,7 @@ pub fn public_note_raw(version: Option<&str>, os: Option<&str>) -> Option<String
     }
     Some(format!(
         "Donn\u{e9}es techniques jointes automatiquement depuis l'application Warren ({}). \
-         Les journaux complets ne sont visibles que par l'\u{e9}quipe support, jamais publiquement.",
+         Les journaux complets ne sont visibles que par l'\u{e9}quipe support.",
         facts.join(", ")
     ))
 }
