@@ -246,7 +246,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(intake_cors());
     axum::Router::new()
         .route("/sso", get(sso_entry))
-        .route("/v1/forum/login", post(forum_login))
+        .route(
+            "/v1/forum/login",
+            // The body is `{"sid":"<32 hex>"}` and it is now parsed BEFORE the
+            // signature verifies (the clock-skew cancel), so the cap is stated
+            // rather than inherited (repo rule: every route with a body).
+            post(forum_login).layer(axum::extract::DefaultBodyLimit::max(1024)),
+        )
         .route("/v1/session/{sid}/status", get(session_status))
         .route("/v1/session/{sid}/cancel", post(session_cancel))
         .route("/v1/session/{sid}/complete", get(session_complete))
@@ -340,6 +346,11 @@ async fn forum_login(
             if matches!(err, AuthError::Clock) {
                 // Best effort: without this the browser polls "pending" until
                 // the TTL and the user never learns their clock is the cause.
+                // The signature is NOT verified at this point, and that is
+                // acceptable for the same reason `session_cancel` below takes
+                // no signature at all: the sid is a 128-bit capability held by
+                // the browser and the app, and the only power here is picking
+                // which of two benign messages that browser shows.
                 if let Ok(login) = serde_json::from_slice::<LoginBody>(&body) {
                     state.sessions.cancel(&login.sid, "clock_skew", now);
                 }
@@ -351,7 +362,9 @@ async fn forum_login(
                     "forum login refused: client clock outside window"
                 );
             } else {
-                tracing::info!(error = %err, "forum login auth refused");
+                // Debug, not info: this route is public and unauthenticated,
+                // so an info line per garbage request is a log amplifier.
+                tracing::debug!(error = %err, "forum login auth refused");
             }
             return Err(err);
         }

@@ -270,10 +270,14 @@ async fn a_clock_skewed_login_answers_a_machine_readable_401_and_cancels_the_ses
         .await
         .expect("body")
         .to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error body");
+    // Byte-exact on purpose: three clients (Android/iOS FFI, desktop) match
+    // this token as a substring of the body, so a re-serialization with a
+    // space or a wrapper object would silently drop them all onto the generic
+    // message with every parsed-value assertion still green.
     assert_eq!(
-        json["error"], "clock_skew",
-        "the app matches this exact token to tell the user to fix the clock"
+        &body[..],
+        br#"{"error":"clock_skew"}"#,
+        "the app matches these exact bytes to tell the user to fix the clock"
     );
 
     let status = app
@@ -330,8 +334,7 @@ async fn a_skewed_login_on_an_unparseable_body_still_answers_the_clock_token() {
         .await
         .expect("body")
         .to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["error"], "clock_skew");
+    assert_eq!(&bytes[..], br#"{"error":"clock_skew"}"#);
 }
 
 #[tokio::test]

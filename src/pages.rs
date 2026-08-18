@@ -158,14 +158,23 @@ pub fn approval_page(
 <script nonce="{nonce}">
   const el = document.getElementById('state');
   let timer = null;
+  let done = false;
   const poll = async () => {{
     timer = null;
+    if (done) return;
     try {{
-      const r = await fetch('/v1/session/{sid}/status');
-      if (!r.ok) {{ el.textContent = el.dataset.expired; return; }}
+      // Bounded: a fetch frozen by a background tab must settle, or the
+      // chain is stranded with nothing left to reschedule it.
+      const r = await fetch('/v1/session/{sid}/status',
+        {{ signal: AbortSignal.timeout(5000) }});
+      // Only "no such session" is terminal; a 502 while the service restarts
+      // is not, and the next poll recovers from it.
+      if (r.status === 404) {{ done = true; el.textContent = el.dataset.expired; return; }}
+      if (!r.ok) {{ timer = setTimeout(poll, 700); return; }}
       const s = await r.json();
-      if (s.status === 'approved') {{ window.location = '/v1/session/{sid}/complete'; return; }}
+      if (s.status === 'approved') {{ done = true; window.location = '/v1/session/{sid}/complete'; return; }}
       if (s.status === 'cancelled') {{
+        done = true;
         el.textContent = s.reason === 'subscription_required' ? el.dataset.subscription
           : s.reason === 'clock_skew' ? el.dataset.clock
           : el.dataset.cancelled;
@@ -176,11 +185,11 @@ pub fn approval_page(
   }};
   // Tapping the button backgrounds this tab and the browser freezes its
   // timers (measured live 2026-08-18: an approved login sat on "waiting" for
-  // ~50 s after the return). Poll the moment the page is visible again; the
-  // timer guard keeps a single chain, and a terminal state (timer null after
-  // return) stays terminal.
+  // ~50 s after the return). Poll the moment the page is visible again. A
+  // pending timer is replaced so there is ever one chain; a fetch in flight
+  // is left to settle (it is bounded above) and reschedules itself.
   document.addEventListener('visibilitychange', () => {{
-    if (document.visibilityState === 'visible' && timer !== null) {{
+    if (document.visibilityState === 'visible' && !done && timer !== null) {{
       clearTimeout(timer);
       poll();
     }}
