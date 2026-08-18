@@ -187,6 +187,20 @@ impl SessionStore {
         }
     }
 
+    /// True when the session behind either id was cancelled (app declined,
+    /// login refused). False for an unknown or expired id: those fail later
+    /// on their own path.
+    #[must_use]
+    pub fn is_cancelled(&self, sid: &str, now_unix: u64) -> bool {
+        let Ok((primary, _)) = self.resolve(sid, now_unix) else {
+            return false;
+        };
+        let sessions = self.sessions.lock().expect("session mutex never poisoned");
+        sessions
+            .get(&primary)
+            .is_some_and(|s| s.cancelled.is_some())
+    }
+
     /// Attaches the proven identity to a pending session. Accepts either id;
     /// the caller decides what to put in `user` from the [`Approach`] it got
     /// out of [`Self::resolve`].
@@ -333,6 +347,24 @@ mod tests {
         // A late approval must NOT resurrect a cancelled session.
         assert!(store.approve(&sid, user(), 3).is_err());
         assert!(store.consume(&sid, 4).is_err());
+    }
+
+    #[test]
+    fn a_cancelled_session_reports_it_before_any_work_is_done_for_it() {
+        // The login handler asks this BEFORE the subscription lookup and the
+        // link upsert: a corrected retry on a sid the provider already
+        // cancelled (clock skew) is doomed, so it must not write two rows on
+        // its way to the refusal.
+        let store = SessionStore::default();
+        let ids = store.create("n".into(), "r".into(), 0).expect("create");
+        assert!(!store.is_cancelled(&ids.sid, 1));
+        store.cancel(&ids.qr_sid, "clock_skew", 2);
+        assert!(store.is_cancelled(&ids.sid, 3), "either id sees the cancel");
+        assert!(store.is_cancelled(&ids.qr_sid, 3));
+        assert!(
+            !store.is_cancelled("deadbeef", 3),
+            "unknown is not cancelled"
+        );
     }
 
     #[test]

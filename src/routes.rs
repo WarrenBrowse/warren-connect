@@ -376,6 +376,12 @@ async fn forum_login(
     // from a second device, which is exactly the shape of a relayed
     // (phished) approval, so nothing that GRANTS anything may ride on it.
     let (primary_sid, approach) = state.sessions.resolve(&login.sid, now)?;
+    // A cancelled session cannot be approved (the browser already gave up on
+    // it), so refuse here rather than after the lookup and the link upsert:
+    // a corrected retry after a clock-skew cancel is the common shape.
+    if state.sessions.is_cancelled(&primary_sid, now) {
+        return Err(AuthError::Session);
+    }
 
     // Staff is an allowlist, independent of payment: admins are operators and
     // must not be locked out of their own forum by the paywall.
