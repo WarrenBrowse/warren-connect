@@ -101,6 +101,16 @@ impl IntoResponse for AuthError {
             )
                 .into_response();
         }
+        // The one auth failure the CLIENT can repair itself: the app matches
+        // this token to tell the user to fix the device clock, so it must stay
+        // machine-readable where the other 401s stay deliberately generic.
+        if matches!(self, AuthError::Clock) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "clock_skew"})),
+            )
+                .into_response();
+        }
         let status = match self {
             AuthError::Session => StatusCode::NOT_FOUND,
             AuthError::SubscriptionRequired => StatusCode::FORBIDDEN,

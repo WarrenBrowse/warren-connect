@@ -151,26 +151,40 @@ pub fn approval_page(
   <p class="muted">{session} <code>{sid}</code> &middot; {expires}</p>
   <p id="state" class="muted"
      data-expired="{expired}" data-subscription="{subscription}"
-     data-cancelled="{cancelled}">{waiting}</p>
+     data-cancelled="{cancelled}" data-clock="{clock}">{waiting}</p>
   <hr class="rule">
   <p class="foot tagline">{tagline}</p>
 </div>
 <script nonce="{nonce}">
   const el = document.getElementById('state');
+  let timer = null;
   const poll = async () => {{
+    timer = null;
     try {{
       const r = await fetch('/v1/session/{sid}/status');
       if (!r.ok) {{ el.textContent = el.dataset.expired; return; }}
       const s = await r.json();
       if (s.status === 'approved') {{ window.location = '/v1/session/{sid}/complete'; return; }}
       if (s.status === 'cancelled') {{
-        el.textContent = s.reason === 'subscription_required'
-          ? el.dataset.subscription : el.dataset.cancelled;
+        el.textContent = s.reason === 'subscription_required' ? el.dataset.subscription
+          : s.reason === 'clock_skew' ? el.dataset.clock
+          : el.dataset.cancelled;
         return;
       }}
     }} catch (e) {{}}
-    setTimeout(poll, 700);
+    timer = setTimeout(poll, 700);
   }};
+  // Tapping the button backgrounds this tab and the browser freezes its
+  // timers (measured live 2026-08-18: an approved login sat on "waiting" for
+  // ~50 s after the return). Poll the moment the page is visible again; the
+  // timer guard keeps a single chain, and a terminal state (timer null after
+  // return) stays terminal.
+  document.addEventListener('visibilitychange', () => {{
+    if (document.visibilityState === 'visible' && timer !== null) {{
+      clearTimeout(timer);
+      poll();
+    }}
+  }});
   poll();
 </script>
 </body>
@@ -189,6 +203,7 @@ pub fn approval_page(
         expired = s.a_expired,
         subscription = s.a_subscription,
         cancelled = s.a_cancelled,
+        clock = s.a_clock,
         tagline = s.tagline,
     )
 }

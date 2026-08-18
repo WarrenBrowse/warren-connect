@@ -327,14 +327,35 @@ async fn forum_login(
 ) -> Result<Response, AuthError> {
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
-    let identity = verify_signed_request(
+    let identity = match verify_signed_request(
         &signed,
         "POST",
         "/v1/forum/login",
         &body,
         now,
         &state.nonces,
-    )?;
+    ) {
+        Ok(identity) => identity,
+        Err(err) => {
+            if matches!(err, AuthError::Clock) {
+                // Best effort: without this the browser polls "pending" until
+                // the TTL and the user never learns their clock is the cause.
+                if let Ok(login) = serde_json::from_slice::<LoginBody>(&body) {
+                    state.sessions.cancel(&login.sid, "clock_skew", now);
+                }
+                // The drift is a duration, not an identifier: logging it is
+                // what turns a 100%-failure day into a one-grep diagnosis
+                // (2026-08-18 left no application-side trace at all).
+                tracing::info!(
+                    drift_secs = now.abs_diff(signed.timestamp),
+                    "forum login refused: client clock outside window"
+                );
+            } else {
+                tracing::info!(error = %err, "forum login auth refused");
+            }
+            return Err(err);
+        }
+    };
 
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
 

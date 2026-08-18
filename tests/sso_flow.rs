@@ -179,6 +179,202 @@ async fn unknown_session_status_is_not_found() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// The sid the approval page hands the app, read the way the app reads it.
+fn sid_from_page(html: &str) -> String {
+    html.split("forum-login?sid=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("the approval page carries the deep link")
+        .to_owned()
+}
+
+fn signed_login_request(
+    key: &ed25519_dalek::SigningKey,
+    sid: &str,
+    timestamp: u64,
+    nonce: [u8; 16],
+) -> Request<Body> {
+    use warren_contract::auth::{
+        HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
+    };
+    let body = format!("{{\"sid\":\"{sid}\"}}");
+    let s = sign_request(
+        key,
+        "POST",
+        "/v1/forum/login",
+        body.as_bytes(),
+        timestamp,
+        nonce,
+    );
+    Request::post("/v1/forum/login")
+        .header(HEADER_PUBKEY, s.pubkey_ss58)
+        .header(HEADER_SIGNATURE, s.signature_hex)
+        .header(HEADER_TIMESTAMP, s.timestamp.to_string())
+        .header(HEADER_NONCE, s.nonce_hex)
+        .body(Body::from(body))
+        .expect("request")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs()
+}
+
+async fn approval_page_sid(app: &axum::Router) -> String {
+    let (sso, sig) = signed_sso(
+        "nonce=nclock&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login",
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/sso?sso={}&sig={sig}", urlencoding::encode(&sso)))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    sid_from_page(std::str::from_utf8(&body).expect("utf8"))
+}
+
+#[tokio::test]
+async fn a_clock_skewed_login_answers_a_machine_readable_401_and_cancels_the_session() {
+    // A device whose wall clock is off by more than the accepted window signs
+    // a request the server must refuse. Two things have to be true for the
+    // failure to be diagnosable at all: the app gets a stable error token it
+    // can turn into "fix your clock" (the 2026-08-18 failures all surfaced as
+    // a generic "sign-in failed"), and the waiting browser page is told, or it
+    // polls "pending" until the session dies with no explanation.
+    let app = router(test_state());
+    let sid = approval_page_sid(&app).await;
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let response = app
+        .clone()
+        .oneshot(signed_login_request(&key, &sid, unix_now() - 120, [2; 16]))
+        .await
+        .expect("infallible");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error body");
+    assert_eq!(
+        json["error"], "clock_skew",
+        "the app matches this exact token to tell the user to fix the clock"
+    );
+
+    let status = app
+        .oneshot(
+            Request::get(format!("/v1/session/{sid}/status"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    let body = status.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["status"], "cancelled");
+    assert_eq!(
+        json["reason"], "clock_skew",
+        "the polling page explains the cause instead of waiting out the TTL"
+    );
+}
+
+#[tokio::test]
+async fn a_skewed_login_on_an_unparseable_body_still_answers_the_clock_token() {
+    // The cancel is best effort: a body that names no session must not turn
+    // the diagnosable 401 into a 500 or a different error.
+    let app = router(test_state());
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    use warren_contract::auth::{
+        HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
+    };
+    let body = "not-json";
+    let s = sign_request(
+        &key,
+        "POST",
+        "/v1/forum/login",
+        body.as_bytes(),
+        unix_now() - 120,
+        [3; 16],
+    );
+    let response = app
+        .oneshot(
+            Request::post("/v1/forum/login")
+                .header(HEADER_PUBKEY, s.pubkey_ss58)
+                .header(HEADER_SIGNATURE, s.signature_hex)
+                .header(HEADER_TIMESTAMP, s.timestamp.to_string())
+                .header(HEADER_NONCE, s.nonce_hex)
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["error"], "clock_skew");
+}
+
+#[tokio::test]
+async fn the_approval_page_explains_clock_skew_and_repolls_when_brought_back_to_front() {
+    // Two mobile lessons from 2026-08-18, measured on a live login: the tap
+    // that opens the app backgrounds the browser, whose timers freeze, so the
+    // page must re-poll the moment it becomes visible again (it sat on
+    // "Waiting for approval" for ~50 s after an approval had landed); and a
+    // clock_skew cancellation needs its own wording, or the user reads a
+    // generic cancel and retries forever.
+    let app = router(test_state());
+    let (sso, sig) = signed_sso(
+        "nonce=npage&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login",
+    );
+    let response = app
+        .oneshot(
+            Request::get(format!("/sso?sso={}&sig={sig}", urlencoding::encode(&sso)))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let html = String::from_utf8(body.to_vec()).expect("utf8");
+    assert!(
+        html.contains("data-clock="),
+        "the page carries a clock-skew message for the poll to show"
+    );
+    assert!(
+        html.contains("clock_skew"),
+        "the poll maps the clock_skew reason onto that message"
+    );
+    assert!(
+        html.contains("visibilitychange"),
+        "the page re-polls immediately when it becomes visible again"
+    );
+}
+
 #[tokio::test]
 async fn login_with_garbage_headers_is_unauthorized() {
     let app = router(test_state());
