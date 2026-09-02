@@ -226,8 +226,40 @@ fn tracing_call_sites(body: &str) -> Vec<String> {
 fn wallet_to_topic_links(body: &str) -> Vec<String> {
     tracing_call_sites(&code_only(body))
         .into_iter()
-        .filter(|site| site.contains("pubkey") && site.contains("topic_id"))
+        .filter(|site| site.contains("pubkey") && names_a_topic(site))
         .collect()
+}
+
+/// Any spelling of the topic a call site could carry: the id, the public
+/// URL, or a `topic` binding.
+fn names_a_topic(site: &str) -> bool {
+    site.contains("topic_id") || site.contains("topic_url") || site.contains("topic =")
+}
+
+/// `tracing_call_sites` finds fully qualified `tracing::<level>!(` sites and
+/// nothing else, so the guard is only as good as that spelling being the
+/// only one in `src/`: a `use tracing::info;` plus a bare `info!(...)` would
+/// be invisible to it. Pin the assumption: no `use tracing` import, and every
+/// `<level>!(` occurrence is preceded by `tracing::`.
+#[test]
+fn every_tracing_call_site_is_fully_qualified() {
+    let mut files = Vec::new();
+    collect_rs_files(std::path::Path::new("src"), "", &mut files);
+    for file in files {
+        let body = code_only(&read_module(&file));
+        assert!(
+            !body.contains("use tracing"),
+            "src/{file} imports from tracing; the log guards only see `tracing::<level>!(` sites"
+        );
+        for level in ["error", "warn", "info", "debug", "trace"] {
+            let bare = body.matches(&format!("{level}!(")).count();
+            let qualified = body.matches(&format!("tracing::{level}!(")).count();
+            assert_eq!(
+                bare, qualified,
+                "src/{file} has a `{level}!(` call the log guards cannot see; write `tracing::{level}!(`"
+            );
+        }
+    }
 }
 
 #[test]
@@ -272,4 +304,25 @@ fn the_link_scan_rejects_any_line_carrying_both_and_keeps_a_one_sided_one() {
     let no_topic =
         r#"tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");"#;
     assert!(wallet_to_topic_links(no_topic).is_empty());
+    let by_url =
+        r#"tracing::info!(pubkey = %redact(&identity.pubkey_ss58), topic_url = %url, "created");"#;
+    assert_eq!(wallet_to_topic_links(by_url).len(), 1);
+    let by_binding =
+        r#"tracing::info!(pubkey = %redact(&identity.pubkey_ss58), topic = id, "created");"#;
+    assert_eq!(wallet_to_topic_links(by_binding).len(), 1);
+}
+
+#[test]
+fn the_qualification_check_sees_a_bare_call_site() {
+    let bare = code_only(
+        r#"
+        use tracing::info;
+        info!(topic_id, "created");
+        "#,
+    );
+    assert!(bare.contains("use tracing"));
+    assert_ne!(
+        bare.matches("info!(").count(),
+        bare.matches("tracing::info!(").count()
+    );
 }
