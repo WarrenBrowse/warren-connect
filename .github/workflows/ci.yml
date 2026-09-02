@@ -103,15 +103,27 @@ jobs:
       # a real finding here rather than hygiene. Installed on demand: the
       # runner image carries no cargo-deny and a docker action is unavailable
       # (no daemon on this pool).
+      # cargo-deny's own git fetch of the advisory database failed on every
+      # run of 2026-09-02 (a cached clone that could not fast-forward, then a
+      # fresh clone that could not clone at all), with no code change between
+      # runs. The checkout action fetches through the token-backed path that
+      # every other step of this workflow already relies on, into the exact
+      # directory cargo-deny derives for the default database URL, and the
+      # check then runs without touching the network.
+      - name: Fetch the RustSec advisory database
+        uses: actions/checkout@v5
+        with:
+          repository: RustSec/advisory-db
+          ref: main
+          path: advisory-db
+          fetch-depth: 1
       - name: cargo deny (advisories, bans, licenses, sources)
         run: |
           set -euo pipefail
           if ! command -v cargo-deny >/dev/null 2>&1; then
             cargo install --locked cargo-deny
           fi
-          # A cached advisory-db clone that cannot fast-forward its `main`
-          # fails every run with "failed to fetch latest changes" (three
-          # reruns on 2026-09-02, no code change between them). A fresh
-          # shallow clone costs seconds and cannot be stale.
           rm -rf ~/.cargo/advisory-dbs
-          cargo deny check advisories bans licenses sources
+          mkdir -p ~/.cargo/advisory-dbs
+          cp -R advisory-db ~/.cargo/advisory-dbs/advisory-db-3157b0e258782691
+          cargo deny check --disable-fetch advisories bans licenses sources
