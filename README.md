@@ -71,7 +71,8 @@ warren-admin.
 | `DISCOURSE_REPORT_API_KEY` | all-users Discourse API key with the granular `topics:write` scope, acting as the reporter so the in-app report topic is theirs; empty disables the report endpoint (503) |
 | `DISCOURSE_REPORT_CATEGORY_ID` | category id (u64) the in-app reports are created in (the bug-reports category); required with the key above |
 | `REPORT_MAX_PER_WALLET` | in-app reports admitted per wallet and per hour, default 3 |
-| `REPORT_MAX_GLOBAL` | in-app reports admitted in total per hour, default 20 |
+| `REPORT_MAX_GLOBAL` | in-app reports admitted in total per hour, default 20 (also caps the failed decodes below, in total) |
+| `REPORT_MAX_DECODE_FAILURES` | in-app report logs that failed to decode, tolerated per wallet and per hour before the wallet's log-bearing reports are refused, default 3; a failed decode creates nothing and does not count as a report |
 | `HELP_REPLY_MAX_PER_IP` | guest follow-ups admitted per IP and per hour, default 10 |
 | `HELP_REPLY_MAX_GLOBAL` | guest follow-ups admitted in total per hour, default 60 |
 

@@ -520,6 +520,36 @@ where
         w.global.push(now_unix);
         Ok(())
     }
+
+    /// Gives back the most recent admission of `key`: the attempt was
+    /// admitted and then produced nothing (an in-app report whose log did
+    /// not decode creates no topic), so it must not count against the
+    /// budget. One slot is refunded in both windows; a key with no live
+    /// admission is a no-op.
+    pub fn release<Q>(&self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(hits) = w.per_key.get_mut(key) else {
+            return;
+        };
+        let popped = hits.pop();
+        let emptied = hits.is_empty();
+        if emptied {
+            w.per_key.remove(key);
+        }
+        let Some(at) = popped else {
+            return;
+        };
+        if let Some(index) = w.global.iter().rposition(|&t| t == at) {
+            w.global.remove(index);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -720,6 +750,54 @@ mod tests {
         // (the t=1 and t=2 hits are still live at now=3600).
         limiter.admit(Some(ip), 3_600).expect("first hit aged out");
         assert!(limiter.admit(Some(ip), 3_600).is_err());
+    }
+
+    #[test]
+    fn a_released_admission_frees_the_per_key_slot() {
+        let limiter: RateLimiter = RateLimiter::new(1, 30, 3_600);
+        let ip: IpAddr = "203.0.113.7".parse().expect("ip");
+        limiter.admit(Some(ip), 0).expect("first admitted");
+        assert!(limiter.admit(Some(ip), 1).is_err(), "budget spent");
+        limiter.release(&Some(ip));
+        limiter
+            .admit(Some(ip), 2)
+            .expect("the refunded slot is free again");
+        assert!(limiter.admit(Some(ip), 3).is_err(), "one refund, one slot");
+    }
+
+    #[test]
+    fn a_released_admission_frees_the_global_slot_too() {
+        let limiter: RateLimiter = RateLimiter::new(5, 1, 3_600);
+        let a: IpAddr = "203.0.113.1".parse().expect("ip");
+        let b: IpAddr = "203.0.113.2".parse().expect("ip");
+        limiter
+            .admit(Some(a), 0)
+            .expect("a fills the global window");
+        assert!(limiter.admit(Some(b), 1).is_err(), "global cap reached");
+        limiter.release(&Some(a));
+        limiter
+            .admit(Some(b), 2)
+            .expect("a's refund frees the global slot");
+    }
+
+    #[test]
+    fn releasing_a_key_without_a_live_admission_changes_nothing() {
+        let limiter: RateLimiter = RateLimiter::new(1, 30, 3_600);
+        let a: IpAddr = "203.0.113.1".parse().expect("ip");
+        let b: IpAddr = "203.0.113.2".parse().expect("ip");
+        limiter.admit(Some(a), 0).expect("admitted");
+        limiter.release(&Some(b));
+        assert!(
+            limiter.admit(Some(a), 1).is_err(),
+            "a's slot is still spent"
+        );
+        limiter.release(&Some(a));
+        limiter.release(&Some(a));
+        limiter.admit(Some(a), 2).expect("one refund");
+        assert!(
+            limiter.admit(Some(a), 3).is_err(),
+            "a second release of the same admission refunds nothing"
+        );
     }
 
     #[test]

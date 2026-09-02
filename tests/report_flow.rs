@@ -206,6 +206,7 @@ fn test_state(
                 topic_api: ForumApi::new(url, "report-key".into(), "system".into(), "staff".into()),
                 category_id: 13,
                 limiter: RateLimiter::new(per_wallet, 20, 3_600),
+                decode_failures: RateLimiter::new(3, 20, 3_600),
             }),
         ),
         None => (None, None),
@@ -827,5 +828,136 @@ async fn a_corrupt_log_from_an_admitted_member_costs_no_forum_write() {
     assert!(
         ops(&stub).is_empty(),
         "nothing reaches Discourse for a corrupt log"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_decode_hands_the_topic_slot_back_so_a_log_free_report_still_files() {
+    // The decode is charged to the wallet's topic budget before it runs, so
+    // the budget bounds the inflate work; a payload that does not decode
+    // creates nothing, so it must hand the slot back. This endpoint is the
+    // only channel of the user who cannot sign in: a corrupt log must not
+    // lock their log-free report out for the rest of the hour.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(33);
+    let state = test_state(Some(&url), Some(&key), 1);
+
+    let app = warren_connect::routes::router(state.clone());
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &corrupt_report_body(),
+            [70; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let app = warren_connect::routes::router(state);
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &report_body(None),
+            [71; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the refused decode left the wallet's only topic slot free"
+    );
+    assert_eq!(
+        ops(&stub).iter().filter(|op| *op == "topic_create").count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_fourth_failed_decode_of_a_wallet_is_refused_by_its_own_budget() {
+    // The refund above must not turn the inflate into free work: failed
+    // decodes have a budget of their own (3 per wallet per hour here), past
+    // which a log-bearing report is refused before anything is inflated,
+    // while a log-free report from the same wallet still files.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(34);
+    let state = test_state(Some(&url), Some(&key), 3);
+
+    for n in 0..3u8 {
+        let app = warren_connect::routes::router(state.clone());
+        let response = app
+            .oneshot(signed_report(
+                &key,
+                &corrupt_report_body(),
+                [80 + n; 16],
+                now_unix(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "failed decode {n} is answered by the decoder"
+        );
+    }
+    let app = warren_connect::routes::router(state.clone());
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &corrupt_report_body(),
+            [90; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the decode budget answers before the decoder"
+    );
+    let app = warren_connect::routes::router(state.clone());
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &report_body(Some(REPORT)),
+            [91; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a valid log is not inflated either once the decode budget is spent"
+    );
+    assert!(
+        ops(&stub).is_empty(),
+        "nothing reached Discourse while every attempt was refused"
+    );
+
+    for n in 0..3u8 {
+        let app = warren_connect::routes::router(state.clone());
+        let response = app
+            .oneshot(signed_report(
+                &key,
+                &report_body(None),
+                [100 + n; 16],
+                now_unix(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "log-free report {n} still files: no refused attempt spent a topic slot"
+        );
+    }
+    assert_eq!(
+        ops(&stub).iter().filter(|op| *op == "topic_create").count(),
+        3
     );
 }

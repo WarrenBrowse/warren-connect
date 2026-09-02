@@ -85,6 +85,10 @@ pub struct ReportState {
     /// id: a signed route must never see a client IP, so the wallet is the
     /// only per-identity budget it can have.
     pub limiter: crate::intake::RateLimiter<String>,
+    /// Budget of failed log decodes, same key. A payload that does not
+    /// decode creates no topic and hands its topic slot back; this is what
+    /// bounds the gunzip work such a wallet can still buy.
+    pub decode_failures: crate::intake::RateLimiter<String>,
 }
 
 /// Everything the guest intake endpoint needs; absent = feature disabled.
@@ -1091,6 +1095,36 @@ fn decode_report(
     Ok((log_text, meta))
 }
 
+/// [`decode_report`] under the wallet's decode-failure budget. The attempt is
+/// charged to that budget up front and refunded on success, so only failures
+/// accumulate and the gunzip work a wallet can buy stays bounded; a failure
+/// refunds the topic slot the caller charged, because nothing was created.
+/// Without the refund three broken payloads closed the endpoint for an hour,
+/// log-free reports included, and this endpoint is the only channel of the
+/// user who cannot complete the browser sign-in.
+fn decode_budgeted(
+    report_state: &ReportState,
+    wallet: &str,
+    log_gz_b64: &str,
+    signer_ss58: &str,
+    now: u64,
+) -> Result<(String, attach::ReportMeta), AuthError> {
+    if let Err(err) = report_state.decode_failures.admit(wallet.to_owned(), now) {
+        report_state.limiter.release(wallet);
+        return Err(err);
+    }
+    match decode_report(log_gz_b64, signer_ss58, None) {
+        Ok(decoded) => {
+            report_state.decode_failures.release(wallet);
+            Ok(decoded)
+        }
+        Err(err) => {
+            report_state.limiter.release(wallet);
+            Err(err)
+        }
+    }
+}
+
 /// Names a decode refusal by the topic when there is one and by the wallet
 /// otherwise, never both: on the topic path the author check has already
 /// tied the signer to a public topic, so the pair, even redacted, would be
@@ -1172,16 +1206,21 @@ async fn forum_report(
         })?;
     // Charged after the signature and the gate: a forged or never-paid
     // request must not burn a member's budget.
-    report_state
-        .limiter
-        .admit(admitted.forum.external_id.clone(), now)?;
+    let wallet = admitted.forum.external_id.as_str();
+    report_state.limiter.admit(wallet.to_owned(), now)?;
 
     // Inflated only past the gate and the budget: the gunzip is the costly
     // step and a never-paid wallet must not be able to buy it for the price
     // of a signature. Still before any write, so a broken payload costs no
     // Discourse call.
     let decoded = match req.log_gz_b64.as_deref() {
-        Some(b64) => Some(decode_report(b64, &identity.pubkey_ss58, None)?),
+        Some(b64) => Some(decode_budgeted(
+            report_state,
+            wallet,
+            b64,
+            &identity.pubkey_ss58,
+            now,
+        )?),
         None => None,
     };
 

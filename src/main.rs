@@ -227,6 +227,14 @@ async fn main() -> anyhow::Result<()> {
                     env_usize("REPORT_MAX_GLOBAL", 20),
                     3_600,
                 ),
+                // A refused decode gives its topic slot back, so this is the
+                // budget that bounds the gunzip a wallet can make the server
+                // do without ever filing anything.
+                decode_failures: warren_connect::intake::RateLimiter::new(
+                    env_usize("REPORT_MAX_DECODE_FAILURES", 3),
+                    env_usize("REPORT_MAX_GLOBAL", 20),
+                    3_600,
+                ),
             })
         }
     };
