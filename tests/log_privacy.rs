@@ -169,3 +169,100 @@ fn the_scan_rejects_a_leaking_log_line() {
         );
     }
 }
+
+/// Every `tracing::<level>!(...)` call site in a source body, as the text
+/// between the macro's parentheses. String literals are skipped when
+/// balancing the parentheses, so a message like `"(API 35)"` cannot cut a
+/// block short.
+fn tracing_call_sites(body: &str) -> Vec<String> {
+    let mut sites = Vec::new();
+    for level in ["error", "warn", "info", "debug", "trace"] {
+        let opener = format!("tracing::{level}!(");
+        let mut from = 0;
+        while let Some(at) = body[from..].find(&opener) {
+            let start = from + at + opener.len();
+            let mut depth = 1usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (offset, ch) in body[start..].char_indices() {
+                if in_string {
+                    match ch {
+                        '\\' if !escaped => escaped = true,
+                        '"' if !escaped => in_string = false,
+                        _ => escaped = false,
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.expect("unbalanced tracing call site");
+            sites.push(body[start..end].to_owned());
+            from = end;
+        }
+    }
+    sites
+}
+
+/// A line that names both the wallet and a topic is the wallet-to-forum link
+/// the pairwise handle exists to break, and `docker logs` is retained. Even
+/// redacted, an 8-character prefix over a user base of tens of wallets is
+/// identifying. So a call site carrying both a `pubkey` field and a
+/// `topic_id` field is only ever a refusal (a refusal is the trace an
+/// incident needs, and it names a topic nothing was written to); a success
+/// line keeps the topic and drops the wallet.
+fn wallet_to_topic_links(body: &str) -> Vec<String> {
+    tracing_call_sites(&code_only(body))
+        .into_iter()
+        .filter(|site| site.contains("pubkey") && site.contains("topic_id"))
+        .filter(|site| !site.contains("refused"))
+        .collect()
+}
+
+#[test]
+fn no_success_line_links_a_wallet_to_a_topic() {
+    let mut files = Vec::new();
+    collect_rs_files(std::path::Path::new("src"), "", &mut files);
+    for file in files {
+        let links = wallet_to_topic_links(&read_module(&file));
+        assert!(
+            links.is_empty(),
+            "src/{file} logs a wallet next to a topic on a success path: {links:?}. \
+             Drop the pubkey field; the topic id alone is what the operator needs."
+        );
+    }
+}
+
+#[test]
+fn the_link_scan_rejects_a_success_line_and_keeps_a_refusal() {
+    let success = r#"
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            topic_id,
+            "in-app report topic created (API 35)"
+        );
+    "#;
+    assert_eq!(wallet_to_topic_links(success).len(), 1);
+    let refusal = r#"
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            topic_id = req.topic_id,
+            "attach-logs refused: signer is not the topic author"
+        );
+    "#;
+    assert!(wallet_to_topic_links(refusal).is_empty());
+    let no_topic =
+        r#"tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");"#;
+    assert!(wallet_to_topic_links(no_topic).is_empty());
+}

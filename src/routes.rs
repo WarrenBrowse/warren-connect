@@ -940,11 +940,9 @@ async fn forum_attach_logs(
     }
 
     state.attach.complete(&req.sid, now_unix())?;
-    tracing::info!(
-        pubkey = %redact(&identity.pubkey_ss58),
-        topic_id = req.topic_id,
-        "forum logs attached"
-    );
+    // No wallet next to the topic on a success line, for the same reason as
+    // the in-app report: the topic is public and the log is retained.
+    tracing::info!(topic_id = req.topic_id, "forum logs attached");
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({"status": "attached"})),
@@ -1239,8 +1237,10 @@ async fn forum_report(
         }
     };
 
+    // No wallet on this line: the topic is public and the log is retained, so
+    // a pubkey next to it, even redacted, is the wallet-to-forum link the
+    // pairwise handle exists to break.
     tracing::info!(
-        pubkey = %redact(&identity.pubkey_ss58),
         topic_id,
         platform,
         area = req.area.short(),
