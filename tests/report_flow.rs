@@ -711,3 +711,121 @@ async fn a_replayed_nonce_is_refused() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(ops(&stub).len(), 2, "the replay reached no forum write");
 }
+
+/// A `log_gz_b64` that is valid base64 of something that is not a gzip
+/// stream: the JSON shape is fine, so the only thing that can refuse it is
+/// the decoder.
+fn corrupt_report_body() -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&report_body(None)).expect("report json");
+    v["log_gz_b64"] = serde_json::Value::String(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"this is not a gzip stream",
+    ));
+    v.to_string()
+}
+
+#[tokio::test]
+async fn a_never_paid_wallet_with_a_corrupt_log_is_refused_by_the_gate_not_the_decoder() {
+    // Inflating a log is the most expensive thing this handler does before
+    // its first Discourse call (up to 32 MiB per request), and a wallet is
+    // free to mint. The gate has to answer before any of that work, or a
+    // never-paid wallet buys the server's CPU for the price of a signature.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(30);
+    let state = test_state(Some(&url), None, 3);
+    let app = warren_connect::routes::router(state);
+
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &corrupt_report_body(),
+            [30; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "the subscription gate answers, not the decoder"
+    );
+    assert!(
+        ops(&stub).is_empty(),
+        "no Discourse call for a refused wallet"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_wallet_with_a_corrupt_log_is_refused_by_the_budget_not_the_decoder() {
+    // Same order one step further: a member who is out of budget pays no
+    // inflate either, so the per-wallet budget bounds the decode work too.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(31);
+    let state = test_state(Some(&url), Some(&key), 3);
+
+    for n in 0..3u8 {
+        let app = warren_connect::routes::router(state.clone());
+        let response = app
+            .oneshot(signed_report(
+                &key,
+                &report_body(None),
+                [40 + n; 16],
+                now_unix(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "report {n} admitted"
+        );
+    }
+    let app = warren_connect::routes::router(state);
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &corrupt_report_body(),
+            [50; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the budget answers, not the decoder"
+    );
+    assert_eq!(
+        ops(&stub).iter().filter(|op| *op == "topic_create").count(),
+        3,
+        "the refused report reached the forum no more than the admitted ones"
+    );
+}
+
+#[tokio::test]
+async fn a_corrupt_log_from_an_admitted_member_costs_no_forum_write() {
+    // The decode sits past the gate and the budget, and still before the
+    // first Discourse call: a broken payload is refused with nothing created.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(32);
+    let state = test_state(Some(&url), Some(&key), 3);
+    let app = warren_connect::routes::router(state);
+
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &corrupt_report_body(),
+            [60; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ops(&stub).is_empty(),
+        "nothing reaches Discourse for a corrupt log"
+    );
+}

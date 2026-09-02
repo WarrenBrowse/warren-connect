@@ -1097,6 +1097,13 @@ fn decode_report(
 /// as attach-logs delivers them. For the user who cannot complete the browser
 /// sign-in, and therefore cannot file the report from the forum.
 ///
+/// Order before the first Discourse call: validate, gate, budget, decode.
+/// The JSON shape and the field caps are checked first because they are
+/// cheap; the subscription gate and the per-wallet budget come next because a
+/// wallet is free to mint; the gunzip comes last because it is the expensive
+/// step (up to 32 MiB per request) and only an admitted member in budget may
+/// make the server do it.
+///
 /// Order of the Discourse writes: account sync, upload, topic, then the staff
 /// notifications. Nothing public exists until the parts that can fail cheaply
 /// have succeeded; past the topic a failure is answered as `partial` rather
@@ -1134,11 +1141,6 @@ async fn forum_report(
         AuthError::InvalidReport
     })?;
     crate::report::validate(&req)?;
-    // Decoded before any write so a broken payload costs no Discourse call.
-    let decoded = match req.log_gz_b64.as_deref() {
-        Some(b64) => Some(decode_report(b64, &identity.pubkey_ss58, None)?),
-        None => None,
-    };
 
     let admitted = admit_forum_identity(&state, &identity)
         .await
@@ -1151,6 +1153,15 @@ async fn forum_report(
     report_state
         .limiter
         .admit(admitted.forum.external_id.clone(), now)?;
+
+    // Inflated only past the gate and the budget: the gunzip is the costly
+    // step and a never-paid wallet must not be able to buy it for the price
+    // of a signature. Still before any write, so a broken payload costs no
+    // Discourse call.
+    let decoded = match req.log_gz_b64.as_deref() {
+        Some(b64) => Some(decode_report(b64, &identity.pubkey_ss58, None)?),
+        None => None,
+    };
 
     // The account the topic will belong to. Never staff on this path: no
     // browser is involved, so nothing proves the same-device approval that
