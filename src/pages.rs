@@ -90,6 +90,35 @@ pub fn cross_device_deep_link(qr_sid: &str, host: &str) -> String {
     cross_device_deep_link_with_scheme(scheme(), qr_sid, host)
 }
 
+/// The Android application id registering `scheme`, one per product
+/// environment (warren-app `android/app/build.gradle.kts`, `productFlavors`).
+/// Chromium's `intent://` form needs it to open the app directly and to fall
+/// back to a URL when the app is absent; an unknown scheme gets no intent link
+/// and the page keeps the plain one.
+#[must_use]
+pub fn android_package_for_scheme(scheme: &str) -> Option<&'static str> {
+    match scheme {
+        "warren" => Some("com.warrenbrowse.vpn"),
+        "warren-beta" => Some("com.warrenbrowse.vpn.beta"),
+        "warren-staging" => Some("com.warrenbrowse.vpn.staging"),
+        _ => None,
+    }
+}
+
+/// The Chromium-on-Android form of the same-device login link: the app
+/// package is named so Chrome opens it without a chooser, and the fallback
+/// URL (appended by the page script, which alone knows its own address)
+/// brings the user back to this page with the recovery block open instead of
+/// dropping the tap silently. Everything before `#Intent` is the frozen deep
+/// link the app parses, so the two forms cannot diverge.
+#[must_use]
+pub fn android_intent_link_with_scheme(scheme: &str, sid: &str, host: &str) -> Option<String> {
+    let package = android_package_for_scheme(scheme)?;
+    Some(format!(
+        "intent://forum-login?sid={sid}&host={host}#Intent;scheme={scheme};package={package};S.browser_fallback_url="
+    ))
+}
+
 /// Approval page shown to the browser while waiting for the app's signature.
 #[must_use]
 pub fn approval_page(
@@ -102,6 +131,7 @@ pub fn approval_page(
     let code = lang.code();
     let sid = ids.sid.as_str();
     let link = deep_link(sid, host);
+    let intent_link = android_intent_link_with_scheme(scheme(), sid, host).unwrap_or_default();
     let qr_link = cross_device_deep_link(&ids.qr_sid, host);
     let qr_svg = QrCode::new(qr_link.as_bytes()).map_or_else(
         |_| String::new(),
@@ -136,6 +166,15 @@ pub fn approval_page(
     margin-top:.6rem;line-height:0;border:1px solid var(--border);}}
   .qr svg{{width:180px;height:180px;display:block;}}
   .foot{{margin-top:1.6rem;}}
+  /* Recovery block: hidden until a tap provably went nowhere. */
+  #noapp{{text-align:left;background:oklch(0.9 0.035 80);border:1px solid var(--border);
+    border-radius:12px;padding:.9rem 1rem;margin:1rem 0 .4rem;}}
+  #noapp h2{{font-size:1.05rem;margin:0 0 .5rem;}}
+  #noapp p{{font-size:.9rem;margin:.45rem 0;}}
+  #noapp code{{font-size:1rem;letter-spacing:.06em;word-break:break-all;}}
+  button.copy{{font:inherit;font-size:.85rem;font-weight:600;color:var(--primary);
+    background:transparent;border:1px solid var(--primary);border-radius:8px;
+    padding:.3rem .7rem;margin-left:.4rem;cursor:pointer;}}
 </style>
 </head>
 <body>
@@ -145,7 +184,15 @@ pub fn approval_page(
   <div class="label">{label}</div>
   <h1>{heading}</h1>
   <p>{body}</p>
-  <a class="button" href="{link}">{button}</a>
+  <a class="button" id="open" href="{link}" data-intent="{intent_link}">{button}</a>
+  <div id="noapp" hidden>
+    <h2>{noapp_heading}</h2>
+    <p>{noapp_browser}</p>
+    <p>{noapp_code}</p>
+    <p><code>{sid}</code><button class="copy" id="copy" type="button"
+       data-copied="{copied}">{copy}</button></p>
+    <p>{noapp_install}</p>
+  </div>
   <p class="muted">{scan}</p>
   <div class="qr">{qr_svg}</div>
   <p class="muted">{session} <code>{sid}</code> &middot; {expires}</p>
@@ -159,6 +206,46 @@ pub fn approval_page(
   const el = document.getElementById('state');
   let timer = null;
   let done = false;
+  // Did the tap take the user to the app? Measured, never assumed: a page
+  // that leaves (pagehide, or hidden visibility) was handed to the app; a
+  // page still fully visible NOAPP_MS after the tap was not (Firefox's own
+  // "open in app" sheet, a stale app without the handler, no app at all).
+  // Live 2026-08-28/29: two such taps sat on "Waiting for approval" for the
+  // whole session with nothing on screen saying what to do.
+  const NOAPP_MS = 1500;
+  const open = document.getElementById('open');
+  const noapp = document.getElementById('noapp');
+  let left = false;
+  const leaving = () => {{ left = true; }};
+  window.addEventListener('pagehide', leaving);
+  document.addEventListener('visibilitychange', () => {{
+    if (document.visibilityState === 'hidden') leaving();
+  }});
+  open.addEventListener('click', () => {{
+    left = false;
+    setTimeout(() => {{ if (!left && !done) noapp.hidden = false; }}, NOAPP_MS);
+  }});
+  // Chromium on Android drops a custom-scheme tap silently when nothing
+  // handles it; the intent form names the package and a fallback URL, which
+  // is this very page with the recovery block open. Firefox keeps the plain
+  // link: it raises its own sheet on that form, and confirming it is the path
+  // the live logins prove.
+  const ua = navigator.userAgent;
+  if (open.dataset.intent && /Android/i.test(ua) && !/Firefox|Fennec|Focus|FxiOS/i.test(ua)) {{
+    const back = new URL(window.location.href);
+    back.searchParams.set('noapp', '1');
+    open.href = open.dataset.intent + encodeURIComponent(back.href) + ';end';
+  }}
+  if (new URLSearchParams(window.location.search).get('noapp') === '1') {{
+    noapp.hidden = false;
+  }}
+  const copy = document.getElementById('copy');
+  copy.addEventListener('click', async () => {{
+    try {{
+      await navigator.clipboard.writeText('{sid}');
+      copy.textContent = copy.dataset.copied;
+    }} catch (e) {{}}
+  }});
   const poll = async () => {{
     timer = null;
     if (done) return;
@@ -213,6 +300,12 @@ pub fn approval_page(
         subscription = s.a_subscription,
         cancelled = s.a_cancelled,
         clock = s.a_clock,
+        noapp_heading = s.a_noapp_heading,
+        noapp_browser = s.a_noapp_browser,
+        noapp_code = s.a_noapp_code,
+        noapp_install = s.a_noapp_install,
+        copy = s.a_copy,
+        copied = s.a_copied,
         tagline = s.tagline,
     )
 }
@@ -558,8 +651,115 @@ mod tests {
         let fr = approval_page(Lang::Fr, &ids("s", "q"), "h", NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("Ouvrir l'application Warren"));
+        assert!(fr.contains("L'application ne s'est pas ouverte ?"));
         let ro = approval_page(Lang::Ro, &ids("s", "q"), "h", NONCE);
         assert!(ro.contains("lang=\"ro\""));
+        assert!(ro.contains("Aplica\u{21b}ia nu s-a deschis?"));
+    }
+
+    #[test]
+    fn approval_page_recovers_when_the_tap_does_not_open_the_app() {
+        // Live 2026-08-28/29: two Firefox-for-Android users tapped the button,
+        // the page never lost visibility (the app never came up), and they
+        // watched "Waiting for approval" until they gave up. The page has to
+        // notice that the tap went nowhere and say what to do: confirm the
+        // browser's own "open in app" sheet, type the code in the app, or
+        // install it.
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
+        assert!(
+            page.contains(r#"<div id="noapp" hidden>"#),
+            "hidden until needed"
+        );
+        assert!(page.contains("The app did not open?"));
+        assert!(page.contains("choose Open"), "names the browser's sheet");
+        assert!(
+            page.contains("Enter sign-in code"),
+            "names the manual path in the app"
+        );
+        assert!(
+            page.contains("1.0.0 or later"),
+            "names the minimum app version"
+        );
+        assert!(
+            page.contains("pagehide"),
+            "departure is detected by the page leaving"
+        );
+        assert!(
+            page.contains("NOAPP_MS = 1500"),
+            "reveal after a bounded wait"
+        );
+        assert!(
+            page.contains("navigator.clipboard"),
+            "the code can be copied for the app"
+        );
+        assert!(page.contains("Copy code"));
+        assert!(
+            page.contains("get('noapp') === '1'"),
+            "the intent fallback lands on the revealed block"
+        );
+    }
+
+    #[test]
+    fn approval_page_offers_a_chromium_intent_link_with_fallback() {
+        // Chromium on Android drops a custom-scheme tap silently when no app
+        // handles it. An `intent://` link names the package and a fallback URL,
+        // so the browser either opens the app or brings the user back here
+        // with the recovery block open. Firefox keeps the plain link: its
+        // handling of the plain scheme is what the live evidence proved works
+        // once the user confirms the sheet.
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
+        assert!(page.contains(
+            r#"data-intent="intent://forum-login?sid=deadbeef&host=connect.warrenbrowse.com#Intent;scheme=warren;package=com.warrenbrowse.vpn;S.browser_fallback_url="#
+        ));
+        assert!(
+            page.contains("/Firefox|Fennec|Focus|FxiOS/"),
+            "Firefox keeps the plain link"
+        );
+        assert!(
+            page.contains(
+                r#"href="warren://forum-login?sid=deadbeef&host=connect.warrenbrowse.com""#
+            ),
+            "the plain link stays the default"
+        );
+        assert_eq!(
+            android_package_for_scheme("warren-beta"),
+            Some("com.warrenbrowse.vpn.beta")
+        );
+        assert_eq!(
+            android_package_for_scheme("warren-staging"),
+            Some("com.warrenbrowse.vpn.staging")
+        );
+        assert_eq!(
+            android_package_for_scheme("warren"),
+            Some("com.warrenbrowse.vpn")
+        );
+        assert_eq!(android_package_for_scheme("other"), None);
+    }
+
+    #[test]
+    fn approval_page_never_auto_navigates_to_the_deep_link() {
+        // The attach page auto-attempts its link 300 ms after load. The login
+        // page must not: Chromium blocks a script-initiated custom-scheme
+        // navigation without a gesture, and Firefox would raise its sheet
+        // before the user has read what they are approving.
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
+        assert!(!page.contains("window.location = 'warren://"));
+        assert!(!page.contains("setTimeout(() => { window.location"));
     }
 
     #[test]
