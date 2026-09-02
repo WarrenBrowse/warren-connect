@@ -120,9 +120,14 @@ jobs:
       - name: cargo deny (advisories, bans, licenses, sources)
         run: |
           set -euo pipefail
-          if ! command -v cargo-deny >/dev/null 2>&1; then
-            cargo install --locked cargo-deny
+          # The runner keeps ~/.cargo/bin between runs, and the copy it kept
+          # predates `--disable-fetch` (0.19 has it; the run of 2026-09-02
+          # answered "unexpected argument"). Pin the version rather than
+          # trusting whatever binary is lying around.
+          if ! cargo deny --version 2>/dev/null | grep -q '^cargo-deny 0\.19\.'; then
+            cargo install --locked cargo-deny --version 0.19.4 --force
           fi
+          cargo deny --version
           rm -rf ~/.cargo/advisory-dbs
           mkdir -p ~/.cargo/advisory-dbs
           cp -R advisory-db ~/.cargo/advisory-dbs/advisory-db-3157b0e258782691
