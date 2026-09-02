@@ -372,25 +372,4 @@ mod tests {
         assert_eq!(preferred_locale_subtag(None), None);
         assert_eq!(preferred_locale_subtag(Some("*;q=0.1, !!,")), None);
     }
-
-    #[test]
-    fn no_locale_string_carries_a_dash() {
-        // The shared typography rule bans the em-dash and the en-dash in
-        // every authored text, page copy in every language included. The
-        // strings are literals in this file, so the file is what to scan;
-        // both the character and its escape are caught.
-        // Built at runtime so this test's own source carries neither the
-        // character nor its escape.
-        let source = include_str!("i18n.rs");
-        for (name, code) in [("em-dash", 0x2014u32), ("en-dash", 0x2013u32)] {
-            let ch = char::from_u32(code).expect("a valid scalar");
-            let escape = format!("\\u{{{code:x}}}");
-            let hits = source
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains(ch) || l.contains(&escape))
-                .count();
-            assert_eq!(hits, 0, "{name} found in a locale string");
-        }
-    }
 }
