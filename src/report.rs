@@ -219,16 +219,28 @@ pub fn validate(req: &ReportRequest) -> Result<(), AuthError> {
 }
 
 /// One line of user text for a title: whitespace collapsed, control and
-/// bidi characters dropped, markdown defanged, clamped.
+/// bidi characters dropped, clamped. A title is plain text to Discourse (no
+/// markdown, no mention parsing), so it is NOT backslash-escaped: the
+/// escapes showed as literal backslashes in the topic list (topic 168).
 fn title_excerpt(text: &str) -> String {
     let collapsed: String = text
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
         .take(TITLE_EXCERPT_CHARS)
         .collect();
-    defang_mentions(&escape_md_inline(collapsed.trim()))
+    collapsed.trim().to_owned()
+}
+
+/// Unicode bidirectional formatting characters (the same set the markdown
+/// escaper drops): none belongs in a title, every one can reorder it.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Topic title: `[Android] Connection: cannot connect after update #a1b2c3`.
@@ -421,18 +433,26 @@ mod tests {
     }
 
     #[test]
-    fn title_is_prefixed_suffixed_bounded_and_defanged() {
+    fn title_is_prefixed_suffixed_bounded_and_plain() {
+        // A Discourse title is plain text: no markdown to defang, so no
+        // backslashes either (they rendered literally on the live forum,
+        // topic 168), but a bidi override or a control character still goes.
         let mut req = base();
-        req.what_happened = "@everyone [pay](https://evil) ".to_owned() + &"x".repeat(200);
+        req.what_happened =
+            "Cannot connect: the app\u{202E} says no-exit\n".to_owned() + &"x".repeat(200);
         let title = topic_title(&req, "a1b2c3");
-        assert!(title.starts_with("[Android] Connection: "));
+        assert!(
+            title.starts_with("[Android] Connection: Cannot connect: the app says no-exit"),
+            "{title}"
+        );
         assert!(title.ends_with(" #a1b2c3"));
         assert!(title.chars().count() < 120);
         assert!(
-            title.contains("\\@\u{200B}everyone"),
-            "mention defanged: {title}"
+            !title.contains('\\'),
+            "no escape survives into a title: {title}"
         );
-        assert!(!title.contains("](https://evil)"), "link defanged: {title}");
+        assert!(!title.contains('\u{202E}'));
+        assert!(!title.contains('\n'));
     }
 
     #[test]
