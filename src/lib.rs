@@ -38,6 +38,7 @@ pub mod intake;
 pub mod nonces;
 pub mod notifications;
 pub mod pages;
+pub mod report;
 pub mod routes;
 pub mod sessions;
 pub mod store;

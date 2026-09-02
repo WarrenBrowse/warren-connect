@@ -510,6 +510,100 @@ pub async fn purge_inactive_links(pool: &PgPool, cutoff_unix: i64) -> Result<u64
     Ok(u64::try_from(purged).unwrap_or(0))
 }
 
+/// The three identity reads and writes a wallet-signed admission needs, behind
+/// one seam so the login and the in-app report share a single admission path
+/// and the integration suite can drive it without a database.
+///
+/// Every deployment builds the Postgres form; the in-memory form exists for
+/// the stub harness in `tests/`, where the pools never dial.
+#[derive(Debug)]
+pub enum IdentityStore {
+    /// The real thing: `forum_auth` for the links, the Warren API database
+    /// (read-only role) for the subscription standing.
+    Postgres {
+        /// `forum_auth` database.
+        forum: PgPool,
+        /// Warren API database, read-only role.
+        warren: PgPool,
+    },
+    /// Test double: in-memory maps with the same semantics.
+    Memory(MemoryIdentity),
+}
+
+/// In-memory identity state for tests: subscriptions keyed by SS58 address,
+/// links keyed by `external_id` holding the username and the slot, if drawn.
+#[derive(Debug, Default)]
+pub struct MemoryIdentity {
+    /// Subscription standing per wallet address.
+    pub subscriptions: std::sync::Mutex<std::collections::HashMap<String, SubscriptionStatus>>,
+    /// Registered links: `external_id` to `(username, notify_slot)`.
+    pub links: std::sync::Mutex<std::collections::HashMap<String, (String, Option<i32>)>>,
+}
+
+impl IdentityStore {
+    /// A wallet's subscription standing; a missing row means never paid.
+    ///
+    /// # Errors
+    /// Propagates sqlx errors from the Postgres form.
+    pub async fn subscription_status(
+        &self,
+        pubkey_ss58: &str,
+    ) -> Result<SubscriptionStatus, sqlx::Error> {
+        match self {
+            IdentityStore::Postgres { warren, .. } => {
+                subscription_status(warren, pubkey_ss58).await
+            }
+            IdentityStore::Memory(m) => Ok(m
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(pubkey_ss58)
+                .copied()
+                .unwrap_or_default()),
+        }
+    }
+
+    /// Records (or refreshes) the link at admission time.
+    ///
+    /// # Errors
+    /// Propagates sqlx errors from the Postgres form.
+    pub async fn upsert_link(&self, external_id: &str, username: &str) -> Result<(), sqlx::Error> {
+        match self {
+            IdentityStore::Postgres { forum, .. } => {
+                upsert_link(forum, external_id, username).await
+            }
+            IdentityStore::Memory(m) => {
+                m.links
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(external_id.to_owned())
+                    .or_insert_with(|| (username.to_owned(), None));
+                Ok(())
+            }
+        }
+    }
+
+    /// The wallet's digest slot, drawn on first admission.
+    ///
+    /// # Errors
+    /// Propagates sqlx errors from the Postgres form.
+    pub async fn assign_notify_slot(&self, external_id: &str) -> Result<Option<i32>, sqlx::Error> {
+        match self {
+            IdentityStore::Postgres { forum, .. } => assign_notify_slot(forum, external_id).await,
+            IdentityStore::Memory(m) => {
+                let mut links = m
+                    .links
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let next = i32::try_from(links.len()).unwrap_or(i32::MAX);
+                Ok(links
+                    .get_mut(external_id)
+                    .map(|(_, slot)| *slot.get_or_insert(next)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

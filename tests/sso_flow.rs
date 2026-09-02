@@ -15,6 +15,7 @@ use warren_connect::attach::AttachStore;
 use warren_connect::nonces::NonceStore;
 use warren_connect::routes::{AppState, router};
 use warren_connect::sessions::SessionStore;
+use warren_connect::store::{IdentityStore, MemoryIdentity};
 
 const CONNECT_SECRET: &[u8] = b"a-test-connect-secret-32-bytes!!";
 
@@ -30,6 +31,7 @@ fn test_state() -> Arc<AppState> {
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
+        identity: IdentityStore::Memory(MemoryIdentity::default()),
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),
@@ -38,6 +40,7 @@ fn test_state() -> Arc<AppState> {
         attach: AttachStore::default(),
         forum_api: None,
         intake: None,
+        report: None,
     })
 }
 

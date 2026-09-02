@@ -61,6 +61,11 @@ pub enum AuthError {
     /// fingerprinted by probing).
     #[error("invalid intake payload")]
     InvalidIntake,
+    /// An in-app bug report is outside its field caps or malformed. Distinct
+    /// from [`Self::InvalidIntake`]: the app renders "fix the form" from the
+    /// token, where the guest form only ever sees a generic 422.
+    #[error("invalid_report")]
+    InvalidReport,
     /// The guest follow-up code is malformed or does not verify: nothing
     /// distinguishes "never existed" from "no longer exists", on purpose.
     #[error("unknown_code")]
@@ -91,6 +96,13 @@ impl IntoResponse for AuthError {
             return (
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": "unknown_code"})),
+            )
+                .into_response();
+        }
+        if matches!(self, AuthError::InvalidReport) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({"error": "invalid_report"})),
             )
                 .into_response();
         }

@@ -122,6 +122,30 @@ pub fn build_outgoing(
     locale: Option<&str>,
     connect_secret: &[u8],
 ) -> (String, String) {
+    signed_payload(Some(nonce), user, locale, connect_secret)
+}
+
+/// The same identity assertion, for `POST /admin/users/sync_sso`: the admin
+/// endpoint that runs `lookup_or_create_user` with no browser and no nonce,
+/// so an app that cannot complete the browser round trip still gets the
+/// account the forum would have created for it. Same pairs, same secret,
+/// same groups rule; only the nonce is absent, because the endpoint never
+/// checks one.
+#[must_use]
+pub fn build_sync_payload(
+    user: &SsoUser,
+    locale: Option<&str>,
+    connect_secret: &[u8],
+) -> (String, String) {
+    signed_payload(None, user, locale, connect_secret)
+}
+
+fn signed_payload(
+    nonce: Option<&str>,
+    user: &SsoUser,
+    locale: Option<&str>,
+    connect_secret: &[u8],
+) -> (String, String) {
     // `discourse_connect_overrides_groups` is enabled, so Discourse reads ONLY
     // `groups` as the authoritative full manual-group list per login (empty =
     // member of none); add_groups/remove_groups are ignored in that mode.
@@ -135,16 +159,19 @@ pub fn build_outgoing(
     }
     let groups = group_list.join(",");
     let groups = groups.as_str();
-    let mut pairs = vec![
-        ("nonce", nonce),
-        ("external_id", &user.external_id),
-        ("username", &user.username),
-        ("email", &user.email),
+    let mut pairs = Vec::with_capacity(10);
+    if let Some(nonce) = nonce {
+        pairs.push(("nonce", nonce));
+    }
+    pairs.extend([
+        ("external_id", user.external_id.as_str()),
+        ("username", user.username.as_str()),
+        ("email", user.email.as_str()),
         // The synthetic address must never trigger a confirmation mail.
         ("require_activation", "false"),
         ("suppress_welcome_message", "true"),
         ("groups", groups),
-    ];
+    ]);
     // Staff is promoted, never demoted. Discourse applies
     // `user.admin = admin unless admin.nil?`, so OMITTING the field leaves the
     // forum's own state alone and a grant made in the admin UI survives every
@@ -395,5 +422,45 @@ mod tests {
         let fields: BTreeMap<String, String> =
             serde_urlencoded::from_bytes(&raw).expect("valid form");
         assert_eq!(fields["groups"], "members");
+    }
+
+    #[test]
+    fn sync_payload_is_the_login_payload_without_a_nonce_and_never_staff() {
+        // `sync_sso` checks no nonce, so none is sent; and a report can never
+        // mint staff, so the caller passes `admin: false` and the payload
+        // carries neither field (Discourse keeps whatever grant it holds).
+        let secret = b"a-connect-secret";
+        let user = SsoUser {
+            external_id: "ext".into(),
+            username: "lusab-babad-dovok".into(),
+            email: "lusab-babad-dovok@users.warrenbrowse.invalid".into(),
+            member: true,
+            subscriber: false,
+            admin: false,
+        };
+        let (sso, sig) = build_sync_payload(&user, Some("fr"), secret);
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &sso)
+            .expect("base64");
+        let fields: BTreeMap<String, String> =
+            serde_urlencoded::from_bytes(&raw).expect("urlencoded");
+        assert!(!fields.contains_key("nonce"));
+        assert!(!fields.contains_key("admin"));
+        assert!(!fields.contains_key("moderator"));
+        assert_eq!(fields["external_id"], "ext");
+        assert_eq!(fields["username"], "lusab-babad-dovok");
+        assert_eq!(fields["groups"], "members");
+        assert_eq!(fields["locale"], "fr");
+        assert_eq!(fields["require_activation"], "false");
+        assert_eq!(sig, hmac_hex(secret, sso.as_bytes()));
+        // The login payload with the same user differs only by the nonce.
+        let (login_sso, _) = build_outgoing("n0nce", &user, Some("fr"), secret);
+        let login_raw =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &login_sso)
+                .expect("base64");
+        let login_fields: BTreeMap<String, String> =
+            serde_urlencoded::from_bytes(&login_raw).expect("urlencoded");
+        let mut without_nonce = login_fields.clone();
+        without_nonce.remove("nonce");
+        assert_eq!(without_nonce, fields);
     }
 }

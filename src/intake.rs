@@ -341,7 +341,7 @@ pub fn topic_title(kind: IntakeKind, date_ymd: &str, shortid: &str) -> String {
 /// a word), so a zero-width space after each `@` keeps the glyph visually
 /// intact while making the token unmatchable. Applied to every
 /// guest-controlled value that ends up in the topic.
-fn defang_mentions(text: &str) -> String {
+pub(crate) fn defang_mentions(text: &str) -> String {
     text.replace('@', "@\u{200B}")
 }
 
@@ -350,7 +350,7 @@ fn defang_mentions(text: &str) -> String {
 /// guest's markdown LIVE (mentions ping members, links/images can exfiltrate
 /// reader data in a public topic), so each line goes through
 /// `escape_md_inline` first: the render stays plain quoted text.
-fn quote_block(text: &str) -> String {
+pub(crate) fn quote_block(text: &str) -> String {
     text.lines()
         .map(|line| {
             let neutral = line.replace(['\u{2028}', '\u{2029}'], " ");
@@ -424,28 +424,44 @@ fn append_attachments(body: &mut String, attachments: &[LinkedAttachment]) {
     }
 }
 
-/// Sliding-window rate limiter for the intake endpoint.
+/// Sliding-window rate limiter, keyed by client.
 ///
-/// Privacy: the per-IP map is the ONLY place a client IP exists in this
+/// The intake keys it on the client IP; the in-app report keys it on the
+/// wallet's keyed forum id, because that route must never see an IP at all.
+///
+/// Privacy: the per-key map is the ONLY place a client IP exists in this
 /// service, it lives in memory only, entries are pruned as soon as they fall
-/// out of the window, and the IP is never logged, persisted, or forwarded.
-/// The map stays bounded without an explicit cap: an IP is recorded only when
+/// out of the window, and the key is never logged, persisted, or forwarded.
+/// The map stays bounded without an explicit cap: a key is recorded only when
 /// its attempt is admitted, and admissions are bounded by the global limit
 /// per window.
 #[derive(Debug)]
-pub struct RateLimiter {
-    per_ip_max: usize,
+pub struct RateLimiter<K = Option<IpAddr>>
+where
+    K: std::hash::Hash + Eq,
+{
+    per_key_max: usize,
     global_max: usize,
     window_secs: u64,
-    inner: Mutex<Windows>,
+    inner: Mutex<Windows<K>>,
 }
 
-#[derive(Debug, Default)]
-struct Windows {
-    // Key None = client IP unknown (no X-Forwarded-For): all such requests
-    // share one bucket, so the fallback fails closed instead of unlimited.
-    per_ip: HashMap<Option<IpAddr>, Vec<u64>>,
+#[derive(Debug)]
+struct Windows<K> {
+    // For the IP form, key None = client IP unknown (no X-Forwarded-For):
+    // all such requests share one bucket, so the fallback fails closed
+    // instead of unlimited.
+    per_key: HashMap<K, Vec<u64>>,
     global: Vec<u64>,
+}
+
+impl<K> Default for Windows<K> {
+    fn default() -> Self {
+        Self {
+            per_key: HashMap::new(),
+            global: Vec::new(),
+        }
+    }
 }
 
 impl Default for RateLimiter {
@@ -454,13 +470,16 @@ impl Default for RateLimiter {
     }
 }
 
-impl RateLimiter {
-    /// Builds a limiter admitting `per_ip_max` per IP and `global_max` in
+impl<K> RateLimiter<K>
+where
+    K: std::hash::Hash + Eq,
+{
+    /// Builds a limiter admitting `per_key_max` per key and `global_max` in
     /// total per sliding `window_secs`.
     #[must_use]
-    pub fn new(per_ip_max: usize, global_max: usize, window_secs: u64) -> Self {
+    pub fn new(per_key_max: usize, global_max: usize, window_secs: u64) -> Self {
         Self {
-            per_ip_max,
+            per_key_max,
             global_max,
             window_secs,
             inner: Mutex::new(Windows::default()),
@@ -469,12 +488,12 @@ impl RateLimiter {
 
     /// Admits or rejects one attempt at `now_unix`. An admitted attempt is
     /// recorded in both windows; a rejected one is recorded in neither, so a
-    /// single hammering IP consumes at most `per_ip_max` global slots per
-    /// window and cannot trip the circuit breaker alone.
+    /// single hammering client consumes at most `per_key_max` global slots
+    /// per window and cannot trip the circuit breaker alone.
     ///
     /// # Errors
     /// [`AuthError::RateLimited`] past either limit.
-    pub fn admit(&self, ip: Option<IpAddr>, now_unix: u64) -> Result<(), AuthError> {
+    pub fn admit(&self, key: K, now_unix: u64) -> Result<(), AuthError> {
         // A hit at `t` expires once `now - t >= window` (avoids the
         // saturating-subtraction off-by-one that would expire hits at t=0).
         let live = |t: u64| now_unix.saturating_sub(t) < self.window_secs;
@@ -486,15 +505,15 @@ impl RateLimiter {
             // forever after a single panic under the lock.
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         w.global.retain(|&t| live(t));
-        w.per_ip.retain(|_, hits| {
+        w.per_key.retain(|_, hits| {
             hits.retain(|&t| live(t));
             !hits.is_empty()
         });
         if w.global.len() >= self.global_max {
             return Err(AuthError::RateLimited);
         }
-        let hits = w.per_ip.entry(ip).or_default();
-        if hits.len() >= self.per_ip_max {
+        let hits = w.per_key.entry(key).or_default();
+        if hits.len() >= self.per_key_max {
             return Err(AuthError::RateLimited);
         }
         hits.push(now_unix);
@@ -691,7 +710,7 @@ mod tests {
 
     #[test]
     fn per_ip_limit_admits_3_then_rejects_within_the_window() {
-        let limiter = RateLimiter::new(3, 30, 3_600);
+        let limiter: RateLimiter = RateLimiter::new(3, 30, 3_600);
         let ip: IpAddr = "203.0.113.7".parse().expect("ip");
         for t in 0..3 {
             limiter.admit(Some(ip), t).expect("under the limit");
@@ -705,7 +724,7 @@ mod tests {
 
     #[test]
     fn distinct_ips_have_independent_budgets() {
-        let limiter = RateLimiter::new(3, 30, 3_600);
+        let limiter: RateLimiter = RateLimiter::new(3, 30, 3_600);
         let a: IpAddr = "203.0.113.1".parse().expect("ip");
         let b: IpAddr = "203.0.113.2".parse().expect("ip");
         for t in 0..3 {
@@ -717,7 +736,7 @@ mod tests {
 
     #[test]
     fn unknown_ips_share_one_fail_closed_bucket() {
-        let limiter = RateLimiter::new(3, 30, 3_600);
+        let limiter: RateLimiter = RateLimiter::new(3, 30, 3_600);
         for t in 0..3 {
             limiter.admit(None, t).expect("under the limit");
         }
@@ -729,7 +748,7 @@ mod tests {
 
     #[test]
     fn global_circuit_breaker_trips_across_ips() {
-        let limiter = RateLimiter::new(3, 30, 3_600);
+        let limiter: RateLimiter = RateLimiter::new(3, 30, 3_600);
         for i in 0..10u32 {
             let ip: IpAddr = format!("203.0.113.{}", i + 1).parse().expect("ip");
             for t in 0..3 {
@@ -748,7 +767,7 @@ mod tests {
 
     #[test]
     fn rejected_attempts_do_not_consume_global_slots() {
-        let limiter = RateLimiter::new(3, 30, 3_600);
+        let limiter: RateLimiter = RateLimiter::new(3, 30, 3_600);
         let ip: IpAddr = "203.0.113.9".parse().expect("ip");
         for t in 0..3 {
             limiter.admit(Some(ip), t).expect("fill");

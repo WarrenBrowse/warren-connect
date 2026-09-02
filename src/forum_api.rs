@@ -78,6 +78,17 @@ pub struct TopicInfo {
     pub locked: bool,
 }
 
+/// The account `sync_sso` created or refreshed. Only the two fields the
+/// caller checks are read: the serializer behind that endpoint is the full
+/// admin user detail, whose shape is Discourse's to change.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SyncedUser {
+    /// Discourse user id.
+    pub id: u64,
+    /// The username Discourse settled on.
+    pub username: String,
+}
+
 /// A completed upload (an attach-flow log, or a guest intake screenshot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadedFile {
@@ -86,7 +97,7 @@ pub struct UploadedFile {
 }
 
 /// Discourse admin API client (system user).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForumApi {
     base_url: String,
     api_key: String,
@@ -328,6 +339,43 @@ impl ForumApi {
         &self.api_username
     }
 
+    /// The same key and connection pool, acting as another user. Only
+    /// meaningful with an all-users key: Discourse refuses a foreign
+    /// `Api-Username` on a user-scoped key. The in-app report uses it so the
+    /// topic is owned by the reporter's own account.
+    #[must_use]
+    pub fn as_user(&self, username: &str) -> ForumApi {
+        ForumApi {
+            api_username: username.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// Creates or refreshes an account through DiscourseConnect's admin
+    /// endpoint (`POST /admin/users/sync_sso`), the same code path a browser
+    /// login takes minus the nonce. Returns what Discourse settled on, which
+    /// the caller compares with the derived handle: a suffixed username would
+    /// break every later author check.
+    ///
+    /// # Errors
+    /// [`ForumApiError`] on transport failure, non-success status, or a body
+    /// without `id` and `username`.
+    pub async fn sync_sso(
+        &self,
+        sso_b64: &str,
+        sig_hex: &str,
+    ) -> Result<SyncedUser, ForumApiError> {
+        const OP: &str = "sync_sso";
+        let body: SyncedUser = self
+            .send(
+                OP,
+                self.request(reqwest::Method::POST, "/admin/users/sync_sso")
+                    .form(&[("sso", sso_b64), ("sig", sig_hex)]),
+            )
+            .await?;
+        Ok(body)
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method, format!("{}{}", self.base_url, path))
@@ -526,9 +574,10 @@ impl ForumApi {
         Ok(body.post_number)
     }
 
-    /// Creates a public topic in `category_id`; returns the topic id. Used by
-    /// the guest intake flow (this client is then built with the dedicated
-    /// low-privilege intake bot as `api_username`, not the system user).
+    /// Creates a public topic in `category_id` carrying `tags`; returns the
+    /// topic id. The guest intake passes no tags and acts as its
+    /// low-privilege bot; the in-app report tags the platform and acts as the
+    /// reporter (`as_user`).
     ///
     /// # Errors
     /// [`ForumApiError`] on transport failure, non-success status, or a body
@@ -538,22 +587,27 @@ impl ForumApi {
         title: &str,
         raw: &str,
         category_id: u64,
+        tags: &[&str],
     ) -> Result<u64, ForumApiError> {
-        const OP: &str = "intake_topic";
+        const OP: &str = "topic_create";
         #[derive(Deserialize)]
         struct PostJson {
             topic_id: u64,
         }
 
+        let mut post = serde_json::json!({
+            "title": title,
+            "raw": raw,
+            "category": category_id,
+        });
+        if !tags.is_empty() {
+            post["tags"] = serde_json::json!(tags);
+        }
         let body: PostJson = self
             .send(
                 OP,
                 self.request(reqwest::Method::POST, "/posts.json")
-                    .json(&serde_json::json!({
-                        "title": title,
-                        "raw": raw,
-                        "category": category_id,
-                    })),
+                    .json(&post),
             )
             .await?;
         Ok(body.topic_id)

@@ -19,6 +19,7 @@ use warren_connect::handle;
 use warren_connect::nonces::NonceStore;
 use warren_connect::routes::{AppState, router};
 use warren_connect::sessions::SessionStore;
+use warren_connect::store::{IdentityStore, MemoryIdentity};
 
 use warren_contract::auth::{
     HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
@@ -177,6 +178,7 @@ fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
+        identity: IdentityStore::Memory(MemoryIdentity::default()),
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),
@@ -185,6 +187,7 @@ fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
         attach: AttachStore::default(),
         forum_api,
         intake: None,
+        report: None,
     })
 }
 

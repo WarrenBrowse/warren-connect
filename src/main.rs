@@ -113,7 +113,12 @@ async fn main() -> anyhow::Result<()> {
                 .parse()
                 .context("DISCOURSE_INTAKE_CATEGORY_ID must be a u64")?;
             Some(warren_connect::routes::IntakeState {
-                api: ForumApi::new(&discourse_url, intake_api_key, intake_username, staff_group),
+                api: ForumApi::new(
+                    &discourse_url,
+                    intake_api_key,
+                    intake_username,
+                    staff_group.clone(),
+                ),
                 category_id,
                 // Abuse budgets, env-tunable so a spam wave can be answered
                 // with a config change instead of a rebuild. The global cap
@@ -187,6 +192,49 @@ async fn main() -> anyhow::Result<()> {
 
     store::migrate(&forum_pool).await.context("migrations")?;
 
+    // In-app bug reports: enabled only with an all-users Discourse key scoped
+    // to topic writes (the system key is user-bound and cannot act as the
+    // reporter) and the target category; otherwise the endpoint answers 503
+    // and nothing else changes. The log delivery reuses the system client.
+    let report = match (
+        std::env::var("DISCOURSE_REPORT_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty()),
+        std::env::var("DISCOURSE_REPORT_CATEGORY_ID").ok(),
+    ) {
+        (None, _) => {
+            tracing::warn!("DISCOURSE_REPORT_API_KEY not set: in-app reports disabled");
+            None
+        }
+        (Some(_), None) => {
+            tracing::warn!("DISCOURSE_REPORT_CATEGORY_ID not set: in-app reports disabled");
+            None
+        }
+        (Some(key), Some(raw)) => {
+            let category_id: u64 = raw
+                .parse()
+                .context("DISCOURSE_REPORT_CATEGORY_ID must be a u64")?;
+            Some(warren_connect::routes::ReportState {
+                // The username is replaced per request (`as_user`); "system"
+                // here is only what a misrouted call would act as.
+                topic_api: ForumApi::new(&discourse_url, key, "system".into(), staff_group.clone()),
+                category_id,
+                // Per wallet, then global: a member files a few reports a
+                // day at most, and the global cap is the circuit breaker a
+                // spam wave from many paid wallets would trip.
+                limiter: warren_connect::intake::RateLimiter::new(
+                    env_usize("REPORT_MAX_PER_WALLET", 3),
+                    env_usize("REPORT_MAX_GLOBAL", 20),
+                    3_600,
+                ),
+            })
+        }
+    };
+
+    let identity = warren_connect::store::IdentityStore::Postgres {
+        forum: forum_pool.clone(),
+        warren: warren_pool.clone(),
+    };
     let state = Arc::new(AppState {
         connect_secret,
         handle_secret,
@@ -195,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         admins,
         forum_pool,
         warren_pool,
+        identity,
         discourse_pool,
         seen_pool,
         digest_generation: warren_connect::digest::GenerationStamp::default(),
@@ -203,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         attach: AttachStore::default(),
         forum_api,
         intake,
+        report,
     });
 
     // Retention: bound how long an inactive forum link (keyed hash + public

@@ -42,6 +42,10 @@ pub struct AppState {
     pub forum_pool: PgPool,
     /// Warren API database, read-only role (subscription check).
     pub warren_pool: PgPool,
+    /// The admission seam over the two pools above: subscription standing,
+    /// link upsert and digest slot, shared by the login and the in-app
+    /// report so the two can never apply different gates.
+    pub identity: store::IdentityStore,
     /// Discourse's own database, read-only role. `None` disables the
     /// broadcast activity digest (503 on its endpoint); everything else
     /// keeps working.
@@ -64,6 +68,23 @@ pub struct AppState {
     pub forum_api: Option<ForumApi>,
     /// Guest help intake; `None` disables the intake endpoint (503).
     pub intake: Option<IntakeState>,
+    /// In-app bug reports; `None` disables the report endpoint (503).
+    pub report: Option<ReportState>,
+}
+
+/// Everything the in-app report endpoint needs; absent = feature disabled.
+pub struct ReportState {
+    /// Discourse client on an all-users key scoped to topic writes, acting as
+    /// the reporter per request (`ForumApi::as_user`), so the topic is owned
+    /// by the wallet's own account. The log delivery keeps using the system
+    /// client in [`AppState::forum_api`].
+    pub topic_api: ForumApi,
+    /// Category the reports are created in (the forum's bug-reports category).
+    pub category_id: u64,
+    /// Per-wallet + global sliding-window limiter, keyed by the keyed forum
+    /// id: a signed route must never see a client IP, so the wallet is the
+    /// only per-identity budget it can have.
+    pub limiter: crate::intake::RateLimiter<String>,
 }
 
 /// Everything the guest intake endpoint needs; absent = feature disabled.
@@ -266,6 +287,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             post(forum_attach_logs).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)),
         )
         .route(
+            "/v1/forum/report",
+            // Same figure and same reason as attach-logs: the report carries
+            // the same base64 gzip field, and the layer has to sit above
+            // MAX_LOG_GZ_B64_CHARS or it, not the constant, is the ceiling.
+            post(forum_report).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
+        .route(
             "/v1/forum/notifications",
             // Explicit, per the repo rule: the signed body is an empty JSON
             // object and nothing here ever grows, so the cap is tight rather
@@ -383,6 +411,75 @@ async fn forum_login(
         return Err(AuthError::Session);
     }
 
+    let admitted = match admit_forum_identity(&state, &identity).await {
+        Ok(admitted) => admitted,
+        Err(AdmitError::NeverPaid) => {
+            // Tell the browser so its approval page stops polling and explains why.
+            state
+                .sessions
+                .cancel(&login.sid, "subscription_required", now);
+            return Err(AuthError::SubscriptionRequired);
+        }
+        Err(AdmitError::Store) => return Err(AuthError::Session),
+    };
+
+    // Kept before the payload moves `username` into the session: the approving
+    // client gets its own handle back (see `login_approved_body`).
+    let handle_for_client = admitted.forum.username.clone();
+    state.sessions.approve(
+        &primary_sid,
+        SsoUser {
+            external_id: admitted.forum.external_id,
+            username: admitted.forum.username,
+            email: admitted.forum.email,
+            member: admitted.status.ever_paid,
+            subscriber: admitted.status.active,
+            admin: staff_claim(admitted.admin, approach),
+        },
+        now,
+    )?;
+
+    tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");
+    Ok((
+        StatusCode::OK,
+        Json(login_approved_body(
+            &handle_for_client,
+            admitted.notify_slot,
+        )),
+    )
+        .into_response())
+}
+
+/// A wallet that passed the forum gate, with everything the two admitting
+/// routes need afterwards.
+struct AdmittedIdentity {
+    /// The derived pairwise forum identity.
+    forum: handle::ForumHandle,
+    /// Subscription standing, which decides the Discourse groups.
+    status: store::SubscriptionStatus,
+    /// On the bootstrap staff allowlist.
+    admin: bool,
+    /// The digest slot, absent when the allocator had no room.
+    notify_slot: Option<i32>,
+}
+
+/// Why an admission was refused. The callers map it: the login cancels the
+/// browser session with a reason, the report answers the app directly.
+enum AdmitError {
+    /// Never paid and not staff: the anti-sybil paywall.
+    NeverPaid,
+    /// The link could not be recorded (database).
+    Store,
+}
+
+/// The one admission path of a wallet-signed forum identity, shared by the
+/// login and the in-app report: the ever-paid gate, the link upsert and the
+/// digest slot. Two routes with two copies of this block would be two gates
+/// that can drift apart.
+async fn admit_forum_identity(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+) -> Result<AdmittedIdentity, AdmitError> {
     // Staff is an allowlist, independent of payment: admins are operators and
     // must not be locked out of their own forum by the paywall.
     let admin = state.admins.is_admin(&identity.pubkey_ss58);
@@ -392,7 +489,9 @@ async fn forum_login(
     // only sybil cost) unless the wallet is staff. A subscription-lookup failure
     // is treated as "never paid" so an outage fails closed rather than opening
     // the gate (an admin still passes on the allowlist).
-    let status = store::subscription_status(&state.warren_pool, &identity.pubkey_ss58)
+    let status = state
+        .identity
+        .subscription_status(&identity.pubkey_ss58)
         .await
         .unwrap_or_else(|e| {
             // Log the sqlx error KIND only, never `%e` (a Postgres error detail
@@ -401,32 +500,26 @@ async fn forum_login(
             store::SubscriptionStatus::default()
         });
     if !login_allowed(status.ever_paid, admin) {
-        // Tell the browser so its approval page stops polling and explains why.
-        state
-            .sessions
-            .cancel(&login.sid, "subscription_required", now);
-        tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login refused: never paid");
-        return Err(AuthError::SubscriptionRequired);
+        tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
+        return Err(AdmitError::NeverPaid);
     }
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-
-    // Kept before the payload moves `username` into the session: the approving
-    // client gets its own handle back (see `login_approved_body`).
-    let handle_for_client = forum.username.clone();
-    store::upsert_link(&state.forum_pool, &forum.external_id, &forum.username)
+    state
+        .identity
+        .upsert_link(&forum.external_id, &forum.username)
         .await
         .map_err(|e| {
-        // Never `%e` here: a unique-constraint violation puts the offending
-        // pubkey/handle in the Postgres error detail. Log the kind + a redacted
-        // pubkey prefix only.
-        tracing::error!(kind = ?sqlx_error_kind(&e), pubkey = %redact(&identity.pubkey_ss58), "link upsert failed");
-        AuthError::Session
-    })?;
+            // Never `%e` here: a unique-constraint violation puts the offending
+            // pubkey/handle in the Postgres error detail. Log the kind + a redacted
+            // pubkey prefix only.
+            tracing::error!(kind = ?sqlx_error_kind(&e), pubkey = %redact(&identity.pubkey_ss58), "link upsert failed");
+            AdmitError::Store
+        })?;
 
-    // Best effort: a login that cannot get a digest slot is still a login.
-    // The device simply shows no forum badge until it logs in again.
-    let notify_slot = match store::assign_notify_slot(&state.forum_pool, &forum.external_id).await {
+    // Best effort: an admission that cannot get a digest slot is still an
+    // admission. The device simply shows no forum badge until the next one.
+    let notify_slot = match state.identity.assign_notify_slot(&forum.external_id).await {
         Ok(slot) => slot,
         Err(e) => {
             tracing::error!(kind = ?sqlx_error_kind(&e), "notify slot assignment failed");
@@ -434,25 +527,30 @@ async fn forum_login(
         }
     };
 
-    state.sessions.approve(
-        &primary_sid,
-        SsoUser {
-            external_id: forum.external_id,
-            username: forum.username,
-            email: forum.email,
-            member: status.ever_paid,
-            subscriber: status.active,
-            admin: staff_claim(admin, approach),
-        },
-        now,
-    )?;
+    Ok(AdmittedIdentity {
+        forum,
+        status,
+        admin,
+        notify_slot,
+    })
+}
 
-    tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");
-    Ok((
-        StatusCode::OK,
-        Json(login_approved_body(&handle_for_client, notify_slot)),
-    )
-        .into_response())
+/// The identity fields an admitting route hands back to the wallet: the
+/// handle (keyed derivation, so this is the only place a client learns it)
+/// and the digest slot, omitted rather than null when none was drawn.
+fn identity_fields(
+    handle: &str,
+    notify_slot: Option<i32>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "handle".into(),
+        serde_json::Value::String(handle.to_owned()),
+    );
+    if let Some(slot) = notify_slot {
+        fields.insert("notify_slot".into(), serde_json::Value::from(slot));
+    }
+    fields
 }
 
 /// Body of an approved login. Carries the handle back to the wallet that just
@@ -465,12 +563,9 @@ async fn forum_login(
 /// document is its own. It is absent when the allocator had no room, which
 /// costs the device its badge until the next login and nothing else.
 fn login_approved_body(handle: &str, notify_slot: Option<i32>) -> serde_json::Value {
-    match notify_slot {
-        Some(slot) => {
-            serde_json::json!({"status": "approved", "handle": handle, "notify_slot": slot})
-        }
-        None => serde_json::json!({"status": "approved", "handle": handle}),
-    }
+    let mut body = identity_fields(handle, notify_slot);
+    body.insert("status".into(), "approved".into());
+    serde_json::Value::Object(body)
 }
 
 /// The caller's own forum notifications, for the app's activity panel.
@@ -800,23 +895,8 @@ async fn forum_attach_logs(
     // Pre-topic session: no topic exists yet, so the report is parked in the
     // session (with the signer's handle for the author check at bind time).
     if kind == AttachKind::PreTopic {
-        let gz =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.log_gz_b64)
-                .map_err(|_| {
-                    tracing::info!(
-                        pubkey = %redact(&identity.pubkey_ss58),
-                        "attach-logs refused: log_gz_b64 is not valid base64"
-                    );
-                    AuthError::Payload
-                })?;
-        let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
-            tracing::info!(
-                pubkey = %redact(&identity.pubkey_ss58),
-                gz_bytes = gz.len(),
-                "attach-logs refused: payload does not gunzip to UTF-8 under the cap"
-            );
-        })?;
-        let (version, os) = attach::parse_report_metadata(&log_text);
+        let (log_text, (version, os)) =
+            decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
         state
             .attach
             .store_received(&req.sid, &forum.username, log_text, version, os, now)?;
@@ -844,24 +924,8 @@ async fn forum_attach_logs(
         return Err(AuthError::NotAuthor);
     }
 
-    let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.log_gz_b64)
-        .map_err(|_| {
-            tracing::info!(
-                pubkey = %redact(&identity.pubkey_ss58),
-                topic_id = req.topic_id,
-                "attach-logs refused: log_gz_b64 is not valid base64"
-            );
-            AuthError::Payload
-        })?;
-    let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
-        tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
-            topic_id = req.topic_id,
-            gz_bytes = gz.len(),
-            "attach-logs refused: payload does not gunzip to UTF-8 under the cap"
-        );
-    })?;
-    let meta = attach::parse_report_metadata(&log_text);
+    let (log_text, meta) =
+        decode_report(&req.log_gz_b64, &identity.pubkey_ss58, Some(req.topic_id))?;
 
     // Discourse writes; the session is marked done only after all of them, so
     // a mid-flight failure leaves it retryable. A retry re-runs every write:
@@ -901,10 +965,50 @@ async fn deliver_to_staff(
     meta: attach::ReportMeta,
     now: u64,
 ) -> Result<(), AuthError> {
-    let filename = format!("warren-report-topic{topic_id}-{now}.log");
+    let upload = upload_report(api, log_text, now, Some(topic_id)).await?;
+    notify_staff(api, topic_id, topic, &upload, meta).await
+}
+
+/// A report uploaded to Discourse, not yet linked from anywhere.
+struct UploadedReport {
+    filename: String,
+    upload: forum_api::UploadedFile,
+}
+
+/// Uploads the decompressed report as a `.log` attachment. Separate from the
+/// writes that link it because the in-app report uploads BEFORE it creates
+/// the topic: a topic must never be published having silently lost the logs
+/// the reporter was told would come with it.
+async fn upload_report(
+    api: &ForumApi,
+    log_text: String,
+    now: u64,
+    topic_id: Option<u64>,
+) -> Result<UploadedReport, AuthError> {
+    // The topic id is in the name when it exists: staff sort attachments by
+    // it. The in-app report uploads first, so its file carries the time only.
+    let filename = match topic_id {
+        Some(id) => format!("warren-report-topic{id}-{now}.log"),
+        None => format!("warren-report-{now}.log"),
+    };
     let upload = api
         .upload_file(&filename, "text/plain", log_text.into_bytes())
         .await?;
+    Ok(UploadedReport { filename, upload })
+}
+
+/// The writes that put an uploaded report in front of the staff: PM to the
+/// staff group, whisper on the topic, public note with the safe facts, then
+/// the best-effort receipt and tag.
+async fn notify_staff(
+    api: &ForumApi,
+    topic_id: u64,
+    topic: &forum_api::TopicInfo,
+    uploaded: &UploadedReport,
+    meta: attach::ReportMeta,
+) -> Result<(), AuthError> {
+    let filename = &uploaded.filename;
+    let upload = &uploaded.upload;
     let pm_topic_id = api
         .create_staff_pm(
             &forum_api::pm_title(topic_id, &topic.title),
@@ -912,7 +1016,7 @@ async fn deliver_to_staff(
                 topic_id,
                 &topic.title,
                 &topic.author_username,
-                &filename,
+                filename,
                 &upload.short_url,
             ),
         )
@@ -956,6 +1060,191 @@ async fn deliver_to_staff(
         );
     }
     Ok(())
+}
+
+/// Decodes and inflates a signed report field, naming the refusal in the log
+/// (every one reaches the reporter as a generic failure otherwise). `topic_id`
+/// is `None` for a report that has no topic yet.
+fn decode_report(
+    log_gz_b64: &str,
+    pubkey_ss58: &str,
+    topic_id: Option<u64>,
+) -> Result<(String, attach::ReportMeta), AuthError> {
+    let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, log_gz_b64)
+        .map_err(|_| {
+            tracing::info!(
+                pubkey = %redact(pubkey_ss58),
+                topic_id,
+                "report refused: log_gz_b64 is not valid base64"
+            );
+            AuthError::Payload
+        })?;
+    let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
+        tracing::info!(
+            pubkey = %redact(pubkey_ss58),
+            topic_id,
+            gz_bytes = gz.len(),
+            "report refused: payload does not gunzip to UTF-8 under the cap"
+        );
+    })?;
+    let meta = attach::parse_report_metadata(&log_text);
+    Ok((log_text, meta))
+}
+
+/// Wallet-signed in-app bug report: a topic in the bug-reports category owned
+/// by the reporter's own forum account (created through `sync_sso` when it
+/// does not exist yet), plus the redacted logs delivered to the staff exactly
+/// as attach-logs delivers them. For the user who cannot complete the browser
+/// sign-in, and therefore cannot file the report from the forum.
+///
+/// Order of the Discourse writes: account sync, upload, topic, then the staff
+/// notifications. Nothing public exists until the parts that can fail cheaply
+/// have succeeded; past the topic a failure is answered as `partial` rather
+/// than as an error the client would retry into a duplicate topic.
+async fn forum_report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, AuthError> {
+    let report_state = state.report.as_ref().ok_or(AuthError::FeatureDisabled)?;
+    let api = forum_api_enabled(&state)?;
+    let signed = extract_signed_headers(&headers)?;
+    let now = now_unix();
+    let identity = verify_signed_request(
+        &signed,
+        "POST",
+        "/v1/forum/report",
+        &body,
+        now,
+        &state.nonces,
+    )
+    .inspect_err(|err| {
+        if matches!(err, AuthError::Clock) {
+            tracing::info!(
+                drift_secs = now.abs_diff(signed.timestamp),
+                "report refused: client clock outside window"
+            );
+        } else {
+            tracing::debug!(error = %err, "report auth refused");
+        }
+    })?;
+
+    let req: crate::report::ReportRequest = serde_json::from_slice(&body).map_err(|_| {
+        tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "report refused: body is not valid JSON");
+        AuthError::InvalidReport
+    })?;
+    crate::report::validate(&req)?;
+    // Decoded before any write so a broken payload costs no Discourse call.
+    let decoded = match req.log_gz_b64.as_deref() {
+        Some(b64) => Some(decode_report(b64, &identity.pubkey_ss58, None)?),
+        None => None,
+    };
+
+    let admitted = admit_forum_identity(&state, &identity)
+        .await
+        .map_err(|err| match err {
+            AdmitError::NeverPaid => AuthError::SubscriptionRequired,
+            AdmitError::Store => AuthError::Forum,
+        })?;
+    // Charged after the signature and the gate: a forged or never-paid
+    // request must not burn a member's budget.
+    report_state
+        .limiter
+        .admit(admitted.forum.external_id.clone(), now)?;
+
+    // The account the topic will belong to. Never staff on this path: no
+    // browser is involved, so nothing proves the same-device approval that
+    // `staff_claim` requires, and a report must not be able to mint staff.
+    let user = SsoUser {
+        external_id: admitted.forum.external_id.clone(),
+        username: admitted.forum.username.clone(),
+        email: admitted.forum.email.clone(),
+        member: admitted.status.ever_paid,
+        subscriber: admitted.status.active,
+        admin: false,
+    };
+    let (sso, sig) =
+        discourse::build_sync_payload(&user, req.locale.as_deref(), &state.connect_secret);
+    let synced = api.sync_sso(&sso, &sig).await?;
+    if !synced
+        .username
+        .eq_ignore_ascii_case(&admitted.forum.username)
+    {
+        // A suffixed or renamed account would fail every later author check
+        // (attach-logs, bind) for this wallet: refuse rather than publish
+        // under a name the derivation does not produce.
+        tracing::error!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            "report refused: forum settled on a username other than the derived handle"
+        );
+        return Err(AuthError::Forum);
+    }
+
+    let uploaded = match decoded {
+        Some((log_text, meta)) => Some((upload_report(api, log_text, now, None).await?, meta)),
+        None => None,
+    };
+
+    let reference = crate::intake::short_id();
+    let title = crate::report::topic_title(&req, &reference);
+    let raw = crate::report::topic_raw(&req);
+    let platform = req.platform.tag();
+    let topic_id = report_state
+        .topic_api
+        .as_user(&admitted.forum.username)
+        .create_topic(&title, &raw, report_state.category_id, &[platform])
+        .await?;
+
+    // From here the topic exists: a staff-side failure is reported, never
+    // answered as an error (the client would file the same topic twice).
+    let logs = match uploaded {
+        None => "none",
+        Some((upload, meta)) => {
+            let topic = forum_api::TopicInfo {
+                title: title.clone(),
+                author_username: admitted.forum.username.clone(),
+                tags: vec![platform.to_owned()],
+                locked: false,
+            };
+            // The client-declared facts fill in for a report whose header
+            // carried none, so the public note is never empty for lack of
+            // metadata the app knew.
+            let (version, os) = meta;
+            let meta = (
+                version.or_else(|| req.app_version.clone()),
+                os.or_else(|| req.os_version.clone()),
+            );
+            match notify_staff(api, topic_id, &topic, &upload, meta).await {
+                Ok(()) => "attached",
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        topic_id,
+                        "report topic created but the staff delivery did not complete"
+                    );
+                    "partial"
+                }
+            }
+        }
+    };
+
+    tracing::info!(
+        pubkey = %redact(&identity.pubkey_ss58),
+        topic_id,
+        platform,
+        area = req.area.short(),
+        logs,
+        "in-app report topic created"
+    );
+    let mut body = identity_fields(&admitted.forum.username, admitted.notify_slot);
+    body.insert("status".into(), "created".into());
+    body.insert("topic_id".into(), topic_id.into());
+    body.insert(
+        "topic_url".into(),
+        format!("{}/t/{topic_id}", crate::forum_api::FORUM_PUBLIC_URL).into(),
+    );
+    body.insert("logs".into(), logs.into());
+    Ok((StatusCode::CREATED, Json(serde_json::Value::Object(body))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1172,7 +1461,7 @@ async fn help_intake(
     let raw = crate::intake::topic_raw(req.kind, &req.message, req.platform.as_deref(), &linked);
     let topic_id = intake
         .api
-        .create_topic(&title, &raw, intake.category_id)
+        .create_topic(&title, &raw, intake.category_id, &[])
         .await?;
 
     // The reference is random and guest-chosen content stays out of the log.

@@ -25,6 +25,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 | `GET /attach?sid=<sid>` | Attach-logs page for a pre-topic session minted by `/v1/attach/new` |
 | `POST /v1/forum/attach-logs` | Wallet-signed gzipped problem report from the Warren app |
 | `POST /v1/forum/notifications` | Wallet-signed read of the caller's own forum notifications, for the app's activity panel |
+| `POST /v1/forum/report` | Wallet-signed in-app bug report: creates (or refreshes, via `sync_sso`) the wallet's forum account, opens a topic in the bug-reports category owned by it and tagged with the platform, and delivers the optional gzipped redacted logs to the staff exactly like attach-logs; returns `{"status","topic_id","topic_url","handle","notify_slot","logs"}` (201). For the user who cannot complete the browser sign-in |
 | `POST /v1/attach/new` | Mints a pre-topic attach session (TTL 30 min), returns `{"sid"}` |
 | `GET /v1/attach/:sid/meta` | Composer prefill poll: `pending`, then `received` + `version`/`os` parsed from the report |
 | `POST /v1/attach/:sid/bind` | Binds a received pre-topic session to a freshly created topic (author check + upload + staff PM + whisper); `409 no_log` before the app delivered |
@@ -67,6 +68,10 @@ warren-admin.
 | `DISCOURSE_INTAKE_CATEGORY_ID` | category id (u64) for guest intake topics; unset disables the intake endpoint (503) |
 | `DISCOURSE_INTAKE_USERNAME` | low-privilege bot user authoring guest intake topics, default `warren-intake` |
 | `DISCOURSE_INTAKE_API_KEY` | user API key minted for the intake bot (the attach-logs key is tied to `system` and cannot impersonate the bot); falls back to `DISCOURSE_API_KEY` when that one is a global key |
+| `DISCOURSE_REPORT_API_KEY` | all-users Discourse API key with the granular `topics:write` scope, acting as the reporter so the in-app report topic is theirs; empty disables the report endpoint (503) |
+| `DISCOURSE_REPORT_CATEGORY_ID` | category id (u64) the in-app reports are created in (the bug-reports category); required with the key above |
+| `REPORT_MAX_PER_WALLET` | in-app reports admitted per wallet and per hour, default 3 |
+| `REPORT_MAX_GLOBAL` | in-app reports admitted in total per hour, default 20 |
 | `HELP_REPLY_MAX_PER_IP` | guest follow-ups admitted per IP and per hour, default 10 |
 | `HELP_REPLY_MAX_GLOBAL` | guest follow-ups admitted in total per hour, default 60 |
 
