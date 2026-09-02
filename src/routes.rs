@@ -916,8 +916,9 @@ async fn forum_attach_logs(
     // deterministic handle bridges the two.
     let topic = api.topic(req.topic_id).await?;
     if !topic.author_username.eq_ignore_ascii_case(&forum.username) {
+        // The topic alone: it is public, so a wallet next to it, even
+        // redacted, is the link the pairwise handle exists to break.
         tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
             topic_id = req.topic_id,
             "attach-logs refused: signer is not the topic author"
         );
@@ -1070,23 +1071,46 @@ fn decode_report(
 ) -> Result<(String, attach::ReportMeta), AuthError> {
     let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, log_gz_b64)
         .map_err(|_| {
-            tracing::info!(
-                pubkey = %redact(pubkey_ss58),
+            log_decode_refusal(
+                pubkey_ss58,
                 topic_id,
-                "report refused: log_gz_b64 is not valid base64"
+                None,
+                "log_gz_b64 is not valid base64",
             );
             AuthError::Payload
         })?;
     let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
-        tracing::info!(
-            pubkey = %redact(pubkey_ss58),
+        log_decode_refusal(
+            pubkey_ss58,
             topic_id,
-            gz_bytes = gz.len(),
-            "report refused: payload does not gunzip to UTF-8 under the cap"
+            Some(gz.len()),
+            "payload does not gunzip to UTF-8 under the cap",
         );
     })?;
     let meta = attach::parse_report_metadata(&log_text);
     Ok((log_text, meta))
+}
+
+/// Names a decode refusal by the topic when there is one and by the wallet
+/// otherwise, never both: on the topic path the author check has already
+/// tied the signer to a public topic, so the pair, even redacted, would be
+/// the wallet-to-forum link the pairwise handle exists to break. The topic
+/// alone routes the incident; the wallet alone is all a pre-topic report has.
+fn log_decode_refusal(
+    pubkey_ss58: &str,
+    topic_id: Option<u64>,
+    gz_bytes: Option<usize>,
+    reason: &str,
+) {
+    match topic_id {
+        Some(topic_id) => tracing::info!(topic_id, gz_bytes, reason, "report refused"),
+        None => tracing::info!(
+            pubkey = %redact(pubkey_ss58),
+            gz_bytes,
+            reason,
+            "report refused"
+        ),
+    }
 }
 
 /// Wallet-signed in-app bug report: a topic in the bug-reports category owned

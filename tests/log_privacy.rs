@@ -218,34 +218,34 @@ fn tracing_call_sites(body: &str) -> Vec<String> {
 /// A line that names both the wallet and a topic is the wallet-to-forum link
 /// the pairwise handle exists to break, and `docker logs` is retained. Even
 /// redacted, an 8-character prefix over a user base of tens of wallets is
-/// identifying. So a call site carrying both a `pubkey` field and a
-/// `topic_id` field is only ever a refusal (a refusal is the trace an
-/// incident needs, and it names a topic nothing was written to); a success
-/// line keeps the topic and drops the wallet.
+/// identifying. Refusals are no exception: on the attach-logs path the
+/// topic is public and the author check has already tied the signer to it,
+/// so a refusal naming both is the same link. A line carries the topic or
+/// the wallet, never both: a topic-mode line keeps the topic (the author is
+/// recoverable from the topic itself), a pre-topic line keeps the wallet.
 fn wallet_to_topic_links(body: &str) -> Vec<String> {
     tracing_call_sites(&code_only(body))
         .into_iter()
         .filter(|site| site.contains("pubkey") && site.contains("topic_id"))
-        .filter(|site| !site.contains("refused"))
         .collect()
 }
 
 #[test]
-fn no_success_line_links_a_wallet_to_a_topic() {
+fn no_line_links_a_wallet_to_a_topic() {
     let mut files = Vec::new();
     collect_rs_files(std::path::Path::new("src"), "", &mut files);
     for file in files {
         let links = wallet_to_topic_links(&read_module(&file));
         assert!(
             links.is_empty(),
-            "src/{file} logs a wallet next to a topic on a success path: {links:?}. \
+            "src/{file} logs a wallet next to a topic: {links:?}. \
              Drop the pubkey field; the topic id alone is what the operator needs."
         );
     }
 }
 
 #[test]
-fn the_link_scan_rejects_a_success_line_and_keeps_a_refusal() {
+fn the_link_scan_rejects_any_line_carrying_both_and_keeps_a_one_sided_one() {
     let success = r#"
         tracing::info!(
             pubkey = %redact(&identity.pubkey_ss58),
@@ -254,14 +254,21 @@ fn the_link_scan_rejects_a_success_line_and_keeps_a_refusal() {
         );
     "#;
     assert_eq!(wallet_to_topic_links(success).len(), 1);
-    let refusal = r#"
+    let refusal_with_both = r#"
         tracing::info!(
             pubkey = %redact(&identity.pubkey_ss58),
             topic_id = req.topic_id,
             "attach-logs refused: signer is not the topic author"
         );
     "#;
-    assert!(wallet_to_topic_links(refusal).is_empty());
+    assert_eq!(wallet_to_topic_links(refusal_with_both).len(), 1);
+    let topic_only_refusal = r#"
+        tracing::info!(
+            topic_id = req.topic_id,
+            "attach-logs refused: signer is not the topic author"
+        );
+    "#;
+    assert!(wallet_to_topic_links(topic_only_refusal).is_empty());
     let no_topic =
         r#"tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");"#;
     assert!(wallet_to_topic_links(no_topic).is_empty());
