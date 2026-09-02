@@ -180,7 +180,7 @@ const EN: Strings = Strings {
     a_noapp_heading: "The app did not open?",
     a_noapp_browser: "If your browser asks whether to open the link in the Warren app, choose Open. Firefox asks every time unless you tick \u{201c}Always open links in apps\u{201d}.",
     a_noapp_code: "Or open the Warren app yourself and type this sign-in code: Settings, Community forum, Enter sign-in code. This page keeps waiting for the approval.",
-    a_noapp_install: "No Warren app on this device yet? Install or update it (1.0.0 or later), then tap the button again.",
+    a_noapp_install: "No Warren app on this device yet? Install or update it (1.1.21 or later), then tap the button again.",
     a_copy: "Copy code",
     a_copied: "Copied",
     l_tab: "Warren, attach your logs",
@@ -234,7 +234,7 @@ const FR: Strings = Strings {
     a_noapp_heading: "L'application ne s'est pas ouverte ?",
     a_noapp_browser: "Si votre navigateur demande s'il doit ouvrir le lien dans l'application Warren, choisissez Ouvrir. Firefox le demande \u{e0} chaque fois tant que \u{ab} Toujours ouvrir les liens dans les applications \u{bb} n'est pas coch\u{e9}.",
     a_noapp_code: "Ou ouvrez vous-m\u{ea}me l'application Warren et saisissez ce code de connexion : R\u{e9}glages, Forum communautaire, Saisir un code de connexion. Cette page continue d'attendre l'approbation.",
-    a_noapp_install: "Pas encore d'application Warren sur cet appareil ? Installez-la ou mettez-la \u{e0} jour (1.0.0 ou plus r\u{e9}cente), puis appuyez de nouveau sur le bouton.",
+    a_noapp_install: "Pas encore d'application Warren sur cet appareil ? Installez-la ou mettez-la \u{e0} jour (1.1.21 ou plus r\u{e9}cente), puis appuyez de nouveau sur le bouton.",
     a_copy: "Copier le code",
     a_copied: "Copi\u{e9}",
     l_tab: "Warren, joindre vos journaux",
@@ -288,7 +288,7 @@ const RO: Strings = Strings {
     a_noapp_heading: "Aplica\u{21b}ia nu s-a deschis?",
     a_noapp_browser: "Dac\u{103} browserul \u{ee}ntreab\u{103} dac\u{103} s\u{103} deschid\u{103} linkul \u{ee}n aplica\u{21b}ia Warren, alege Deschide. Firefox \u{ee}ntreab\u{103} de fiecare dat\u{103} p\u{e2}n\u{103} bifezi \u{201e}Deschide \u{ee}ntotdeauna linkurile \u{ee}n aplica\u{21b}ii\u{201d}.",
     a_noapp_code: "Sau deschide singur aplica\u{21b}ia Warren \u{219}i introdu acest cod de autentificare: Set\u{103}ri, Forumul comunit\u{103}\u{21b}ii, Introdu un cod de autentificare. Aceast\u{103} pagin\u{103} a\u{219}teapt\u{103} \u{ee}n continuare aprobarea.",
-    a_noapp_install: "Nu ai \u{ee}nc\u{103} aplica\u{21b}ia Warren pe acest dispozitiv? Instaleaz-o sau actualizeaz-o (1.0.0 sau mai nou\u{103}), apoi apas\u{103} din nou butonul.",
+    a_noapp_install: "Nu ai \u{ee}nc\u{103} aplica\u{21b}ia Warren pe acest dispozitiv? Instaleaz-o sau actualizeaz-o (1.1.21 sau mai nou\u{103}), apoi apas\u{103} din nou butonul.",
     a_copy: "Copiaz\u{103} codul",
     a_copied: "Copiat",
     l_tab: "Warren, ata\u{219}eaz\u{103}-\u{21b}i jurnalele",
@@ -371,5 +371,26 @@ mod tests {
     fn locale_subtag_rejects_junk_and_missing() {
         assert_eq!(preferred_locale_subtag(None), None);
         assert_eq!(preferred_locale_subtag(Some("*;q=0.1, !!,")), None);
+    }
+
+    #[test]
+    fn no_locale_string_carries_a_dash() {
+        // The shared typography rule bans the em-dash and the en-dash in
+        // every authored text, page copy in every language included. The
+        // strings are literals in this file, so the file is what to scan;
+        // both the character and its escape are caught.
+        // Built at runtime so this test's own source carries neither the
+        // character nor its escape.
+        let source = include_str!("i18n.rs");
+        for (name, code) in [("em-dash", 0x2014u32), ("en-dash", 0x2013u32)] {
+            let ch = char::from_u32(code).expect("a valid scalar");
+            let escape = format!("\\u{{{code:x}}}");
+            let hits = source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(ch) || l.contains(&escape))
+                .count();
+            assert_eq!(hits, 0, "{name} found in a locale string");
+        }
     }
 }

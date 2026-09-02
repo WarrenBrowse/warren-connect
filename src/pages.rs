@@ -682,7 +682,7 @@ mod tests {
             "names the manual path in the app"
         );
         assert!(
-            page.contains("1.0.0 or later"),
+            page.contains("1.1.21 or later"),
             "names the minimum app version"
         );
         assert!(
@@ -702,6 +702,25 @@ mod tests {
             page.contains("get('noapp') === '1'"),
             "the intent fallback lands on the revealed block"
         );
+    }
+
+    #[test]
+    fn the_install_hint_names_the_first_version_with_the_sign_in_code_screen() {
+        // The intent filter exists from Android 1.0.0, but the "Enter sign-in
+        // code" screen the recovery block sends the user to only exists from
+        // 1.1.21: a user on 1.0.x who updates to what the page names must land
+        // on a version that has the screen.
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let page = approval_page(lang, &ids("s", "q"), "h", NONCE);
+            assert!(
+                page.contains("1.1.21"),
+                "{lang:?} names the code-screen minimum"
+            );
+            assert!(
+                !page.contains("1.0.0"),
+                "{lang:?} no longer names the intent-filter minimum"
+            );
+        }
     }
 
     #[test]
