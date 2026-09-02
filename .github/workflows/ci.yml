@@ -109,4 +109,9 @@ jobs:
           if ! command -v cargo-deny >/dev/null 2>&1; then
             cargo install --locked cargo-deny
           fi
+          # A cached advisory-db clone that cannot fast-forward its `main`
+          # fails every run with "failed to fetch latest changes" (three
+          # reruns on 2026-09-02, no code change between them). A fresh
+          # shallow clone costs seconds and cannot be stale.
+          rm -rf ~/.cargo/advisory-dbs
           cargo deny check advisories bans licenses sources
