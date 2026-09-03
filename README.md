@@ -148,10 +148,17 @@ origin `https://forum.warrenbrowse.com` only.
 ## Build and deploy
 
 ```bash
+git submodule update --init
 cargo test
 cross build --release --target x86_64-unknown-linux-musl
 docker build -t warren-connect:vX.Y.Z .
 ```
+
+The integration tests replay the shared golden vectors from the `vectors/`
+submodule ([warren-vectors](https://github.com/WarrenBrowse/warren-vectors)):
+`forum_login_v1.json` pins the exact signed request bytes a client builds for
+`/v1/forum/login` and `/v1/forum/report` and the exact answer this service
+gives per outcome, so the app and this broker are held to the same bytes.
 
 Deployed on the API host as part of the forum compose stack.
 

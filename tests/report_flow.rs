@@ -27,6 +27,9 @@ use warren_contract::auth::{
     HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
 };
 
+mod forum_vector;
+use forum_vector::{assert_answer, assert_signed_by_the_contract, observe, verify_at_vector_clock};
+
 const HANDLE_SECRET: &[u8] = b"a-test-handle-secret-32-bytes!!!";
 const CONNECT_SECRET: &[u8] = b"a-test-connect-secret-32-bytes!!";
 
@@ -179,14 +182,25 @@ fn test_state(
     paid: Option<&SigningKey>,
     per_wallet: usize,
 ) -> Arc<AppState> {
+    let paid_ss58 = paid.map(|key| warren_contract::ss58::encode(&key.verifying_key().to_bytes()));
+    state_with(HANDLE_SECRET, stub_url, paid_ss58.as_deref(), per_wallet)
+}
+
+/// A state under `handle_secret`, whose identity store knows `paid_ss58` as
+/// an ever-paid wallet when one is given.
+fn state_with(
+    handle_secret: &[u8],
+    stub_url: Option<&str>,
+    paid_ss58: Option<&str>,
+    per_wallet: usize,
+) -> Arc<AppState> {
     let lazy = PgPoolOptions::new()
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
         .expect("lazy pool never dials at build time");
     let memory = MemoryIdentity::default();
-    if let Some(key) = paid {
-        let ss58 = warren_contract::ss58::encode(&key.verifying_key().to_bytes());
+    if let Some(ss58) = paid_ss58 {
         memory.subscriptions.lock().expect("mutex").insert(
-            ss58,
+            ss58.to_owned(),
             SubscriptionStatus {
                 ever_paid: true,
                 active: true,
@@ -213,7 +227,7 @@ fn test_state(
     };
     Arc::new(AppState {
         connect_secret: CONNECT_SECRET.to_vec(),
-        handle_secret: HANDLE_SECRET.to_vec(),
+        handle_secret: handle_secret.to_vec(),
         public_host: "connect.test".into(),
         internal_token: String::new(),
         admins: Default::default(),
@@ -960,4 +974,322 @@ async fn the_fourth_failed_decode_of_a_wallet_is_refused_by_its_own_budget() {
         ops(&stub).iter().filter(|op| *op == "topic_create").count(),
         3
     );
+}
+
+#[test]
+fn the_forum_vector_carries_only_the_report_answers_this_suite_replays() {
+    // An outcome added to the vector goes red here until a replay exists for
+    // it (the request names and the login answers are guarded by the login
+    // suite).
+    let v = forum_vector::load();
+    let mut names = v.responses.report.names();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "clock_skew",
+            "created",
+            "created_logs_partial",
+            "created_without_logs",
+            "feature_disabled",
+            "forum_unavailable",
+            "invalid_report",
+            "payload_too_large",
+            "rate_limited",
+            "subscription_required"
+        ]
+    );
+}
+
+#[test]
+fn the_report_vectors_are_what_the_contract_signs_and_what_the_verifier_accepts() {
+    // Both ends of the wire against the same bytes, for the report with its
+    // log and for the one without: the contract's signer reproduces the
+    // pinned headers, the verifier accepts them at the vector clock, and the
+    // body is a report this route admits, field for field, within every cap.
+    let v = forum_vector::load();
+    for name in ["report_with_log", "report_without_log"] {
+        let req = forum_vector::request(&v, name);
+        assert_signed_by_the_contract(&v, req);
+        verify_at_vector_clock(&v, req);
+
+        let parsed: warren_connect::report::ReportRequest =
+            serde_json::from_str(&req.body_utf8).expect("the pinned body is a report");
+        warren_connect::report::validate(&parsed).expect("the pinned report is within every cap");
+        let body: serde_json::Value = serde_json::from_str(&req.body_utf8).expect("json");
+        let fields = req
+            .fields
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .expect("the report request declares its fields");
+        for (field, value) in fields {
+            assert_eq!(&body[field], value, "{name}: field {field}");
+        }
+        assert_eq!(
+            body.as_object().map(serde_json::Map::len),
+            Some(fields.len() + usize::from(req.log_gz_hex.is_some())),
+            "{name}: no field beyond the declared ones"
+        );
+        match req.log_gz_hex.as_deref() {
+            Some(gz_hex) => {
+                let gz = hex::decode(gz_hex).expect("hex");
+                assert_eq!(
+                    body["log_gz_b64"],
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &gz),
+                    "{name}: the log rides as standard base64 of the pinned gzip"
+                );
+                let text = warren_connect::attach::gunzip_capped(&gz)
+                    .expect("the pinned gzip inflates within the cap");
+                assert_eq!(Some(text.as_str()), req.log_utf8.as_deref(), "{name}");
+                let (version, os) = warren_connect::attach::parse_report_metadata(&text);
+                assert_eq!(
+                    version.as_deref(),
+                    fields["app_version"].as_str(),
+                    "{name}: the log header names the declared version"
+                );
+                assert_eq!(os.as_deref(), fields["os_version"].as_str(), "{name}");
+            }
+            None => assert!(
+                body.get("log_gz_b64").is_none(),
+                "{name}: no log field at all, never an empty one"
+            ),
+        }
+    }
+}
+
+/// A state under the vector's provider secret, knowing the vector wallet as
+/// ever-paid when `paid`.
+fn vector_state(
+    v: &forum_vector::Vector,
+    stub_url: Option<&str>,
+    paid: bool,
+    per_wallet: usize,
+) -> Arc<AppState> {
+    state_with(
+        v.provider.handle_secret_utf8.as_bytes(),
+        stub_url,
+        paid.then_some(v.signer.pubkey_ss58.as_str()),
+        per_wallet,
+    )
+}
+
+/// This router's answer to the pinned body named `request`, signed again by
+/// the vector key inside the clock window.
+async fn vector_answer(
+    v: &forum_vector::Vector,
+    state: Arc<AppState>,
+    request: &str,
+    nonce: [u8; 16],
+) -> forum_vector::Answer {
+    let app = warren_connect::routes::router(state);
+    let req = forum_vector::request(v, request);
+    let response = app
+        .oneshot(req.resigned_at(&v.signer.signing_key(), now_unix(), nonce))
+        .await
+        .expect("response");
+    observe(response).await
+}
+
+/// A created answer as this deployment produces it: the vector's synthetic
+/// forum origin is the one field the provider fills from its configuration.
+fn expected_created(v: &forum_vector::Vector, name: &str) -> forum_vector::Answer {
+    v.responses.report.get(name).at_forum_origin(
+        &v.provider.forum_public_url,
+        warren_connect::FORUM_PUBLIC_URL,
+    )
+}
+
+#[tokio::test]
+async fn the_report_vector_bytes_through_the_router_land_on_the_frozen_clock_skew_answer() {
+    // The vector timestamp is fixed, so at any real clock the pinned request
+    // is outside the window: the router reads the pinned headers and body
+    // and answers the token the clients match, byte for byte, at no forum
+    // cost.
+    let v = forum_vector::load();
+    let req = forum_vector::request(&v, "report_with_log");
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let app = warren_connect::routes::router(vector_state(&v, Some(&url), true, 3));
+    let answer = observe(app.oneshot(req.as_http()).await.expect("response")).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("clock_skew"),
+        "report.clock_skew",
+    );
+    assert!(ops(&stub).is_empty(), "a refused clock costs no forum call");
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_created_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let answer = vector_answer(&v, state, "report_with_log", [0x31; 16]).await;
+    assert_answer(&answer, &expected_created(&v, "created"), "report.created");
+    assert_eq!(
+        ops(&stub),
+        vec![
+            "sync_sso",
+            "upload",
+            "topic_create",
+            "pm",
+            "whisper",
+            "reply",
+            "author_pm",
+            "tag"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_created_without_logs_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let answer = vector_answer(&v, state, "report_without_log", [0x32; 16]).await;
+    assert_answer(
+        &answer,
+        &expected_created(&v, "created_without_logs"),
+        "report.created_without_logs",
+    );
+    assert_eq!(ops(&stub), vec!["sync_sso", "topic_create"]);
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_partial_delivery_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState {
+        whisper_fails: true,
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let answer = vector_answer(&v, state, "report_with_log", [0x33; 16]).await;
+    assert_answer(
+        &answer,
+        &expected_created(&v, "created_logs_partial"),
+        "report.created_logs_partial",
+    );
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_subscription_required_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), false, 3);
+    let answer = vector_answer(&v, state, "report_without_log", [0x34; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("subscription_required"),
+        "report.subscription_required",
+    );
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_rate_limited_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 0);
+    let answer = vector_answer(&v, state, "report_without_log", [0x35; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("rate_limited"),
+        "report.rate_limited",
+    );
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_forum_unavailable_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState {
+        topic_fails: true,
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let answer = vector_answer(&v, state, "report_without_log", [0x36; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("forum_unavailable"),
+        "report.forum_unavailable",
+    );
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_feature_disabled_answer() {
+    let v = forum_vector::load();
+    let state = vector_state(&v, None, true, 3);
+    let answer = vector_answer(&v, state, "report_without_log", [0x37; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("feature_disabled"),
+        "report.feature_disabled",
+    );
+}
+
+/// The pinned report fields with one value replaced, signed by the vector
+/// key inside the window: the shape the app sends, one cap tripped.
+async fn vector_fields_answer(
+    v: &forum_vector::Vector,
+    state: Arc<AppState>,
+    field: &str,
+    value: serde_json::Value,
+    nonce: [u8; 16],
+) -> forum_vector::Answer {
+    let mut fields = forum_vector::request(v, "report_without_log")
+        .fields
+        .clone()
+        .expect("the report request declares its fields");
+    fields[field] = value;
+    let app = warren_connect::routes::router(state);
+    let response = app
+        .oneshot(signed_report(
+            &v.signer.signing_key(),
+            &fields.to_string(),
+            nonce,
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+    observe(response).await
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_invalid_report_answer() {
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let answer =
+        vector_fields_answer(&v, state, "what_happened", "too short".into(), [0x38; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("invalid_report"),
+        "report.invalid_report",
+    );
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn the_report_vector_pins_the_payload_too_large_answer() {
+    // One character past the base64 cap: refused before the gate, the
+    // budget or any inflate.
+    let v = forum_vector::load();
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = vector_state(&v, Some(&url), true, 3);
+    let over = "A".repeat(warren_connect::attach::MAX_LOG_GZ_B64_CHARS + 1);
+    let answer = vector_fields_answer(&v, state, "log_gz_b64", over.into(), [0x39; 16]).await;
+    assert_answer(
+        &answer,
+        &v.responses.report.get("payload_too_large"),
+        "report.payload_too_large",
+    );
+    assert!(ops(&stub).is_empty());
 }

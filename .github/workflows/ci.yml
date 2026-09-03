@@ -27,7 +27,11 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 25
     steps:
+      # The integration tests replay the shared golden vectors (the public
+      # warren-vectors submodule at vectors/), so the checkout brings it in.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       # warren-contract is a private git dependency. The ENGINE_TOKEN secret is
       # an enrichment, never a precondition: when it is unset the step warns and

@@ -15,23 +15,43 @@ use warren_connect::attach::AttachStore;
 use warren_connect::nonces::NonceStore;
 use warren_connect::routes::{AppState, router};
 use warren_connect::sessions::SessionStore;
-use warren_connect::store::{IdentityStore, MemoryIdentity};
+use warren_connect::store::{IdentityStore, MemoryIdentity, SubscriptionStatus};
+
+mod forum_vector;
+use forum_vector::{assert_answer, assert_signed_by_the_contract, observe, verify_at_vector_clock};
 
 const CONNECT_SECRET: &[u8] = b"a-test-connect-secret-32-bytes!!";
 
 fn test_state() -> Arc<AppState> {
+    state_with(b"a-test-handle-secret-32-bytes!!!", None)
+}
+
+/// A state under `handle_secret`, whose identity store knows `paid_ss58` as
+/// an ever-paid wallet when one is given.
+fn state_with(handle_secret: &[u8], paid_ss58: Option<&str>) -> Arc<AppState> {
     let lazy = PgPoolOptions::new()
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
         .expect("lazy pool never dials at build time");
+    let memory = MemoryIdentity::default();
+    if let Some(ss58) = paid_ss58 {
+        memory.subscriptions.lock().expect("mutex").insert(
+            ss58.to_owned(),
+            SubscriptionStatus {
+                ever_paid: true,
+                active: true,
+                expires_at_unix: Some(4_102_444_800),
+            },
+        );
+    }
     Arc::new(AppState {
         connect_secret: CONNECT_SECRET.to_vec(),
-        handle_secret: b"a-test-handle-secret-32-bytes!!!".to_vec(),
+        handle_secret: handle_secret.to_vec(),
         public_host: "connect.test".into(),
         internal_token: "test-internal-token".into(),
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
-        identity: IdentityStore::Memory(MemoryIdentity::default()),
+        identity: IdentityStore::Memory(memory),
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),
@@ -226,9 +246,16 @@ fn unix_now() -> u64 {
 }
 
 async fn approval_page_sid(app: &axum::Router) -> String {
-    let (sso, sig) = signed_sso(
-        "nonce=nclock&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login",
-    );
+    page_sid(app, "nclock").await
+}
+
+/// The sid of the approval page opened under the DiscourseConnect nonce
+/// `nonce` (a live pending session is reused per nonce, so a test that needs
+/// a fresh one names a fresh nonce).
+async fn page_sid(app: &axum::Router, nonce: &str) -> String {
+    let (sso, sig) = signed_sso(&format!(
+        "nonce={nonce}&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login"
+    ));
     let response = app
         .clone()
         .oneshot(
@@ -458,4 +485,193 @@ async fn internal_lookup_requires_bearer_token() {
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn the_forum_vector_carries_only_the_names_the_login_suite_replays() {
+    // The control.json convention: a request or an outcome added to the
+    // vector goes red here until a replay exists for it, so a stale pin can
+    // never drop a golden vector silently. The report answers are guarded
+    // by the report suite.
+    let v = forum_vector::load();
+    let mut requests: Vec<&str> = v.requests.iter().map(|r| r.name.as_str()).collect();
+    requests.sort_unstable();
+    assert_eq!(requests, ["login", "report_with_log", "report_without_log"]);
+    let mut login = v.responses.login.names();
+    login.sort_unstable();
+    assert_eq!(
+        login,
+        [
+            "approved",
+            "clock_skew",
+            "session_unknown",
+            "subscription_required"
+        ]
+    );
+    let mut status = v.responses.session_status.names();
+    status.sort_unstable();
+    assert_eq!(
+        status,
+        [
+            "approved",
+            "cancelled_clock_skew",
+            "cancelled_subscription_required",
+            "pending",
+            "unknown"
+        ]
+    );
+}
+
+#[test]
+fn the_login_vector_is_what_the_contract_signs_and_what_the_verifier_accepts() {
+    // Both ends of the wire against the same bytes: the contract's signer fed
+    // the vector inputs must produce exactly the pinned headers, and this
+    // verifier, with its clock at the vector timestamp, must accept them
+    // over the pinned body and prove the vector key.
+    let v = forum_vector::load();
+    let req = forum_vector::request(&v, "login");
+    assert_signed_by_the_contract(&v, req);
+    let identity = verify_at_vector_clock(&v, req);
+
+    let sid = req.sid.as_deref().expect("the login request names its sid");
+    let body: serde_json::Value = serde_json::from_str(&req.body_utf8).expect("json body");
+    assert_eq!(
+        body["sid"], sid,
+        "the body is the sid the deep link carried"
+    );
+
+    // The handle the provider answers with is the keyed derivation over the
+    // proven key, under the provider secret the vector was produced with.
+    let derived =
+        warren_connect::handle::derive(v.provider.handle_secret_utf8.as_bytes(), &identity.pubkey);
+    assert_eq!(derived.username, v.provider.handle);
+    assert_eq!(derived.external_id, v.provider.external_id);
+}
+
+#[tokio::test]
+async fn the_login_vector_bytes_through_the_router_land_on_the_frozen_clock_skew_answer() {
+    // The vector timestamp is fixed, so at any real clock the pinned request
+    // is outside the window: the router reads the pinned headers and body
+    // and answers the token the clients match, byte for byte.
+    let v = forum_vector::load();
+    let req = forum_vector::request(&v, "login");
+    let app = router(test_state());
+    let answer = observe(app.oneshot(req.as_http()).await.expect("infallible")).await;
+    assert_answer(
+        &answer,
+        &v.responses.login.get("clock_skew"),
+        "login.clock_skew",
+    );
+}
+
+async fn session_status_answer(app: &axum::Router, sid: &str) -> forum_vector::Answer {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/session/{sid}/status"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    observe(response).await
+}
+
+#[tokio::test]
+async fn the_login_vector_pins_the_provider_answer_per_outcome() {
+    // The pinned answers, produced again by this router under the vector's
+    // provider parameters, with the vector key signing inside the window.
+    let v = forum_vector::load();
+    let key = v.signer.signing_key();
+    let secret = v.provider.handle_secret_utf8.as_bytes();
+    let app = router(state_with(secret, Some(&v.signer.pubkey_ss58)));
+
+    // Pending, then approved: the handle and the slot come back to the
+    // wallet that signed, and the browser sees the approval.
+    let sid = page_sid(&app, "nvec-approve").await;
+    assert_answer(
+        &session_status_answer(&app, &sid).await,
+        &v.responses.session_status.get("pending"),
+        "session_status.pending",
+    );
+    let response = app
+        .clone()
+        .oneshot(signed_login_request(&key, &sid, unix_now(), [0x21; 16]))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.login.get("approved"),
+        "login.approved",
+    );
+    assert_answer(
+        &session_status_answer(&app, &sid).await,
+        &v.responses.session_status.get("approved"),
+        "session_status.approved",
+    );
+
+    // Clock skew: refused with the token, and the browser is told why.
+    let sid = page_sid(&app, "nvec-clock").await;
+    let response = app
+        .clone()
+        .oneshot(signed_login_request(
+            &key,
+            &sid,
+            unix_now() - 120,
+            [0x22; 16],
+        ))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.login.get("clock_skew"),
+        "login.clock_skew",
+    );
+    assert_answer(
+        &session_status_answer(&app, &sid).await,
+        &v.responses.session_status.get("cancelled_clock_skew"),
+        "session_status.cancelled_clock_skew",
+    );
+
+    // The vector sid names no live session here.
+    let unknown = forum_vector::request(&v, "login")
+        .sid
+        .as_deref()
+        .expect("the login request names its sid");
+    let response = app
+        .clone()
+        .oneshot(signed_login_request(&key, unknown, unix_now(), [0x23; 16]))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.login.get("session_unknown"),
+        "login.session_unknown",
+    );
+    assert_answer(
+        &session_status_answer(&app, unknown).await,
+        &v.responses.session_status.get("unknown"),
+        "session_status.unknown",
+    );
+
+    // Never paid: the paywall, and the browser is told why.
+    let never = router(state_with(secret, None));
+    let sid = page_sid(&never, "nvec-unpaid").await;
+    let response = never
+        .clone()
+        .oneshot(signed_login_request(&key, &sid, unix_now(), [0x24; 16]))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.login.get("subscription_required"),
+        "login.subscription_required",
+    );
+    assert_answer(
+        &session_status_answer(&never, &sid).await,
+        &v.responses
+            .session_status
+            .get("cancelled_subscription_required"),
+        "session_status.cancelled_subscription_required",
+    );
 }
