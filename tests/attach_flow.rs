@@ -58,7 +58,7 @@ async fn stub_topic(State(s): State<Arc<StubState>>) -> Json<serde_json::Value> 
             .collect::<Vec<_>>()
     };
     Json(serde_json::json!({
-        "title": "Connexion impossible",
+        "title": "[macOS] Connection: cannot connect after update #a1b2c3",
         "details": { "created_by": { "username": s.author } },
         "post_stream": { "posts": [ { "username": s.author } ] },
         "tags": tags,
@@ -1362,6 +1362,45 @@ async fn the_reporter_gets_a_private_receipt_naming_their_topic() {
         raw.contains("uniquement par l\u{2019}\u{e9}quipe support")
             || raw.contains("uniquement par l'\u{e9}quipe support"),
         "states the logs stay private: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn the_staff_pm_subject_carries_the_topic_title_unescaped() {
+    // A Discourse subject is rendered verbatim, so the escaping that defangs
+    // the PM body must not reach the subject: PM 176 reached the staff inbox
+    // reading "Journaux Warren pour le sujet #175 : \\[macOS\\] Connection\\: ...".
+    let key = SigningKey::from_bytes(&[17u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = state.attach.create(42, now_unix()).expect("create");
+    let body = serde_json::json!({
+        "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
+    })
+    .to_string();
+    let response = router(state)
+        .oneshot(signed_attach_request(&key, &body, [37; 16]))
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = stub.calls.lock().expect("stub mutex");
+    let pm = calls.iter().find(|c| c.op == "pm").expect("staff PM sent");
+    let sent: serde_json::Value = serde_json::from_str(&pm.body).expect("json");
+    let title = sent["title"].as_str().expect("title");
+    assert!(
+        title.ends_with("[macOS] Connection: cannot connect after update #a1b2c3"),
+        "{title}"
+    );
+    assert!(!title.contains('\\'), "no escape in a subject: {title}");
+    assert!(
+        sent["raw"].as_str().expect("raw").contains("\\[macOS\\]"),
+        "the body stays defanged, it IS markdown"
     );
 }
 

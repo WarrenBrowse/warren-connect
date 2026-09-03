@@ -138,8 +138,9 @@ pub(crate) fn escape_md_inline(input: &str) -> String {
 /// Unicode bidirectional formatting characters: the marks, the embeddings and
 /// overrides, and the isolates. None of them has a legitimate place in a topic
 /// title, a filename or a report field, and every one of them can make the
-/// rendered order differ from the stored order.
-fn is_bidi_control(ch: char) -> bool {
+/// rendered order differ from the stored order. One definition for the whole
+/// crate: two lists would drift apart and leave one surface reorderable.
+pub(crate) fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
@@ -152,12 +153,35 @@ fn safe_fact(input: &str) -> String {
     escape_md_inline(&clamped)
 }
 
+/// Longest slice of a topic title echoed in a PM subject. Discourse caps a
+/// title and refuses a longer one, and the echoed title is whatever the forum
+/// holds (already at that cap on its own), so the echo is clamped rather than
+/// the prefixed subject risking the refusal that would strand the logs.
+const PM_TITLE_EXCERPT_CHARS: usize = 180;
+
+/// One line of user text for a Discourse title: whitespace collapsed, control
+/// and bidi characters dropped, clamped. A title is plain text to Discourse
+/// (no markdown, no mention parsing), so it is NOT backslash-escaped: the
+/// escapes reached the staff inbox as literal backslashes (PM 176).
+#[must_use]
+fn title_plain(input: &str) -> String {
+    let collapsed: String = input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .take(PM_TITLE_EXCERPT_CHARS)
+        .collect();
+    collapsed.trim().to_owned()
+}
+
 /// Title of the staff PM carrying the uploaded log.
 #[must_use]
 pub fn pm_title(topic_id: u64, topic_title: &str) -> String {
     format!(
         "Journaux Warren pour le sujet #{topic_id} : {}",
-        escape_md_inline(topic_title)
+        title_plain(topic_title)
     )
 }
 
@@ -712,6 +736,33 @@ mod tests {
         let t = pm_title(42, "Connexion impossible");
         assert!(t.contains("42"));
         assert!(t.contains("Connexion impossible"));
+    }
+
+    #[test]
+    fn pm_title_echoes_the_topic_title_as_plain_text() {
+        // A Discourse title is rendered verbatim: the escapes reached the
+        // staff inbox as literal backslashes (PM 176 read
+        // "\\[macOS\\] Connection\\: ..."). A control or bidi character
+        // still goes, since it can make the subject read as something else.
+        let t = pm_title(
+            175,
+            "[macOS] Connection: cannot connect\u{202E} after update #a1b2c3",
+        );
+        assert!(
+            t.contains("[macOS] Connection: cannot connect after update #a1b2c3"),
+            "{t}"
+        );
+        assert!(!t.contains('\\'), "no escape survives into a subject: {t}");
+        assert!(!t.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn pm_title_clamps_an_oversized_topic_title() {
+        // Discourse refuses a title past its own cap, so a long forum-side
+        // title must not push the prefixed subject over it and fail the PM
+        // that carries the logs.
+        let t = pm_title(175, &"a".repeat(255));
+        assert!(t.chars().count() < 255, "{}", t.chars().count());
     }
 
     #[test]

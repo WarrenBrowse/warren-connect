@@ -12,7 +12,7 @@
 use serde::Deserialize;
 
 use crate::error::AuthError;
-use crate::forum_api::escape_md_inline;
+use crate::forum_api::{escape_md_inline, is_bidi_control};
 use crate::intake::{MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS, defang_mentions, quote_block};
 
 /// Longest optional title the reporter may set; the server derives one
@@ -232,15 +232,6 @@ fn title_excerpt(text: &str) -> String {
         .take(TITLE_EXCERPT_CHARS)
         .collect();
     collapsed.trim().to_owned()
-}
-
-/// Unicode bidirectional formatting characters (the same set the markdown
-/// escaper drops): none belongs in a title, every one can reorder it.
-fn is_bidi_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 /// Topic title: `[Android] Connection: cannot connect after update #a1b2c3`.
