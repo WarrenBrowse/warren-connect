@@ -355,6 +355,11 @@ pub async fn notifications_for_username(
 /// `username` is derived from the signing wallet by the caller, never taken
 /// from a request field, so this cannot be pointed at somebody else.
 ///
+/// The returned bookmark is cast explicitly, like every column the panel
+/// reads: Discourse widened it to BIGINT, and decoding it narrower failed
+/// AFTER the update had committed, so the route reported a landed write as
+/// a failure.
+///
 /// # Errors
 /// Propagates sqlx errors.
 pub async fn mark_seen_for_username(
@@ -363,7 +368,7 @@ pub async fn mark_seen_for_username(
 ) -> Result<i64, sqlx::Error> {
     // Same visibility rule as the count: a bookmark must not land on a
     // notification the reader can never be shown.
-    let seen: Option<i32> = sqlx::query_scalar(
+    let seen: Option<i64> = sqlx::query_scalar(
         "UPDATE users u
             SET seen_notification_id = GREATEST(
                   COALESCE(u.seen_notification_id, 0),
@@ -373,12 +378,12 @@ pub async fn mark_seen_for_username(
                              WHERE n.user_id = u.id
                                AND (t.id IS NULL OR t.deleted_at IS NULL)), 0))
           WHERE u.username = $1
-      RETURNING u.seen_notification_id",
+      RETURNING u.seen_notification_id::bigint",
     )
     .bind(username)
     .fetch_optional(discourse_pool)
     .await?;
-    Ok(i64::from(seen.unwrap_or(0)))
+    Ok(seen.unwrap_or(0))
 }
 
 /// A wallet's subscription standing, derived from the single `subscriptions`
@@ -746,10 +751,14 @@ mod tests {
     async fn seed_fake_discourse(pool: &PgPool) {
         // One statement per call: a prepared statement cannot carry several.
         sqlx::query(
+            // The bookmark and the notification id are BIGINT on the live
+            // forum (schema_migrations 20260728071552, read on 2026-09-03):
+            // Discourse widened both. Narrower fixture columns hid a decode
+            // that failed only in production, after the write had landed.
             "CREATE TABLE users (
                  id INTEGER PRIMARY KEY,
                  username TEXT NOT NULL,
-                 seen_notification_id INTEGER NOT NULL DEFAULT 0
+                 seen_notification_id BIGINT NOT NULL DEFAULT 0
              )",
         )
         .execute(pool)
@@ -757,7 +766,7 @@ mod tests {
         .expect("fake users table");
         sqlx::query(
             "CREATE TABLE notifications (
-                 id SERIAL PRIMARY KEY,
+                 id BIGSERIAL PRIMARY KEY,
                  user_id INTEGER NOT NULL,
                  notification_type INTEGER NOT NULL,
                  read BOOLEAN NOT NULL,
@@ -1049,6 +1058,39 @@ laisse passer ?', NULL),
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn marking_seen_reports_the_bookmark_discourse_stores_as_bigint(pool: PgPool) {
+        // Seen live on 2026-09-03 against connect v0.15.3: the UPDATE landed
+        // (the forum's bookmark advanced, the next digest read 0) and the
+        // route still answered 404, because the returned bookmark was decoded
+        // as a 32-bit integer while Discourse now stores it as BIGINT. A
+        // landed write that reports failure is the worst shape of bug: the
+        // client retries, or shows an error, over a state that is correct.
+        seed_fake_discourse(&pool).await;
+        let newest: i64 = sqlx::query_scalar("SELECT max(id) FROM notifications WHERE user_id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("newest");
+
+        let reported = mark_seen_for_username(&pool, "lusab-babad-dovok").await;
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT seen_notification_id FROM users WHERE username = 'lusab-babad-dovok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("stored");
+        assert_eq!(
+            stored, newest,
+            "the write itself must land on the newest notification"
+        );
+        assert_eq!(
+            reported.map_err(|e| e.to_string()),
+            Ok(stored),
+            "a write that landed must be reported as such, with the bookmark it left"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn the_seen_bookmark_only_ever_moves_forward(pool: PgPool) {
         // It is the one guarantee that makes this write safe to expose: a
         // replay, a race or a stale client can only ever fail to advance it,
@@ -1087,7 +1129,7 @@ laisse passer ?', NULL),
             .await
             .expect("mark seen");
 
-        let other: i32 = sqlx::query_scalar(
+        let other: i64 = sqlx::query_scalar(
             "SELECT seen_notification_id FROM users WHERE username = 'rudop-tijub-sozom'",
         )
         .fetch_one(&pool)
