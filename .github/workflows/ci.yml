@@ -114,6 +114,15 @@ jobs:
       # every other step of this workflow already relies on, into the exact
       # directory cargo-deny derives for the default database URL, and the
       # check then runs without touching the network.
+      #
+      # `persist-credentials: false` is load-bearing: the clone is copied
+      # below into `~/.cargo/advisory-dbs`, a cache every WarrenBrowse
+      # workflow on this runner pool shares. With the default, the checkout
+      # leaves this job's token as `http.https://github.com/.extraheader` in
+      # the clone's `.git/config`; the token dies with the job, and the next
+      # repo whose cargo-deny fetches that cache (warren-core, 2026-09-07,
+      # six of eight arm64 runners) gets a 401 from GitHub on a PUBLIC repo
+      # and dies on "could not read Username ... terminal prompts disabled".
       - name: Fetch the RustSec advisory database
         uses: actions/checkout@v5
         with:
@@ -121,6 +130,7 @@ jobs:
           ref: main
           path: advisory-db
           fetch-depth: 1
+          persist-credentials: false
       - name: cargo deny (advisories, bans, licenses, sources)
         run: |
           set -euo pipefail
