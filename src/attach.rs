@@ -395,6 +395,20 @@ impl AttachStore {
             .map(|r| (r.version.clone(), r.os.clone())))
     }
 
+    /// The topic a live session is bound to, `None` for a pre-topic session.
+    /// What a phone typing the session id by hand cannot know otherwise.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] if unknown or expired.
+    pub fn topic_of(&self, sid: &str, now_unix: u64) -> Result<Option<u64>, AuthError> {
+        let sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        let session = sessions.get(sid).ok_or(AuthError::Session)?;
+        if session.expired(now_unix) {
+            return Err(AuthError::Session);
+        }
+        Ok(session.topic_id)
+    }
+
     /// The stored handle + log of a received pre-topic session, for the bind.
     /// Does not transition (a failed Discourse write must stay retryable).
     ///
@@ -839,6 +853,16 @@ mod tests {
             );
             assert!(store.status(sid, 1800).is_err(), "the TTL is 1800 s");
         }
+    }
+
+    #[test]
+    fn topic_of_names_the_bound_topic_and_none_for_a_pre_topic_session() {
+        let store = AttachStore::default();
+        let bound = store.create(42, 1).expect("create");
+        assert_eq!(store.topic_of(&bound, 2).expect("topic"), Some(42));
+        let pre = store.create_pre(1).expect("create pre");
+        assert_eq!(store.topic_of(&pre, 2).expect("topic"), None);
+        assert!(store.topic_of("nope", 2).is_err(), "unknown sid");
     }
 
     #[test]

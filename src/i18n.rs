@@ -139,16 +139,15 @@ pub(crate) struct Strings {
     pub(crate) l_received: &'static str,
     pub(crate) l_expired: &'static str,
     pub(crate) l_cancelled: &'static str,
-    /// Shown instead of the deep-link button when the reader is a phone
-    /// browser: neither mobile app takes the attach-logs link, so the button
-    /// would go nowhere. Android has an in-app report to send the user to;
-    /// iOS has no report screen, so its copy asks for a reply on the topic.
-    /// `{link}` in the topic-mode bodies is the topic's URL, pasted into the
-    /// report so the staff can pair the two.
-    pub(crate) l_android_heading: &'static str,
+    /// The fallback block a phone reader sees under the button from the
+    /// start: neither mobile app took the attach-logs link before the
+    /// builds of 2026-09-08, so a tap on an older app goes nowhere (Android)
+    /// or opens an app that does nothing (iOS). Android has an in-app report
+    /// to fall back on; iOS has no report screen, so its copy asks for a
+    /// reply on the topic.
+    pub(crate) l_noapp_heading: &'static str,
     pub(crate) l_android_body: &'static str,
     pub(crate) l_android_body_pre: &'static str,
-    pub(crate) l_ios_heading: &'static str,
     pub(crate) l_ios_body: &'static str,
     pub(crate) l_ios_body_pre: &'static str,
     pub(crate) l_back: &'static str,
@@ -207,12 +206,11 @@ const EN: Strings = Strings {
     l_received: "Report received. Return to the forum tab: your report form is waiting for you there.",
     l_expired: "Session expired. Close this page and click the button on your topic again.",
     l_cancelled: "Sending cancelled from the Warren app. You can close this page.",
-    l_android_heading: "On Android, send the logs from the app",
-    l_android_body: "The Warren app for Android cannot take over from this page yet. Send your logs from the app instead: Settings, Report a problem, with the logs included. Paste this link into the description so the staff can match the two:",
-    l_android_body_pre: "The Warren app for Android cannot take over from this page yet. File your report from the app instead: Settings, Report a problem, with the logs included. It posts the topic and delivers your logs in one step, so discard the draft in the forum tab. You can close this page.",
-    l_ios_heading: "On iPhone and iPad, answer on the topic",
-    l_ios_body: "The Warren app for iOS cannot take over from this page yet, and it has no report screen. Reply on your topic with what you observe and your app version; the staff will ask for what they need.",
-    l_ios_body_pre: "The Warren app for iOS cannot take over from this page yet, and it has no report screen. Post your report in the forum tab without logs, with your app version; the staff will ask for what they need. You can close this page.",
+    l_noapp_heading: "The app did not open, or did nothing?",
+    l_android_body: "Your Warren app predates this link: update it from beta.warren.ro and tap the button again. Or send your logs from the app now: Settings, Report a problem, with the logs included, and paste this link into the description so the staff can match the two:",
+    l_android_body_pre: "Your Warren app predates this link: update it from beta.warren.ro and tap the button again. Or file your report from the app now: Settings, Report a problem, with the logs included. It posts the topic and delivers your logs in one step, so discard the draft in the forum tab.",
+    l_ios_body: "The Warren app for iOS cannot take this link yet, and it has no report screen. Reply on your topic with what you observe and your app version; the staff will ask for what they need.",
+    l_ios_body_pre: "The Warren app for iOS cannot take this link yet, and it has no report screen. Post your report in the forum tab without logs, with your app version; the staff will ask for what they need.",
     l_back: "Back to the topic",
     t_tab: "Warren forum: transparency",
     t_heading: "How forum sign-in protects you",
@@ -268,12 +266,11 @@ const FR: Strings = Strings {
     l_received: "Rapport re\u{e7}u. Revenez \u{e0} l'onglet du forum : votre formulaire vous y attend.",
     l_expired: "Session expir\u{e9}e. Fermez cette page et cliquez \u{e0} nouveau sur le bouton de votre sujet.",
     l_cancelled: "Envoi annul\u{e9} depuis l'application Warren. Vous pouvez fermer cette page.",
-    l_android_heading: "Sur Android, envoyez les journaux depuis l'application",
-    l_android_body: "L'application Warren pour Android ne peut pas encore prendre le relais de cette page. Envoyez vos journaux depuis l'application : Param\u{e8}tres, Signaler un probl\u{e8}me, journaux inclus. Collez ce lien dans la description pour que le staff fasse le rapprochement :",
-    l_android_body_pre: "L'application Warren pour Android ne peut pas encore prendre le relais de cette page. D\u{e9}posez votre rapport depuis l'application : Param\u{e8}tres, Signaler un probl\u{e8}me, journaux inclus. Elle publie le sujet et transmet vos journaux en une seule \u{e9}tape, donc abandonnez le brouillon de l'onglet du forum. Vous pouvez fermer cette page.",
-    l_ios_heading: "Sur iPhone et iPad, r\u{e9}pondez sur le sujet",
-    l_ios_body: "L'application Warren pour iOS ne peut pas encore prendre le relais de cette page et n'a pas d'\u{e9}cran de signalement. R\u{e9}pondez sur votre sujet avec ce que vous observez et votre version de l'application ; le staff vous demandera ce dont il a besoin.",
-    l_ios_body_pre: "L'application Warren pour iOS ne peut pas encore prendre le relais de cette page et n'a pas d'\u{e9}cran de signalement. Publiez votre rapport dans l'onglet du forum sans journaux, avec votre version de l'application ; le staff vous demandera ce dont il a besoin. Vous pouvez fermer cette page.",
+    l_noapp_heading: "L'application ne s'est pas ouverte, ou n'a rien fait ?",
+    l_android_body: "Votre application Warren est ant\u{e9}rieure \u{e0} ce lien : mettez-la \u{e0} jour depuis beta.warren.ro et touchez \u{e0} nouveau le bouton. Ou envoyez vos journaux depuis l'application d\u{e8}s maintenant : Param\u{e8}tres, Signaler un probl\u{e8}me, journaux inclus, et collez ce lien dans la description pour que le staff fasse le rapprochement :",
+    l_android_body_pre: "Votre application Warren est ant\u{e9}rieure \u{e0} ce lien : mettez-la \u{e0} jour depuis beta.warren.ro et touchez \u{e0} nouveau le bouton. Ou d\u{e9}posez votre rapport depuis l'application d\u{e8}s maintenant : Param\u{e8}tres, Signaler un probl\u{e8}me, journaux inclus. Elle publie le sujet et transmet vos journaux en une seule \u{e9}tape, donc abandonnez le brouillon de l'onglet du forum.",
+    l_ios_body: "L'application Warren pour iOS ne peut pas encore prendre ce lien et n'a pas d'\u{e9}cran de signalement. R\u{e9}pondez sur votre sujet avec ce que vous observez et votre version de l'application ; le staff vous demandera ce dont il a besoin.",
+    l_ios_body_pre: "L'application Warren pour iOS ne peut pas encore prendre ce lien et n'a pas d'\u{e9}cran de signalement. Publiez votre rapport dans l'onglet du forum sans journaux, avec votre version de l'application ; le staff vous demandera ce dont il a besoin.",
     l_back: "Retour au sujet",
     t_tab: "Forum Warren : transparence",
     t_heading: "Comment la connexion au forum vous prot\u{e8}ge",
@@ -329,12 +326,11 @@ const RO: Strings = Strings {
     l_received: "Raport primit. Revino la fila forumului: formularul t\u{103}u te a\u{219}teapt\u{103} acolo.",
     l_expired: "Sesiune expirat\u{103}. \u{ce}nchide aceast\u{103} pagin\u{103} \u{219}i apas\u{103} din nou butonul de pe subiect.",
     l_cancelled: "Trimitere anulat\u{103} din aplica\u{21b}ia Warren. Po\u{21b}i \u{ee}nchide aceast\u{103} pagin\u{103}.",
-    l_android_heading: "Pe Android, trimite jurnalele din aplica\u{21b}ie",
-    l_android_body: "Aplica\u{21b}ia Warren pentru Android nu poate continua deocamdat\u{103} de pe aceast\u{103} pagin\u{103}. Trimite jurnalele din aplica\u{21b}ie: Set\u{103}ri, Raporta\u{21b}i o problem\u{103}, cu jurnalele incluse. Lipe\u{219}te acest link \u{ee}n descriere, ca echipa s\u{103} poat\u{103} face leg\u{103}tura:",
-    l_android_body_pre: "Aplica\u{21b}ia Warren pentru Android nu poate continua deocamdat\u{103} de pe aceast\u{103} pagin\u{103}. Depune raportul din aplica\u{21b}ie: Set\u{103}ri, Raporta\u{21b}i o problem\u{103}, cu jurnalele incluse. Public\u{103} subiectul \u{219}i transmite jurnalele \u{ee}ntr-un singur pas, a\u{219}a c\u{103} renun\u{21b}\u{103} la ciorna din fila forumului. Po\u{21b}i \u{ee}nchide aceast\u{103} pagin\u{103}.",
-    l_ios_heading: "Pe iPhone \u{219}i iPad, r\u{103}spunde pe subiect",
-    l_ios_body: "Aplica\u{21b}ia Warren pentru iOS nu poate continua deocamdat\u{103} de pe aceast\u{103} pagin\u{103} \u{219}i nu are un ecran de raportare. R\u{103}spunde pe subiectul t\u{103}u cu ce observi \u{219}i cu versiunea aplica\u{21b}iei; echipa \u{ee}\u{21b}i va cere ce \u{ee}i trebuie.",
-    l_ios_body_pre: "Aplica\u{21b}ia Warren pentru iOS nu poate continua deocamdat\u{103} de pe aceast\u{103} pagin\u{103} \u{219}i nu are un ecran de raportare. Public\u{103} raportul \u{ee}n fila forumului f\u{103}r\u{103} jurnale, cu versiunea aplica\u{21b}iei; echipa \u{ee}\u{21b}i va cere ce \u{ee}i trebuie. Po\u{21b}i \u{ee}nchide aceast\u{103} pagin\u{103}.",
+    l_noapp_heading: "Aplica\u{21b}ia nu s-a deschis, sau nu a f\u{103}cut nimic?",
+    l_android_body: "Aplica\u{21b}ia ta Warren este mai veche dec\u{e2}t acest link: actualizeaz-o de pe beta.warren.ro \u{219}i apas\u{103} din nou butonul. Sau trimite jurnalele din aplica\u{21b}ie chiar acum: Set\u{103}ri, Raporta\u{21b}i o problem\u{103}, cu jurnalele incluse, \u{219}i lipe\u{219}te acest link \u{ee}n descriere, ca echipa s\u{103} poat\u{103} face leg\u{103}tura:",
+    l_android_body_pre: "Aplica\u{21b}ia ta Warren este mai veche dec\u{e2}t acest link: actualizeaz-o de pe beta.warren.ro \u{219}i apas\u{103} din nou butonul. Sau depune raportul din aplica\u{21b}ie chiar acum: Set\u{103}ri, Raporta\u{21b}i o problem\u{103}, cu jurnalele incluse. Public\u{103} subiectul \u{219}i transmite jurnalele \u{ee}ntr-un singur pas, a\u{219}a c\u{103} renun\u{21b}\u{103} la ciorna din fila forumului.",
+    l_ios_body: "Aplica\u{21b}ia Warren pentru iOS nu poate prelua \u{ee}nc\u{103} acest link \u{219}i nu are un ecran de raportare. R\u{103}spunde pe subiectul t\u{103}u cu ce observi \u{219}i cu versiunea aplica\u{21b}iei; echipa \u{ee}\u{21b}i va cere ce \u{ee}i trebuie.",
+    l_ios_body_pre: "Aplica\u{21b}ia Warren pentru iOS nu poate prelua \u{ee}nc\u{103} acest link \u{219}i nu are un ecran de raportare. Public\u{103} raportul \u{ee}n fila forumului f\u{103}r\u{103} jurnale, cu versiunea aplica\u{21b}iei; echipa \u{ee}\u{21b}i va cere ce \u{ee}i trebuie.",
     l_back: "\u{ce}napoi la subiect",
     t_tab: "Forumul Warren: transparen\u{21b}\u{103}",
     t_heading: "Cum te protejeaz\u{103} autentificarea pe forum",

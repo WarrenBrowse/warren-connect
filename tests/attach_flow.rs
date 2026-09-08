@@ -321,11 +321,18 @@ async fn attach_page_on_android_routes_to_the_in_app_report() {
             .to_vec(),
     )
     .expect("utf8");
-    assert!(html.contains("Report a problem"));
+    assert!(
+        html.contains("Report a problem"),
+        "the fallback for an app that predates the link"
+    );
     assert!(html.contains("https://forum.warrenbrowse.com/t/42"));
     assert!(
-        !html.contains("warren://attach-logs"),
-        "the Android app claims no attach-logs link: the button would go nowhere"
+        html.contains("warren://attach-logs?sid="),
+        "an updated app takes the link"
+    );
+    assert!(
+        !html.contains("<code>"),
+        "no session id to mistake for a sign-in code"
     );
 }
 
@@ -364,11 +371,11 @@ async fn a_desktop_user_agent_with_an_android_platform_hint_is_a_phone() {
     )
     .expect("utf8");
     assert!(html.contains("Report a problem"));
-    assert!(!html.contains("warren://attach-logs"));
+    assert!(html.contains("data-intent=\"intent://attach-logs?sid="));
 }
 
 #[tokio::test]
-async fn attach_page_pre_on_a_phone_routes_away_from_the_deep_link() {
+async fn attach_page_pre_on_a_phone_keeps_the_link_and_shows_the_fallback() {
     let (url, _stub) = spawn_stub("whoever", true).await;
     let state = test_state(Some(ForumApi::new(
         &url,
@@ -409,9 +416,12 @@ async fn attach_page_pre_on_a_phone_routes_away_from_the_deep_link() {
         )
         .expect("utf8");
         assert!(html.contains(expected), "{ua}");
-        assert!(!html.contains("warren://attach-logs"), "{ua}");
         assert!(
-            !html.contains(&sid),
+            html.contains(&format!("warren://attach-logs?sid={sid}&topic=0")),
+            "{ua}"
+        );
+        assert!(
+            !html.contains("<code>"),
             "{ua}: no session id to mistake for a code"
         );
     }
@@ -460,7 +470,58 @@ async fn a_reader_query_override_routes_a_mac_user_agent_to_the_phone_page() {
         )
         .expect("utf8");
         assert!(html.contains(expected), "{path}");
-        assert!(!html.contains("warren://attach-logs"), "{path}");
+        assert!(html.contains("warren://attach-logs?sid="), "{path}");
+        assert!(!html.contains("<code>"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn attach_meta_names_the_bound_topic_and_null_for_a_pre_topic_session() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let response = router(state.clone())
+        .oneshot(
+            Request::get("/attach?topic=42")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    let sid_start = html.find("warren://attach-logs?sid=").expect("link") + 25;
+    let bound = html[sid_start..sid_start + 32].to_string();
+    let pre = new_pre_sid(state.clone()).await;
+
+    for (sid, expected) in [
+        (bound, serde_json::json!(42)),
+        (pre, serde_json::Value::Null),
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(format!("/v1/attach/{sid}/meta"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["topic_id"], expected, "{sid}");
     }
 }
 
@@ -847,7 +908,7 @@ async fn pre_mode_happy_path_receives_then_binds() {
         .expect("infallible");
     assert_eq!(
         body_json(response).await,
-        serde_json::json!({"status": "pending"})
+        serde_json::json!({"status": "pending", "topic_id": null})
     );
 
     // The app's signed upload with topic_id 0 parks the report.
@@ -886,6 +947,7 @@ async fn pre_mode_happy_path_receives_then_binds() {
             "status": "received",
             "version": "2026.5-beta1",
             "os": "macOS 15.5",
+            "topic_id": null,
         })
     );
     let response = router(state.clone())

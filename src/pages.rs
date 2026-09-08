@@ -395,95 +395,36 @@ impl AttachReader {
     }
 }
 
-/// Attach page for a phone reader: no deep link (the app would not take it),
-/// no session id (it reads as a code to type somewhere), no poll (nothing
-/// will ever settle it). One paragraph naming what the platform can do, the
-/// topic's URL to paste into the report in topic mode, and a way back.
+/// The Chromium-on-Android form of the attach link, like the login one:
+/// the package is named so Chrome opens the app without a chooser, and the
+/// fallback URL (appended by the page script) brings the reader back here.
+/// Everything before `#Intent` is the frozen deep link the app parses.
 #[must_use]
-pub fn attach_page_without_app(
-    lang: Lang,
-    reader: MobileReader,
-    topic_id: Option<u64>,
-    nonce: &str,
-) -> String {
-    let s = lang.strings();
-    let code = lang.code();
-    let (heading, body, body_pre) = match reader {
-        MobileReader::Android => (s.l_android_heading, s.l_android_body, s.l_android_body_pre),
-        MobileReader::Ios => (s.l_ios_heading, s.l_ios_body, s.l_ios_body_pre),
-    };
-    // The pasteable URL only follows a body that introduces it: the Android
-    // copy ends on "paste this link", the iOS copy asks for a reply instead.
-    let (body, tail) = match topic_id {
-        Some(id) => {
-            let url = format!("{FORUM_PUBLIC_URL}/t/{id}");
-            let paste = match reader {
-                MobileReader::Android => format!("<p class=\"muted\">{url}</p>\n  "),
-                MobileReader::Ios => String::new(),
-            };
-            (
-                body,
-                format!(
-                    r#"{paste}<p><a class="button" href="{url}">{back}</a></p>"#,
-                    back = s.l_back
-                ),
-            )
-        }
-        None => (body_pre, String::new()),
-    };
-    format!(
-        r##"<!doctype html>
-<html lang="{code}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>{tab}</title>
-<style nonce="{nonce}">{style}
-  body{{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem;}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:16px;
-    padding:2.4rem 2rem;max-width:27rem;width:100%;text-align:center;
-    box-shadow:0 18px 40px -24px oklch(0.25 0.03 60 / .5);}}
-  .brand{{display:block;margin-bottom:.5rem;}}
-  h1{{font-size:1.5rem;margin:.5rem 0 1rem;}}
-  p{{margin:.6rem 0;}}
-  p.muted{{word-break:break-all;user-select:all;}}
-  a.button{{display:inline-block;background:var(--primary);color:var(--primary-fg);
-    padding:.75rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:600;
-    margin:1.1rem 0 .3rem;transition:background .15s ease;}}
-  a.button:hover{{background:var(--primary-hover);}}
-  .foot{{margin-top:1.6rem;}}
-</style>
-</head>
-<body>
-<div class="card">
-  <span class="brand">Warren</span>
-  <div class="spark">&#10022;</div>
-  <div class="label">{label}</div>
-  <h1>{heading}</h1>
-  <p>{body}</p>
-  {tail}
-  <hr class="rule">
-  <p class="foot tagline">{tagline}</p>
-</div>
-</body>
-</html>"##,
-        style = STYLE,
-        nonce = nonce,
-        tab = s.l_tab,
-        label = s.a_label,
-        heading = heading,
-        body = body,
-        tail = tail,
-        tagline = s.tagline,
-    )
+pub fn android_attach_intent_link_with_scheme(
+    scheme: &str,
+    sid: &str,
+    topic_id: u64,
+    host: &str,
+) -> Option<String> {
+    let package = android_package_for_scheme(scheme)?;
+    Some(format!(
+        "intent://attach-logs?sid={sid}&topic={topic_id}&host={host}#Intent;scheme={scheme};package={package};S.browser_fallback_url="
+    ))
 }
 
-/// Attach-logs page (topic mode): explains the flow, auto-attempts the deep
-/// link, offers a manual click, polls the attach session every 2 s, and on
-/// success redirects back to the topic.
+/// Attach-logs page (topic mode): explains the flow, offers the deep link,
+/// polls the attach session, and on success redirects back to the topic. A
+/// phone reader gets the same page with a fallback block under the button
+/// and without the auto-open (Chromium drops a navigation nobody tapped).
 #[must_use]
-pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str, nonce: &str) -> String {
+pub fn attach_page(
+    lang: Lang,
+    sid: &str,
+    topic_id: u64,
+    host: &str,
+    reader: AttachReader,
+    nonce: &str,
+) -> String {
     let s = lang.strings();
     // On done: show the success text briefly, then land back on the topic.
     let settle = format!(
@@ -494,10 +435,13 @@ pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str, nonce: &str
         lang,
         sid,
         &attach_deep_link(sid, topic_id, host),
+        android_attach_intent_link_with_scheme(scheme(), sid, topic_id, host),
         s.l_expires,
         s.l_done,
         &settle,
+        reader,
         nonce,
+        Some(topic_id),
     )
 }
 
@@ -506,7 +450,13 @@ pub fn attach_page(lang: Lang, sid: &str, topic_id: u64, host: &str, nonce: &str
 /// return there (and tries `window.close()`, which succeeds when this tab was
 /// script-opened) instead of redirecting.
 #[must_use]
-pub fn attach_page_pre(lang: Lang, sid: &str, host: &str, nonce: &str) -> String {
+pub fn attach_page_pre(
+    lang: Lang,
+    sid: &str,
+    host: &str,
+    reader: AttachReader,
+    nonce: &str,
+) -> String {
     let s = lang.strings();
     let settle = "if (s.status === 'received' || s.status === 'done') {\n        \
          say(el.dataset.done, false);\n        \
@@ -515,27 +465,104 @@ pub fn attach_page_pre(lang: Lang, sid: &str, host: &str, nonce: &str) -> String
         lang,
         sid,
         &attach_deep_link(sid, 0, host),
+        android_attach_intent_link_with_scheme(scheme(), sid, 0, host),
         s.l_expires_pre,
         s.l_received,
         settle,
+        reader,
         nonce,
+        None,
     )
 }
 
 /// Shared shell of the two attach pages; `settle_js` decides what the poll
 /// does when the session reaches its success state (`el.dataset.done` carries
-/// `done_text`).
+/// `done_text`). `topic_id` is `None` in pre-topic mode.
+#[allow(clippy::too_many_arguments)]
 fn attach_page_shell(
     lang: Lang,
     sid: &str,
     link: &str,
+    intent_link: Option<String>,
     expires: &str,
     done_text: &str,
     settle_js: &str,
+    reader: AttachReader,
     nonce: &str,
+    topic_id: Option<u64>,
 ) -> String {
     let s = lang.strings();
     let code = lang.code();
+    // A phone reader sees the fallback block from the start rather than after
+    // a tap that provably went nowhere: apps older than the 2026-09-08 builds
+    // never took this link, so most taps go nowhere for a while yet. No
+    // session id line either: typed into the app's sign-in screen it once
+    // read as a sign-in code.
+    let (aside, autopen) = match reader {
+        AttachReader::Desktop => (
+            format!(
+                r#"<p class="muted">{session} <code>{sid}</code> &middot; {expires}</p>"#,
+                session = s.a_session
+            ),
+            format!(
+                r#"  // An iPad in Safari's default desktop mode presents as a Mac and sends no
+  // client hint; a Mac has no touch points. Such a reader gets the phone page
+  // instead of a deep link its app would open and reject.
+  if (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)) {{
+    const u = new URL(window.location.href);
+    u.searchParams.set('reader', 'ios');
+    window.location.replace(u.href);
+  }} else {{
+    setTimeout(() => {{ window.location = '{link}'; }}, 300);
+  }}"#
+            ),
+        ),
+        AttachReader::Mobile(phone) => {
+            let (body, back) = match (phone, topic_id) {
+                (MobileReader::Android, Some(id)) => (
+                    s.l_android_body.to_owned(),
+                    format!(
+                        r#"
+    <p class="muted">{FORUM_PUBLIC_URL}/t/{id}</p>
+    <p><a class="button" href="{FORUM_PUBLIC_URL}/t/{id}">{back}</a></p>"#,
+                        back = s.l_back
+                    ),
+                ),
+                (MobileReader::Android, None) => (s.l_android_body_pre.to_owned(), String::new()),
+                (MobileReader::Ios, Some(id)) => (
+                    s.l_ios_body.to_owned(),
+                    format!(
+                        r#"
+    <p><a class="button" href="{FORUM_PUBLIC_URL}/t/{id}">{back}</a></p>"#,
+                        back = s.l_back
+                    ),
+                ),
+                (MobileReader::Ios, None) => (s.l_ios_body_pre.to_owned(), String::new()),
+            };
+            (
+                format!(
+                    r#"<div id="noapp">
+    <h2>{heading}</h2>
+    <p>{body}</p>{back}
+  </div>
+  <p class="muted">{expires}</p>"#,
+                    heading = s.l_noapp_heading,
+                ),
+                // Chromium on Android drops a custom-scheme tap silently when
+                // nothing handles it; the intent form names the package and a
+                // fallback URL, which is this very page. Firefox keeps the plain
+                // link and raises its own sheet. No auto-open on a phone.
+                r#"  const open = document.getElementById('open');
+  const ua = navigator.userAgent;
+  if (open.dataset.intent && /Android/i.test(ua) && !/Firefox|Fennec|Focus|FxiOS/i.test(ua)) {{
+    const back = new URL(window.location.href);
+    back.searchParams.set('noapp', '1');
+    open.href = open.dataset.intent + encodeURIComponent(back.href) + ';end';
+  }}"#
+                .to_owned(),
+            )
+        }
+    };
     format!(
         r##"<!doctype html>
 <html lang="{code}">
@@ -557,6 +584,12 @@ fn attach_page_shell(
     margin:1.1rem 0 .3rem;transition:background .15s ease;}}
   a.button:hover{{background:var(--primary-hover);}}
   .foot{{margin-top:1.6rem;}}
+  /* Fallback block for a phone whose app does not take the link. */
+  #noapp{{text-align:left;background:oklch(0.9 0.035 80);border:1px solid var(--border);
+    border-radius:12px;padding:.9rem 1rem;margin:1rem 0 .4rem;}}
+  #noapp h2{{font-size:1.05rem;margin:0 0 .5rem;}}
+  #noapp p{{font-size:.9rem;margin:.45rem 0;}}
+  #noapp p.muted{{word-break:break-all;user-select:all;}}
   /* Live progress. The forum writes take seconds; without a moving indicator
      the page looks frozen right after the user approves in the app. */
   .spinner{{width:1.15rem;height:1.15rem;border-radius:50%;flex:0 0 auto;
@@ -577,8 +610,8 @@ fn attach_page_shell(
   <div class="label">{label}</div>
   <h1>{heading}</h1>
   <p>{body}</p>
-  <a class="button" href="{link}">{button}</a>
-  <p class="muted">{session} <code>{sid}</code> &middot; {expires}</p>
+  <a class="button" id="open" href="{link}" data-intent="{intent}">{button}</a>
+  {aside}
   <p id="state" class="muted"
      data-expired="{expired}" data-done="{done}"
      data-cancelled="{cancelled}" data-processing="{processing}"><span id="msg">{waiting}</span></p>
@@ -586,16 +619,7 @@ fn attach_page_shell(
   <p class="foot tagline">{tagline}</p>
 </div>
 <script nonce="{nonce}">
-  // An iPad in Safari's default desktop mode presents as a Mac and sends no
-  // client hint; a Mac has no touch points. Such a reader gets the phone page
-  // instead of a deep link its app would open and reject.
-  if (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)) {{
-    const u = new URL(window.location.href);
-    u.searchParams.set('reader', 'ios');
-    window.location.replace(u.href);
-  }} else {{
-    setTimeout(() => {{ window.location = '{link}'; }}, 300);
-  }}
+{autopen}
   const el = document.getElementById('state');
   const msg = document.getElementById('msg');
   const card = document.getElementById('card');
@@ -632,7 +656,9 @@ fn attach_page_shell(
         heading = s.l_heading,
         body = s.l_body,
         button = s.a_button,
-        session = s.a_session,
+        intent = intent_link.unwrap_or_default(),
+        aside = aside,
+        autopen = autopen,
         waiting = s.l_waiting,
         expired = s.l_expired,
         done = done_text,
@@ -956,7 +982,14 @@ mod tests {
 
     #[test]
     fn attach_page_contains_link_autopen_and_poll() {
-        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE);
+        let page = attach_page(
+            Lang::En,
+            "deadbeef",
+            42,
+            "connect.warrenbrowse.com",
+            AttachReader::Desktop,
+            NONCE,
+        );
         assert!(
             page.contains(
                 "warren://attach-logs?sid=deadbeef&topic=42&host=connect.warrenbrowse.com"
@@ -970,23 +1003,36 @@ mod tests {
 
     #[test]
     fn attach_page_is_localized() {
-        let fr = attach_page(Lang::Fr, "s", 1, "h", NONCE);
+        let fr = attach_page(Lang::Fr, "s", 1, "h", AttachReader::Desktop, NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("Ouvrir l'application Warren"));
-        let ro = attach_page(Lang::Ro, "s", 1, "h", NONCE);
+        let ro = attach_page(Lang::Ro, "s", 1, "h", AttachReader::Desktop, NONCE);
         assert!(ro.contains("lang=\"ro\""));
     }
 
     #[test]
     fn attach_page_redirects_to_the_topic_on_done() {
-        let page = attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE);
+        let page = attach_page(
+            Lang::En,
+            "deadbeef",
+            42,
+            "connect.warrenbrowse.com",
+            AttachReader::Desktop,
+            NONCE,
+        );
         assert!(page.contains("location.replace('https://forum.warrenbrowse.com/t/42')"));
         assert!(page.contains("1500"), "brief success text before redirect");
     }
 
     #[test]
     fn attach_page_pre_deep_links_topic_zero_and_closes() {
-        let page = attach_page_pre(Lang::En, "deadbeef", "connect.warrenbrowse.com", NONCE);
+        let page = attach_page_pre(
+            Lang::En,
+            "deadbeef",
+            "connect.warrenbrowse.com",
+            AttachReader::Desktop,
+            NONCE,
+        );
         assert!(
             page.contains(
                 "warren://attach-logs?sid=deadbeef&topic=0&host=connect.warrenbrowse.com"
@@ -1006,10 +1052,10 @@ mod tests {
 
     #[test]
     fn attach_page_pre_is_localized() {
-        let fr = attach_page_pre(Lang::Fr, "s", "h", NONCE);
+        let fr = attach_page_pre(Lang::Fr, "s", "h", AttachReader::Desktop, NONCE);
         assert!(fr.contains("lang=\"fr\""));
         assert!(fr.contains("l'onglet du forum"));
-        let ro = attach_page_pre(Lang::Ro, "s", "h", NONCE);
+        let ro = attach_page_pre(Lang::Ro, "s", "h", AttachReader::Desktop, NONCE);
         assert!(ro.contains("lang=\"ro\""));
     }
 
@@ -1055,80 +1101,162 @@ mod tests {
     }
 
     #[test]
-    fn the_android_page_routes_to_the_in_app_report_and_names_the_topic() {
-        let page = attach_page_without_app(Lang::En, MobileReader::Android, Some(42), NONCE);
+    fn the_attach_intent_link_is_the_frozen_deep_link_plus_the_package() {
+        assert_eq!(
+            android_attach_intent_link_with_scheme(
+                "warren-beta",
+                "deadbeef",
+                42,
+                "connect.warrenbrowse.com"
+            )
+            .as_deref(),
+            Some(
+                "intent://attach-logs?sid=deadbeef&topic=42&host=connect.warrenbrowse.com#Intent;scheme=warren-beta;package=com.warrenbrowse.vpn.beta;S.browser_fallback_url="
+            )
+        );
+        assert_eq!(
+            android_attach_intent_link_with_scheme("other", "s", 1, "h"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_android_attach_page_keeps_the_link_and_shows_the_in_app_fallback() {
+        let page = attach_page(
+            Lang::En,
+            "deadbeef",
+            42,
+            "connect.warrenbrowse.com",
+            AttachReader::Mobile(MobileReader::Android),
+            NONCE,
+        );
+        assert!(page.contains(
+            "href=\"warren://attach-logs?sid=deadbeef&topic=42&host=connect.warrenbrowse.com\""
+        ));
+        assert!(
+            page.contains("data-intent=\"intent://attach-logs?sid=deadbeef&topic=42"),
+            "the Chromium form"
+        );
+        assert!(
+            page.contains("/v1/attach/deadbeef/status"),
+            "the poll stays: an updated app does attach"
+        );
         assert!(page.contains("Report a problem"));
         assert!(
             page.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/42</p>"),
-            "the topic URL to paste into the report"
+            "the topic URL to paste"
         );
         assert!(
             page.contains("href=\"https://forum.warrenbrowse.com/t/42\""),
-            "a way back to the topic"
+            "a way back"
         );
-        assert!(!page.contains("attach-logs"), "no dead deep link");
-        assert!(!page.contains("/v1/attach/"), "nothing to poll for");
-        assert!(!page.contains("<script"), "nothing runs on this page");
         assert!(
             !page.contains("<code>"),
             "no session id to mistake for a sign-in code"
+        );
+        assert!(!page.contains("}, 300)"), "no auto-open on a phone");
+        assert!(
+            !page.contains("maxTouchPoints"),
+            "the iPad check belongs to the desktop page"
         );
     }
 
     #[test]
     fn the_android_pre_page_says_the_report_posts_the_topic_itself() {
-        let page = attach_page_without_app(Lang::En, MobileReader::Android, None, NONCE);
-        assert!(page.contains("Report a problem"));
-        assert!(page.contains("close this page"));
+        let page = attach_page_pre(
+            Lang::En,
+            "deadbeef",
+            "connect.warrenbrowse.com",
+            AttachReader::Mobile(MobileReader::Android),
+            NONCE,
+        );
+        assert!(page.contains("attach-logs?sid=deadbeef&topic=0"));
+        assert!(page.contains("discard the draft in the forum tab"));
         assert!(
             !page.contains("forum.warrenbrowse.com/t/"),
             "no topic exists yet"
         );
-        assert!(!page.contains("attach-logs"));
-        assert!(
-            !page.contains("window.close()"),
-            "nothing will ever settle this page"
-        );
+        assert!(!page.contains("<code>"));
     }
 
     #[test]
-    fn the_ios_page_asks_for_a_reply_because_ios_has_no_report_screen() {
-        let page = attach_page_without_app(Lang::En, MobileReader::Ios, Some(42), NONCE);
+    fn the_ios_pages_ask_for_a_reply_because_ios_has_no_report_screen() {
+        let page = attach_page(
+            Lang::En,
+            "deadbeef",
+            42,
+            "connect.warrenbrowse.com",
+            AttachReader::Mobile(MobileReader::Ios),
+            NONCE,
+        );
+        assert!(page.contains("href=\"warren://attach-logs?sid=deadbeef&topic=42"));
         assert!(page.contains("Reply on your topic"));
         assert!(!page.contains("Report a problem"), "iOS has no such screen");
         assert!(page.contains("href=\"https://forum.warrenbrowse.com/t/42\""));
         assert!(
             !page.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/42</p>"),
-            "nothing on this page asks iOS readers to paste a link"
+            "nothing asks an iOS reader to paste a link"
         );
-        assert!(!page.contains("attach-logs"));
-        let pre = attach_page_without_app(Lang::En, MobileReader::Ios, None, NONCE);
+        assert!(!page.contains("<code>"));
+        let pre = attach_page_pre(
+            Lang::En,
+            "deadbeef",
+            "connect.warrenbrowse.com",
+            AttachReader::Mobile(MobileReader::Ios),
+            NONCE,
+        );
         assert!(pre.contains("without logs"));
-        assert!(pre.contains("close this page"));
     }
 
     #[test]
-    fn the_phone_pages_are_localized_and_every_locale_carries_the_topic_url() {
+    fn the_phone_fallback_is_localized_and_every_locale_carries_the_topic_url() {
         for lang in [Lang::En, Lang::Fr, Lang::Ro] {
-            let android = attach_page_without_app(lang, MobileReader::Android, Some(7), NONCE);
+            let android = attach_page(
+                lang,
+                "s",
+                7,
+                "h",
+                AttachReader::Mobile(MobileReader::Android),
+                NONCE,
+            );
             assert!(
                 android.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/7</p>"),
                 "{lang:?}: the topic URL is what pairs the two reports"
             );
             for reader in [MobileReader::Android, MobileReader::Ios] {
-                let page = attach_page_without_app(lang, reader, Some(7), NONCE);
+                let page = attach_page(lang, "s", 7, "h", AttachReader::Mobile(reader), NONCE);
                 assert!(
                     page.contains("href=\"https://forum.warrenbrowse.com/t/7\""),
-                    "{lang:?} {reader:?}: a way back to the topic"
+                    "{lang:?} {reader:?}"
                 );
                 assert!(page.contains(&format!("lang=\"{}\"", lang.code())));
             }
         }
-        let fr = attach_page_without_app(Lang::Fr, MobileReader::Android, Some(7), NONCE);
+        let fr = attach_page(
+            Lang::Fr,
+            "s",
+            7,
+            "h",
+            AttachReader::Mobile(MobileReader::Android),
+            NONCE,
+        );
         assert!(fr.contains("Signaler un probl\u{e8}me"));
-        let ro = attach_page_without_app(Lang::Ro, MobileReader::Android, Some(7), NONCE);
+        let ro = attach_page(
+            Lang::Ro,
+            "s",
+            7,
+            "h",
+            AttachReader::Mobile(MobileReader::Android),
+            NONCE,
+        );
         assert!(ro.contains("Raporta\u{21b}i o problem\u{103}"));
-        let ro_ios = attach_page_without_app(Lang::Ro, MobileReader::Ios, None, NONCE);
+        let ro_ios = attach_page_pre(
+            Lang::Ro,
+            "s",
+            "h",
+            AttachReader::Mobile(MobileReader::Ios),
+            NONCE,
+        );
         assert!(ro_ios.contains("f\u{103}r\u{103} jurnale"));
     }
 
@@ -1159,8 +1287,21 @@ mod tests {
         // Safari on iPadOS presents as a Mac by default and sends no client
         // hint; a Mac has no touch points, so the page itself can tell.
         for page in [
-            attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE),
-            attach_page_pre(Lang::En, "deadbeef", "connect.warrenbrowse.com", NONCE),
+            attach_page(
+                Lang::En,
+                "deadbeef",
+                42,
+                "connect.warrenbrowse.com",
+                AttachReader::Desktop,
+                NONCE,
+            ),
+            attach_page_pre(
+                Lang::En,
+                "deadbeef",
+                "connect.warrenbrowse.com",
+                AttachReader::Desktop,
+                NONCE,
+            ),
         ] {
             assert!(page.contains("navigator.maxTouchPoints > 1"));
             assert!(page.contains("/Macintosh/.test(navigator.userAgent)"));

@@ -847,33 +847,18 @@ async fn attach_entry(
     );
     match (params.topic, params.sid) {
         // Topic mode: mints (or reuses) a session bound to an existing topic.
-        // A phone reader gets its page before any session exists for it: its
-        // app would never consume one, and a slot burnt for the TTL is a slot
-        // a desktop reader may then be refused under pressure.
         (Some(topic), _) if topic >= 1 => {
-            if let pages::AttachReader::Mobile(phone) = reader {
-                return Ok(html_page(
-                    |nonce| pages::attach_page_without_app(lang, phone, Some(topic), nonce),
-                    false,
-                ));
-            }
             let sid = state.attach.create(topic, now_unix())?;
             Ok(html_page(
-                |nonce| pages::attach_page(lang, &sid, topic, &state.public_host, nonce),
+                |nonce| pages::attach_page(lang, &sid, topic, &state.public_host, reader, nonce),
                 false,
             ))
         }
         // Pre-topic mode: reuses the session minted by /v1/attach/new.
         (None, Some(sid)) => {
             state.attach.pre_exists(&sid, now_unix())?;
-            if let pages::AttachReader::Mobile(phone) = reader {
-                return Ok(html_page(
-                    |nonce| pages::attach_page_without_app(lang, phone, None, nonce),
-                    false,
-                ));
-            }
             Ok(html_page(
-                |nonce| pages::attach_page_pre(lang, &sid, &state.public_host, nonce),
+                |nonce| pages::attach_page_pre(lang, &sid, &state.public_host, reader, nonce),
                 false,
             ))
         }
@@ -1412,10 +1397,13 @@ async fn attach_meta(
     Path(sid): Path<String>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     forum_api_enabled(&state)?;
+    // The topic is what a phone that typed the sid by hand cannot know, so
+    // the meta names it (null for a pre-topic session).
+    let topic_id = state.attach.topic_of(&sid, now_unix())?;
     Ok(Json(match state.attach.meta(&sid, now_unix())? {
-        None => serde_json::json!({"status": "pending"}),
+        None => serde_json::json!({"status": "pending", "topic_id": topic_id}),
         Some((version, os)) => {
-            serde_json::json!({"status": "received", "version": version, "os": os})
+            serde_json::json!({"status": "received", "version": version, "os": os, "topic_id": topic_id})
         }
     }))
 }
