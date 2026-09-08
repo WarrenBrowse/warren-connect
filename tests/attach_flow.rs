@@ -289,6 +289,135 @@ async fn attach_page_renders_deep_link_and_poll() {
 }
 
 #[tokio::test]
+async fn attach_page_on_android_routes_to_the_in_app_report() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+
+    let response = router(state)
+        .oneshot(
+            Request::get("/attach?topic=42")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 15; FP3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36",
+                )
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert!(html.contains("Report a problem"));
+    assert!(html.contains("https://forum.warrenbrowse.com/t/42"));
+    assert!(
+        !html.contains("warren://attach-logs"),
+        "the Android app claims no attach-logs link: the button would go nowhere"
+    );
+}
+
+#[tokio::test]
+async fn a_desktop_user_agent_with_an_android_platform_hint_is_a_phone() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+
+    let response = router(state)
+        .oneshot(
+            Request::get("/attach?topic=42")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                )
+                .header("Sec-CH-UA-Platform", "\"Android\"")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert!(html.contains("Report a problem"));
+    assert!(!html.contains("warren://attach-logs"));
+}
+
+#[tokio::test]
+async fn attach_page_pre_on_a_phone_routes_away_from_the_deep_link() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = new_pre_sid(state.clone()).await;
+
+    for (ua, expected) in [
+        (
+            "Mozilla/5.0 (Linux; Android 15; FP3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36",
+            "Report a problem",
+        ),
+        (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1",
+            "without logs",
+        ),
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(format!("/attach?sid={sid}"))
+                    .header("User-Agent", ua)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(html.contains(expected), "{ua}");
+        assert!(!html.contains("warren://attach-logs"), "{ua}");
+        assert!(
+            !html.contains(&sid),
+            "{ua}: no session id to mistake for a code"
+        );
+    }
+}
+
+#[tokio::test]
 async fn attach_endpoints_are_503_without_api_key() {
     let state = test_state(None);
     for req in [

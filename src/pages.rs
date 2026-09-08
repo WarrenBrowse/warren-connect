@@ -327,6 +327,140 @@ pub fn attach_deep_link(sid: &str, topic_id: u64, host: &str) -> String {
 
 use crate::FORUM_PUBLIC_URL;
 
+/// Who is reading an attach page, read from the request headers.
+///
+/// The desktop apps register the `attach-logs` deep link and take it from the
+/// page. Neither mobile app does: the Android manifest claims only
+/// `forum-login`, so the tap goes nowhere, and the iOS app opens on the link
+/// and rejects the action (`WarrenForumLogin.swift`, "wrong-action"). One
+/// Android reporter tapped the dead button for weeks, then typed the session
+/// id printed under it into the app's sign-in code screen and was told the
+/// sign-in had expired (topic 199, 2026-09-07). Phone readers are told what
+/// their platform can do instead, before any session is minted for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachReader {
+    /// A reader whose app takes the link (the desktop apps), and any reader
+    /// the headers cannot place.
+    Desktop,
+    /// A phone browser, whose app does not take the link.
+    Mobile(MobileReader),
+}
+
+/// The two phone platforms, which differ in what they can do instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobileReader {
+    /// Has an in-app report (Settings, Report a problem) to send the user to.
+    Android,
+    /// Has no report screen: the user can only answer on the topic.
+    Ios,
+}
+
+impl AttachReader {
+    /// "Android" is the token every Android browser carries (Firefox drops
+    /// "Linux" from its string, so that one word is the whole test). The
+    /// `Sec-CH-UA-Platform` client hint (`"Android"`, quoted) is accepted as
+    /// a second signal when a browser sends one; whether a browser keeps it
+    /// truthful under "Request desktop site" was not measured. iPhone and
+    /// iPad name themselves; an iPad in its default desktop mode presents as
+    /// a Mac and cannot be told apart, so it lands on the desktop page.
+    #[must_use]
+    pub fn from_headers(user_agent: Option<&str>, ua_platform: Option<&str>) -> Self {
+        let ua = user_agent.unwrap_or_default();
+        let platform = ua_platform.unwrap_or_default().trim_matches('"');
+        if ua.contains("Android") || platform == "Android" {
+            Self::Mobile(MobileReader::Android)
+        } else if ua.contains("iPhone") || ua.contains("iPad") {
+            Self::Mobile(MobileReader::Ios)
+        } else {
+            Self::Desktop
+        }
+    }
+}
+
+/// Attach page for a phone reader: no deep link (the app would not take it),
+/// no session id (it reads as a code to type somewhere), no poll (nothing
+/// will ever settle it). One paragraph naming what the platform can do, the
+/// topic's URL to paste into the report in topic mode, and a way back.
+#[must_use]
+pub fn attach_page_without_app(
+    lang: Lang,
+    reader: MobileReader,
+    topic_id: Option<u64>,
+    nonce: &str,
+) -> String {
+    let s = lang.strings();
+    let code = lang.code();
+    let (heading, body, body_pre) = match reader {
+        MobileReader::Android => (s.l_android_heading, s.l_android_body, s.l_android_body_pre),
+        MobileReader::Ios => (s.l_ios_heading, s.l_ios_body, s.l_ios_body_pre),
+    };
+    // The pasteable URL only follows a body that introduces it: the Android
+    // copy ends on "paste this link", the iOS copy asks for a reply instead.
+    let (body, tail) = match topic_id {
+        Some(id) => {
+            let url = format!("{FORUM_PUBLIC_URL}/t/{id}");
+            let paste = match reader {
+                MobileReader::Android => format!("<p class=\"muted\">{url}</p>\n  "),
+                MobileReader::Ios => String::new(),
+            };
+            (
+                body,
+                format!(
+                    r#"{paste}<p><a class="button" href="{url}">{back}</a></p>"#,
+                    back = s.l_back
+                ),
+            )
+        }
+        None => (body_pre, String::new()),
+    };
+    format!(
+        r##"<!doctype html>
+<html lang="{code}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{tab}</title>
+<style nonce="{nonce}">{style}
+  body{{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem;}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:16px;
+    padding:2.4rem 2rem;max-width:27rem;width:100%;text-align:center;
+    box-shadow:0 18px 40px -24px oklch(0.25 0.03 60 / .5);}}
+  .brand{{display:block;margin-bottom:.5rem;}}
+  h1{{font-size:1.5rem;margin:.5rem 0 1rem;}}
+  p{{margin:.6rem 0;}}
+  p.muted{{word-break:break-all;user-select:all;}}
+  a.button{{display:inline-block;background:var(--primary);color:var(--primary-fg);
+    padding:.75rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:600;
+    margin:1.1rem 0 .3rem;transition:background .15s ease;}}
+  a.button:hover{{background:var(--primary-hover);}}
+  .foot{{margin-top:1.6rem;}}
+</style>
+</head>
+<body>
+<div class="card">
+  <span class="brand">Warren</span>
+  <div class="spark">&#10022;</div>
+  <div class="label">{label}</div>
+  <h1>{heading}</h1>
+  <p>{body}</p>
+  {tail}
+  <hr class="rule">
+  <p class="foot tagline">{tagline}</p>
+</div>
+</body>
+</html>"##,
+        style = STYLE,
+        nonce = nonce,
+        tab = s.l_tab,
+        label = s.a_label,
+        heading = heading,
+        body = body,
+        tail = tail,
+        tagline = s.tagline,
+    )
+}
+
 /// Attach-logs page (topic mode): explains the flow, auto-attempts the deep
 /// link, offers a manual click, polls the attach session every 2 s, and on
 /// success redirects back to the topic.
@@ -850,6 +984,125 @@ mod tests {
         assert!(fr.contains("l'onglet du forum"));
         let ro = attach_page_pre(Lang::Ro, "s", "h", NONCE);
         assert!(ro.contains("lang=\"ro\""));
+    }
+
+    #[test]
+    fn the_reader_is_placed_from_the_user_agent_and_the_platform_hint() {
+        let android = AttachReader::Mobile(MobileReader::Android);
+        let ios = AttachReader::Mobile(MobileReader::Ios);
+        let chrome_android = "Mozilla/5.0 (Linux; Android 15; FP3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36";
+        let firefox_android =
+            "Mozilla/5.0 (Android 15; Mobile; rv:148.0) Gecko/148.0 Firefox/148.0";
+        let linux_desktop = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+        let chrome_os = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+        let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1";
+        let ipad = "Mozilla/5.0 (iPad; CPU OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1";
+        assert_eq!(
+            AttachReader::from_headers(Some(chrome_android), None),
+            android
+        );
+        assert_eq!(
+            AttachReader::from_headers(Some(firefox_android), None),
+            android
+        );
+        // Chrome's "Request desktop site" swaps the string for a desktop one;
+        // the client hint still says where the reader is.
+        assert_eq!(
+            AttachReader::from_headers(Some(linux_desktop), Some("\"Android\"")),
+            android
+        );
+        assert_eq!(AttachReader::from_headers(Some(iphone), None), ios);
+        assert_eq!(AttachReader::from_headers(Some(ipad), None), ios);
+        assert_eq!(
+            AttachReader::from_headers(Some(linux_desktop), Some("\"Linux\"")),
+            AttachReader::Desktop
+        );
+        assert_eq!(
+            AttachReader::from_headers(Some(chrome_os), None),
+            AttachReader::Desktop
+        );
+        assert_eq!(
+            AttachReader::from_headers(None, None),
+            AttachReader::Desktop
+        );
+    }
+
+    #[test]
+    fn the_android_page_routes_to_the_in_app_report_and_names_the_topic() {
+        let page = attach_page_without_app(Lang::En, MobileReader::Android, Some(42), NONCE);
+        assert!(page.contains("Report a problem"));
+        assert!(
+            page.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/42</p>"),
+            "the topic URL to paste into the report"
+        );
+        assert!(
+            page.contains("href=\"https://forum.warrenbrowse.com/t/42\""),
+            "a way back to the topic"
+        );
+        assert!(!page.contains("attach-logs"), "no dead deep link");
+        assert!(!page.contains("/v1/attach/"), "nothing to poll for");
+        assert!(!page.contains("<script"), "nothing runs on this page");
+        assert!(
+            !page.contains("<code>"),
+            "no session id to mistake for a sign-in code"
+        );
+    }
+
+    #[test]
+    fn the_android_pre_page_says_the_report_posts_the_topic_itself() {
+        let page = attach_page_without_app(Lang::En, MobileReader::Android, None, NONCE);
+        assert!(page.contains("Report a problem"));
+        assert!(page.contains("close this page"));
+        assert!(
+            !page.contains("forum.warrenbrowse.com/t/"),
+            "no topic exists yet"
+        );
+        assert!(!page.contains("attach-logs"));
+        assert!(
+            !page.contains("window.close()"),
+            "nothing will ever settle this page"
+        );
+    }
+
+    #[test]
+    fn the_ios_page_asks_for_a_reply_because_ios_has_no_report_screen() {
+        let page = attach_page_without_app(Lang::En, MobileReader::Ios, Some(42), NONCE);
+        assert!(page.contains("Reply on your topic"));
+        assert!(!page.contains("Report a problem"), "iOS has no such screen");
+        assert!(page.contains("href=\"https://forum.warrenbrowse.com/t/42\""));
+        assert!(
+            !page.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/42</p>"),
+            "nothing on this page asks iOS readers to paste a link"
+        );
+        assert!(!page.contains("attach-logs"));
+        let pre = attach_page_without_app(Lang::En, MobileReader::Ios, None, NONCE);
+        assert!(pre.contains("without logs"));
+        assert!(pre.contains("close this page"));
+    }
+
+    #[test]
+    fn the_phone_pages_are_localized_and_every_locale_carries_the_topic_url() {
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let android = attach_page_without_app(lang, MobileReader::Android, Some(7), NONCE);
+            assert!(
+                android.contains("<p class=\"muted\">https://forum.warrenbrowse.com/t/7</p>"),
+                "{lang:?}: the topic URL is what pairs the two reports"
+            );
+            for reader in [MobileReader::Android, MobileReader::Ios] {
+                let page = attach_page_without_app(lang, reader, Some(7), NONCE);
+                assert!(
+                    page.contains("href=\"https://forum.warrenbrowse.com/t/7\""),
+                    "{lang:?} {reader:?}: a way back to the topic"
+                );
+                assert!(page.contains(&format!("lang=\"{}\"", lang.code())));
+            }
+        }
+        let fr = attach_page_without_app(Lang::Fr, MobileReader::Android, Some(7), NONCE);
+        assert!(fr.contains("Signaler un probl\u{e8}me"));
+        let ro = attach_page_without_app(Lang::Ro, MobileReader::Android, Some(7), NONCE);
+        assert!(ro.contains("Raporta\u{21b}i o problem\u{103}"));
+        let ro_ios = attach_page_without_app(Lang::Ro, MobileReader::Ios, None, NONCE);
+        assert!(ro_ios.contains("f\u{103}r\u{103} jurnale"));
     }
 
     #[test]

@@ -346,6 +346,22 @@ async fn sso_entry(
     ))
 }
 
+/// Extracts the raw `User-Agent` header value, if present and valid UTF-8.
+fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Extracts the `Sec-CH-UA-Platform` client hint, if present and valid UTF-8.
+/// It is consumed by the reader placement on the stack and reaches no log,
+/// error or metric label, like the User-Agent next to it.
+fn ua_platform(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("sec-ch-ua-platform")
+        .and_then(|v| v.to_str().ok())
+}
+
 /// Extracts the raw `Accept-Language` header value, if present and valid UTF-8.
 fn accept_language(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -821,9 +837,19 @@ async fn attach_entry(
 ) -> Result<Response, AuthError> {
     forum_api_enabled(&state)?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
+    let reader = pages::AttachReader::from_headers(user_agent(&headers), ua_platform(&headers));
     match (params.topic, params.sid) {
         // Topic mode: mints (or reuses) a session bound to an existing topic.
+        // A phone reader gets its page before any session exists for it: its
+        // app would never consume one, and a slot burnt for the TTL is a slot
+        // a desktop reader may then be refused under pressure.
         (Some(topic), _) if topic >= 1 => {
+            if let pages::AttachReader::Mobile(phone) = reader {
+                return Ok(html_page(
+                    |nonce| pages::attach_page_without_app(lang, phone, Some(topic), nonce),
+                    false,
+                ));
+            }
             let sid = state.attach.create(topic, now_unix())?;
             Ok(html_page(
                 |nonce| pages::attach_page(lang, &sid, topic, &state.public_host, nonce),
@@ -833,6 +859,12 @@ async fn attach_entry(
         // Pre-topic mode: reuses the session minted by /v1/attach/new.
         (None, Some(sid)) => {
             state.attach.pre_exists(&sid, now_unix())?;
+            if let pages::AttachReader::Mobile(phone) = reader {
+                return Ok(html_page(
+                    |nonce| pages::attach_page_without_app(lang, phone, None, nonce),
+                    false,
+                ));
+            }
             Ok(html_page(
                 |nonce| pages::attach_page_pre(lang, &sid, &state.public_host, nonce),
                 false,
