@@ -21,6 +21,8 @@ use warren_connect::routes::{AppState, router};
 use warren_connect::sessions::SessionStore;
 use warren_connect::store::{IdentityStore, MemoryIdentity};
 
+mod forum_vector;
+use forum_vector::{assert_answer, assert_signed_by_the_contract, observe, verify_at_vector_clock};
 use warren_contract::auth::{
     HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
 };
@@ -1681,5 +1683,361 @@ async fn a_report_far_larger_than_the_old_ceiling_is_accepted() {
     assert!(
         upload.body.len() > 8 * 1024 * 1024,
         "the whole log reached Discourse, not a truncated head"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The shared golden vector, `vectors/forum_login_v1.json`: the attach-logs
+// wire both mobile apps freeze, replayed against THIS provider. A client and
+// this router meet on these bytes and nowhere else.
+
+#[test]
+fn the_forum_vector_carries_only_the_attach_answers_this_suite_replays() {
+    // An answer added to the vector goes red here until a replay exists for
+    // it (`processing` is the one transient answer, pinned by shape below).
+    let v = forum_vector::load();
+    let mut attach = v.responses.attach.names();
+    attach.sort_unstable();
+    assert_eq!(
+        attach,
+        [
+            "attached",
+            "clock_skew",
+            "feature_disabled",
+            "forum_unavailable",
+            "not_author",
+            "payload_too_large",
+            "received",
+            "session_unknown"
+        ]
+    );
+    let mut status = v.responses.attach_status.names();
+    status.sort_unstable();
+    assert_eq!(
+        status,
+        [
+            "cancelled_user",
+            "done",
+            "pending",
+            "processing",
+            "received",
+            "unknown"
+        ]
+    );
+    let mut meta = v.responses.attach_meta.names();
+    meta.sort_unstable();
+    assert_eq!(
+        meta,
+        [
+            "pending_pre_topic",
+            "pending_topic",
+            "received_pre_topic",
+            "unknown"
+        ]
+    );
+    let processing = v.responses.attach_status.get("processing");
+    assert_eq!(processing.status, 200);
+    assert_eq!(processing.body_utf8, r#"{"status":"processing"}"#);
+}
+
+#[test]
+fn the_attach_vectors_are_what_the_contract_signs_and_what_the_verifier_accepts() {
+    // Both ends of the wire against the same bytes, for the topic-bound
+    // upload and the pre-topic one: the contract's signer reproduces the
+    // pinned headers, the verifier accepts them at the vector clock, and the
+    // body is exactly the three fields this route reads, within every cap.
+    let v = forum_vector::load();
+    for name in ["attach_with_log", "attach_pre_topic"] {
+        let req = forum_vector::request(&v, name);
+        assert_signed_by_the_contract(&v, req);
+        verify_at_vector_clock(&v, req);
+
+        let body: serde_json::Value = serde_json::from_str(&req.body_utf8).expect("json");
+        let object = body.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["log_gz_b64", "sid", "topic_id"],
+            "{name}: exactly this route's fields"
+        );
+        assert_eq!(
+            body["sid"].as_str(),
+            req.sid.as_deref(),
+            "{name}: the declared sid"
+        );
+        let topic = req.topic_id.expect("an attach request declares its topic");
+        assert_eq!(
+            body["topic_id"].as_u64(),
+            Some(topic),
+            "{name}: the declared topic"
+        );
+        assert_eq!(
+            name == "attach_pre_topic",
+            topic == 0,
+            "{name}: topic 0 is the pre-topic marker and nothing else"
+        );
+
+        let gz = hex::decode(
+            req.log_gz_hex
+                .as_deref()
+                .expect("an attach upload carries its gzip"),
+        )
+        .expect("hex");
+        assert_eq!(
+            body["log_gz_b64"],
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &gz),
+            "{name}: the log rides as standard base64 of the pinned gzip"
+        );
+        assert!(
+            body["log_gz_b64"]
+                .as_str()
+                .map(str::len)
+                .unwrap_or(usize::MAX)
+                <= warren_connect::attach::MAX_LOG_GZ_B64_CHARS,
+            "{name}: within the provider's base64 cap"
+        );
+        let text = warren_connect::attach::gunzip_capped(&gz)
+            .expect("the pinned gzip inflates within the cap");
+        assert_eq!(Some(text.as_str()), req.log_utf8.as_deref(), "{name}");
+    }
+}
+
+/// The three lifecycle reads of one session, as this router answers them.
+async fn read_status(state: Arc<AppState>, sid: &str) -> forum_vector::Answer {
+    let response = router(state)
+        .oneshot(
+            Request::get(format!("/v1/attach/{sid}/status"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    observe(response).await
+}
+
+async fn read_meta(state: Arc<AppState>, sid: &str) -> forum_vector::Answer {
+    let response = router(state)
+        .oneshot(
+            Request::get(format!("/v1/attach/{sid}/meta"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    observe(response).await
+}
+
+async fn upload(
+    state: Arc<AppState>,
+    key: &SigningKey,
+    sid: &str,
+    topic_id: u64,
+    log: &str,
+    nonce: [u8; 16],
+) -> forum_vector::Answer {
+    let body = format!(
+        r#"{{"sid":"{sid}","topic_id":{topic_id},"log_gz_b64":"{}"}}"#,
+        gz_b64(log)
+    );
+    let response = router(state)
+        .oneshot(signed_attach_request(key, &body, nonce))
+        .await
+        .expect("infallible");
+    observe(response).await
+}
+
+#[tokio::test]
+async fn every_pinned_attach_answer_is_what_this_router_sends() {
+    // The vector's log is the report both mobile clients freeze; its header
+    // names the version and OS the meta must echo once delivered.
+    let v = forum_vector::load();
+    let log = forum_vector::request(&v, "attach_with_log")
+        .log_utf8
+        .clone()
+        .expect("the pinned upload carries a log");
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+
+    // A topic-bound session: pending, its meta names the topic, then attached.
+    let bound = state.attach.create(4242, now_unix()).expect("create");
+    assert_answer(
+        &read_status(state.clone(), &bound).await,
+        &v.responses.attach_status.get("pending"),
+        "attach_status.pending",
+    );
+    assert_answer(
+        &read_meta(state.clone(), &bound).await,
+        &v.responses.attach_meta.get("pending_topic"),
+        "attach_meta.pending_topic",
+    );
+    assert_answer(
+        &upload(state.clone(), &key, &bound, 4242, &log, [1; 16]).await,
+        &v.responses.attach.get("attached"),
+        "attach.attached",
+    );
+    assert_answer(
+        &read_status(state.clone(), &bound).await,
+        &v.responses.attach_status.get("done"),
+        "attach_status.done",
+    );
+
+    // A pre-topic session: its meta has no topic, the upload parks the
+    // report (received), and the meta then names what the app delivered.
+    let pre = new_pre_sid(state.clone()).await;
+    assert_answer(
+        &read_meta(state.clone(), &pre).await,
+        &v.responses.attach_meta.get("pending_pre_topic"),
+        "attach_meta.pending_pre_topic",
+    );
+    assert_answer(
+        &upload(state.clone(), &key, &pre, 0, &log, [2; 16]).await,
+        &v.responses.attach.get("received"),
+        "attach.received",
+    );
+    assert_answer(
+        &read_status(state.clone(), &pre).await,
+        &v.responses.attach_status.get("received"),
+        "attach_status.received",
+    );
+    assert_answer(
+        &read_meta(state.clone(), &pre).await,
+        &v.responses.attach_meta.get("received_pre_topic"),
+        "attach_meta.received_pre_topic",
+    );
+
+    // A cancelled session, and a session nobody minted.
+    let cancelled = state.attach.create(7, now_unix()).expect("create");
+    let response = router(state.clone())
+        .oneshot(
+            Request::post(format!("/v1/attach/{cancelled}/cancel"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert!(response.status().is_success(), "cancel answers success");
+    assert_answer(
+        &read_status(state.clone(), &cancelled).await,
+        &v.responses.attach_status.get("cancelled_user"),
+        "attach_status.cancelled_user",
+    );
+    let nobody = "ffffffffffffffffffffffffffffffff";
+    assert_answer(
+        &read_status(state.clone(), nobody).await,
+        &v.responses.attach_status.get("unknown"),
+        "attach_status.unknown",
+    );
+    assert_answer(
+        &read_meta(state.clone(), nobody).await,
+        &v.responses.attach_meta.get("unknown"),
+        "attach_meta.unknown",
+    );
+
+    // The pinned request itself, re-signed inside the clock window: its sid
+    // was never minted by this store, which is the session_unknown answer.
+    let pinned = forum_vector::request(&v, "attach_with_log");
+    let response = router(state.clone())
+        .oneshot(pinned.resigned_at(&v.signer.signing_key(), now_unix(), [3; 16]))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.attach.get("session_unknown"),
+        "attach.session_unknown",
+    );
+
+    // A signature stamped an hour ago, on a live session.
+    let skewed = state.attach.create(8, now_unix()).expect("create");
+    let body = format!(
+        r#"{{"sid":"{skewed}","topic_id":8,"log_gz_b64":"{}"}}"#,
+        gz_b64(&log)
+    );
+    let s = sign_request(
+        &key,
+        "POST",
+        "/v1/forum/attach-logs",
+        body.as_bytes(),
+        now_unix() - 3600,
+        [4; 16],
+    );
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/v1/forum/attach-logs")
+                .header(HEADER_PUBKEY, s.pubkey_ss58)
+                .header(HEADER_SIGNATURE, s.signature_hex)
+                .header(HEADER_TIMESTAMP, s.timestamp.to_string())
+                .header(HEADER_NONCE, s.nonce_hex)
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.attach.get("clock_skew"),
+        "attach.clock_skew",
+    );
+
+    // A base64 field past the cap.
+    let big = state.attach.create(9, now_unix()).expect("create");
+    let body = format!(
+        r#"{{"sid":"{big}","topic_id":9,"log_gz_b64":"{}"}}"#,
+        "A".repeat(warren_connect::attach::MAX_LOG_GZ_B64_CHARS + 1)
+    );
+    let response = router(state.clone())
+        .oneshot(signed_attach_request(&key, &body, [5; 16]))
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.attach.get("payload_too_large"),
+        "attach.payload_too_large",
+    );
+
+    // Somebody else's topic, and a forum that fails the upload.
+    let (other_url, _other) = spawn_stub("somebody-else", true).await;
+    let other = test_state(Some(ForumApi::new(
+        &other_url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let theirs = other.attach.create(42, now_unix()).expect("create");
+    assert_answer(
+        &upload(other, &key, &theirs, 42, &log, [6; 16]).await,
+        &v.responses.attach.get("not_author"),
+        "attach.not_author",
+    );
+    let (down_url, _down) = spawn_stub(&author_username(&key), false).await;
+    let down = test_state(Some(ForumApi::new(
+        &down_url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let mine = down.attach.create(42, now_unix()).expect("create");
+    assert_answer(
+        &upload(down, &key, &mine, 42, &log, [7; 16]).await,
+        &v.responses.attach.get("forum_unavailable"),
+        "attach.forum_unavailable",
+    );
+
+    // No forum API key at all: the feature is off before anything is read.
+    let off = test_state(None);
+    let response = router(off)
+        .oneshot(pinned.as_http())
+        .await
+        .expect("infallible");
+    assert_answer(
+        &observe(response).await,
+        &v.responses.attach.get("feature_disabled"),
+        "attach.feature_disabled",
     );
 }

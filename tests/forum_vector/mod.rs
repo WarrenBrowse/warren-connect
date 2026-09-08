@@ -45,6 +45,8 @@ pub struct SignedRequest {
     pub url: String,
     pub nonce_hex: String,
     pub sid: Option<String>,
+    /// The attach requests declare their topic (0 marks pre-topic).
+    pub topic_id: Option<u64>,
     pub fields: Option<serde_json::Value>,
     pub log_utf8: Option<String>,
     pub log_gz_hex: Option<String>,
@@ -59,6 +61,9 @@ pub struct Responses {
     pub login: Group,
     pub session_status: Group,
     pub report: Group,
+    pub attach: Group,
+    pub attach_status: Group,
+    pub attach_meta: Group,
 }
 
 /// One outcome group; the `_endpoint` and `_comment` entries ride along as

@@ -492,11 +492,21 @@ fn the_forum_vector_carries_only_the_names_the_login_suite_replays() {
     // The control.json convention: a request or an outcome added to the
     // vector goes red here until a replay exists for it, so a stale pin can
     // never drop a golden vector silently. The report answers are guarded
-    // by the report suite.
+    // by the report suite, the attach requests and answers by the attach
+    // suite.
     let v = forum_vector::load();
     let mut requests: Vec<&str> = v.requests.iter().map(|r| r.name.as_str()).collect();
     requests.sort_unstable();
-    assert_eq!(requests, ["login", "report_with_log", "report_without_log"]);
+    assert_eq!(
+        requests,
+        [
+            "attach_pre_topic",
+            "attach_with_log",
+            "login",
+            "report_with_log",
+            "report_without_log"
+        ]
+    );
     let mut login = v.responses.login.names();
     login.sort_unstable();
     assert_eq!(
