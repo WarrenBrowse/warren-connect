@@ -418,6 +418,53 @@ async fn attach_page_pre_on_a_phone_routes_away_from_the_deep_link() {
 }
 
 #[tokio::test]
+async fn a_reader_query_override_routes_a_mac_user_agent_to_the_phone_page() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15";
+    let sid = new_pre_sid(state.clone()).await;
+
+    for (path, expected) in [
+        (
+            "/attach?topic=42&reader=ios".to_string(),
+            "Reply on your topic",
+        ),
+        (
+            format!("/attach?sid={sid}&reader=android"),
+            "Report a problem",
+        ),
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(&path)
+                    .header("User-Agent", mac)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(html.contains(expected), "{path}");
+        assert!(!html.contains("warren://attach-logs"), "{path}");
+    }
+}
+
+#[tokio::test]
 async fn attach_endpoints_are_503_without_api_key() {
     let state = test_state(None);
     for req in [

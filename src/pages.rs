@@ -363,6 +363,24 @@ impl AttachReader {
     /// truthful under "Request desktop site" was not measured. iPhone and
     /// iPad name themselves; an iPad in its default desktop mode presents as
     /// a Mac and cannot be told apart, so it lands on the desktop page.
+    /// The headers, unless the page itself asked for a reader: the desktop
+    /// attach page redirects an iPad in Safari's desktop mode (a Mac string,
+    /// no client hint, but touch points) with `?reader=ios`. An unknown value
+    /// is ignored.
+    #[must_use]
+    pub fn from_request(
+        user_agent: Option<&str>,
+        ua_platform: Option<&str>,
+        override_reader: Option<&str>,
+    ) -> Self {
+        match override_reader {
+            Some("ios") => Self::Mobile(MobileReader::Ios),
+            Some("android") => Self::Mobile(MobileReader::Android),
+            _ => Self::from_headers(user_agent, ua_platform),
+        }
+    }
+
+    /// The headers alone: the User-Agent token, then the client hint.
     #[must_use]
     pub fn from_headers(user_agent: Option<&str>, ua_platform: Option<&str>) -> Self {
         let ua = user_agent.unwrap_or_default();
@@ -568,7 +586,16 @@ fn attach_page_shell(
   <p class="foot tagline">{tagline}</p>
 </div>
 <script nonce="{nonce}">
-  setTimeout(() => {{ window.location = '{link}'; }}, 300);
+  // An iPad in Safari's default desktop mode presents as a Mac and sends no
+  // client hint; a Mac has no touch points. Such a reader gets the phone page
+  // instead of a deep link its app would open and reject.
+  if (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)) {{
+    const u = new URL(window.location.href);
+    u.searchParams.set('reader', 'ios');
+    window.location.replace(u.href);
+  }} else {{
+    setTimeout(() => {{ window.location = '{link}'; }}, 300);
+  }}
   const el = document.getElementById('state');
   const msg = document.getElementById('msg');
   const card = document.getElementById('card');
@@ -969,8 +996,8 @@ mod tests {
         assert!(page.contains("s.status === 'received'"));
         assert!(page.contains("window.close()"));
         assert!(
-            !page.contains("location.replace"),
-            "the composer lives in the other tab: no redirect in pre mode"
+            !page.contains("location.replace('"),
+            "the composer lives in the other tab: no redirect to a topic in pre mode"
         );
         assert!(page.contains("expires in 30 minutes"));
         assert!(page.contains("Return to the forum tab"));
@@ -1103,6 +1130,52 @@ mod tests {
         assert!(ro.contains("Raporta\u{21b}i o problem\u{103}"));
         let ro_ios = attach_page_without_app(Lang::Ro, MobileReader::Ios, None, NONCE);
         assert!(ro_ios.contains("f\u{103}r\u{103} jurnale"));
+    }
+
+    #[test]
+    fn a_reader_override_beats_the_headers() {
+        let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15";
+        assert_eq!(
+            AttachReader::from_request(Some(mac), None, Some("ios")),
+            AttachReader::Mobile(MobileReader::Ios)
+        );
+        assert_eq!(
+            AttachReader::from_request(Some(mac), None, Some("android")),
+            AttachReader::Mobile(MobileReader::Android)
+        );
+        assert_eq!(
+            AttachReader::from_request(Some(mac), None, Some("toaster")),
+            AttachReader::Desktop,
+            "an unknown override falls back to the headers"
+        );
+        assert_eq!(
+            AttachReader::from_request(Some(mac), None, None),
+            AttachReader::Desktop
+        );
+    }
+
+    #[test]
+    fn the_desktop_attach_pages_send_an_ipad_in_desktop_mode_to_the_phone_page() {
+        // Safari on iPadOS presents as a Mac by default and sends no client
+        // hint; a Mac has no touch points, so the page itself can tell.
+        for page in [
+            attach_page(Lang::En, "deadbeef", 42, "connect.warrenbrowse.com", NONCE),
+            attach_page_pre(Lang::En, "deadbeef", "connect.warrenbrowse.com", NONCE),
+        ] {
+            assert!(page.contains("navigator.maxTouchPoints > 1"));
+            assert!(page.contains("/Macintosh/.test(navigator.userAgent)"));
+            assert!(page.contains("searchParams.set('reader', 'ios')"));
+            assert!(
+                page.contains(
+                    "}} else {{
+    setTimeout(() => {{ window.location = "
+                ) || page.contains(
+                    "} else {
+    setTimeout(() => { window.location = "
+                ),
+                "the deep link only fires when the reader is not redirected"
+            );
+        }
     }
 
     #[test]

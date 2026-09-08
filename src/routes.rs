@@ -828,6 +828,9 @@ fn forum_api_enabled(state: &AppState) -> Result<&ForumApi, AuthError> {
 struct AttachParams {
     topic: Option<u64>,
     sid: Option<String>,
+    /// Set by the desktop attach page itself when it finds it is being read
+    /// on an iPad in desktop mode (`reader=ios`).
+    reader: Option<String>,
 }
 
 async fn attach_entry(
@@ -837,7 +840,11 @@ async fn attach_entry(
 ) -> Result<Response, AuthError> {
     forum_api_enabled(&state)?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    let reader = pages::AttachReader::from_headers(user_agent(&headers), ua_platform(&headers));
+    let reader = pages::AttachReader::from_request(
+        user_agent(&headers),
+        ua_platform(&headers),
+        params.reader.as_deref(),
+    );
     match (params.topic, params.sid) {
         // Topic mode: mints (or reuses) a session bound to an existing topic.
         // A phone reader gets its page before any session exists for it: its
