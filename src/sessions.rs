@@ -32,7 +32,10 @@ use crate::verify::Admitted;
 /// link is worth anything (see the threat note in warren-core doc 55).
 pub(crate) const SESSION_TTL_SECS: u64 = 300;
 
-/// Hard cap on concurrent sessions (fail closed).
+/// Hard cap on concurrent sessions. At the cap a new login displaces the
+/// oldest one that ended, else the oldest one still waiting for its approval,
+/// and is refused only when every login is past its approval (see
+/// `SessionStore::make_room`).
 const MAX_SESSIONS: usize = 10_000;
 
 /// Logins one DiscourseConnect payload opens while the last one lives. Each
@@ -40,6 +43,13 @@ const MAX_SESSIONS: usize = 10_000;
 /// the forum for a new payload. Three cover the reloads a user makes after a
 /// refusal they can repair (a clock set right, a subscription just paid).
 const MAX_OPENS_PER_PAYLOAD: u8 = 3;
+
+/// Logins one wallet holds past their approval at once: waiting for the code,
+/// or confirmed and not completed yet. A full store never displaces those, so
+/// without this one paying wallet could approve logins until it held the
+/// whole store; with it, that takes a third as many paying wallets as the
+/// store holds logins.
+const MAX_APPROVED_PER_WALLET: usize = 3;
 
 /// Wrong codes a browser may type before its login is cancelled. The code is
 /// six digits, so the holder of a cookie and a relayed approval wins with
@@ -288,6 +298,33 @@ impl State {
             State::Cancelled { reason } => SessionStatus::Cancelled { reason: *reason },
         }
     }
+
+    /// The wallet (its forum external id) that approved a login past its
+    /// approval.
+    fn approved_by(&self) -> Option<&str> {
+        match self {
+            State::AwaitingCode { user, .. } | State::Approved { user } => Some(&user.external_id),
+            State::Pending | State::Completed | State::Cancelled { .. } => None,
+        }
+    }
+
+    /// The order in which a full store displaces logins, lowest first. An
+    /// ended login only still answers a page's last poll; one waiting for its
+    /// approval costs its user a new sign-in from the forum. `None` past the
+    /// approval: that browser holds the only way to finish, and a flood must
+    /// never take it.
+    fn displacement_rank(&self) -> Option<u8> {
+        match self {
+            State::Completed | State::Cancelled { .. } => Some(0),
+            State::Pending => Some(1),
+            State::AwaitingCode { .. } | State::Approved { .. } => None,
+        }
+    }
+}
+
+/// Whether something created at `created_unix` is still within the login TTL.
+fn alive(created_unix: u64, now_unix: u64) -> bool {
+    now_unix.saturating_sub(created_unix) < SESSION_TTL_SECS
 }
 
 struct Session {
@@ -303,18 +340,36 @@ struct Session {
 
 impl Session {
     fn live(&self, now_unix: u64) -> bool {
-        now_unix.saturating_sub(self.created_unix) < SESSION_TTL_SECS
+        alive(self.created_unix, now_unix)
     }
+}
+
+/// What a displaced login leaves behind until it would have expired, so its
+/// payload keeps its owner and its count of logins opened: without it a flood
+/// that displaces a payload's login would hand that payload a fresh count.
+struct Displaced {
+    browser: BrowserKey,
+    opens: u8,
+    created_unix: u64,
 }
 
 /// In-memory session registry.
 ///
 /// Keyed on the same-device sid. `by_qr` maps the QR's id onto it, so the two
 /// ids address one session and only one of them ever says "another device".
-#[derive(Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     by_qr: Mutex<HashMap<String, String>>,
+    /// Displaced logins, by nonce.
+    displaced: Mutex<HashMap<String, Displaced>>,
+    /// Logins held at once, and records of displaced ones kept at once.
+    capacity: usize,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::with_capacity(MAX_SESSIONS)
+    }
 }
 
 impl std::fmt::Debug for SessionStore {
@@ -336,6 +391,15 @@ fn fresh_sid() -> String {
 }
 
 impl SessionStore {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            sessions: Mutex::default(),
+            by_qr: Mutex::default(),
+            displaced: Mutex::default(),
+            capacity,
+        }
+    }
+
     /// Opens a login for `browser`, or hands that browser back the one it
     /// already has for this DiscourseConnect nonce (a page refresh).
     ///
@@ -345,12 +409,14 @@ impl SessionStore {
     /// That also keeps one captured payload from minting sessions until the
     /// store is full. The owner reopening a cancelled or completed login gets
     /// a fresh session in its place, up to [`MAX_OPENS_PER_PAYLOAD`] logins
-    /// while the latest one lives.
+    /// while the latest one lives. A login displaced from a full store keeps
+    /// both rules for its payload until it would have expired.
     ///
     /// # Errors
-    /// [`AuthError::BrowserMismatch`] when the nonce's live session belongs
-    /// to another browser, [`AuthError::Session`] when the store is at
-    /// capacity or the payload has opened its last login.
+    /// [`AuthError::BrowserMismatch`] when the nonce's live or displaced
+    /// login belongs to another browser, [`AuthError::Session`] when the
+    /// payload has opened its last login or every login in a full store is
+    /// past its approval.
     pub fn create(
         &self,
         nonce: String,
@@ -360,8 +426,18 @@ impl SessionStore {
     ) -> Result<SessionIds, AuthError> {
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
         let mut by_qr = self.by_qr.lock().expect("qr index mutex never poisoned");
-        sessions.retain(|_, s| s.live(now_unix));
-        by_qr.retain(|_, primary| sessions.contains_key(primary));
+        let mut displaced = self
+            .displaced
+            .lock()
+            .expect("displaced mutex never poisoned");
+        sessions.retain(|_, s| {
+            let live = s.live(now_unix);
+            if !live {
+                by_qr.remove(&s.qr_sid);
+            }
+            live
+        });
+        displaced.retain(|_, d| alive(d.created_unix, now_unix));
 
         let mut opens = 1;
         if let Some(sid) = sessions
@@ -391,11 +467,21 @@ impl SessionStore {
                     sessions.remove(&sid);
                 }
             }
+        } else if let Some(record) = displaced.get(&nonce) {
+            if !record.browser.matches(browser) {
+                return Err(AuthError::BrowserMismatch);
+            }
+            if record.opens >= MAX_OPENS_PER_PAYLOAD {
+                return Err(AuthError::Session);
+            }
+            opens = record.opens + 1;
         }
 
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(AuthError::Session);
+        if sessions.len() >= self.capacity {
+            self.make_room(&mut sessions, &mut by_qr, &mut displaced)?;
         }
+        // Past the refusals above: a refused open leaves the record in place.
+        displaced.remove(&nonce);
         let sid = fresh_sid();
         let qr_sid = fresh_sid();
         by_qr.insert(qr_sid.clone(), sid.clone());
@@ -412,6 +498,56 @@ impl SessionStore {
             },
         );
         Ok(SessionIds { sid, qr_sid })
+    }
+
+    /// Frees one place in a full store: the oldest login that ended, else the
+    /// oldest one still waiting for its approval.
+    ///
+    /// `/sso` takes any payload the forum signed and each forum visit mints
+    /// one, so refusing at capacity would let a pile of harvested payloads
+    /// refuse every sign-in. Displacing the oldest means a flood mostly
+    /// displaces its own logins: a user's login waiting for its approval
+    /// outlasts every ended login and every older waiting one, and the user
+    /// who loses it signs in again from the forum.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] when every login is past its approval, which
+    /// [`MAX_APPROVED_PER_WALLET`] makes cost a third as many paying wallets
+    /// as the store holds logins.
+    fn make_room(
+        &self,
+        sessions: &mut HashMap<String, Session>,
+        by_qr: &mut HashMap<String, String>,
+        displaced: &mut HashMap<String, Displaced>,
+    ) -> Result<(), AuthError> {
+        let victim = sessions
+            .iter()
+            .filter_map(|(sid, s)| {
+                let rank = s.state.displacement_rank()?;
+                Some(((rank, s.created_unix), sid))
+            })
+            .min()
+            .map(|(_, sid)| sid.clone())
+            .ok_or(AuthError::Session)?;
+        let session = sessions.remove(&victim).expect("the victim was just found");
+        by_qr.remove(&session.qr_sid);
+        if displaced.len() >= self.capacity
+            && let Some(oldest) = displaced
+                .iter()
+                .min_by_key(|(_, d)| d.created_unix)
+                .map(|(nonce, _)| nonce.clone())
+        {
+            displaced.remove(&oldest);
+        }
+        displaced.insert(
+            session.nonce,
+            Displaced {
+                browser: session.browser,
+                opens: session.opens,
+                created_unix: session.created_unix,
+            },
+        );
+        Ok(())
     }
 
     /// Resolves either id onto the session's own key, saying which one it was.
@@ -470,6 +606,9 @@ impl SessionStore {
     /// # Errors
     /// [`AuthError::Session`] if the session is unknown, expired, or no longer
     /// waiting for an approval: a second approval never replaces the first.
+    /// [`AuthError::RateLimited`] when the wallet already holds
+    /// [`MAX_APPROVED_PER_WALLET`] logins past their approval; the session
+    /// keeps waiting.
     pub fn approve_bound(
         &self,
         _admitted: &Admitted,
@@ -508,10 +647,22 @@ impl SessionStore {
     fn approve(&self, sid: &str, next: State, now_unix: u64) -> Result<(), AuthError> {
         let (primary, _) = self.resolve(sid, now_unix)?;
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
-        let session = sessions.get_mut(&primary).ok_or(AuthError::Session)?;
-        if !matches!(session.state, State::Pending) {
+        if !sessions
+            .get(&primary)
+            .is_some_and(|s| matches!(s.state, State::Pending))
+        {
             return Err(AuthError::Session);
         }
+        let held = next.approved_by().map_or(0, |wallet| {
+            sessions
+                .values()
+                .filter(|s| s.live(now_unix) && s.state.approved_by() == Some(wallet))
+                .count()
+        });
+        if held >= MAX_APPROVED_PER_WALLET {
+            return Err(AuthError::RateLimited);
+        }
+        let session = sessions.get_mut(&primary).ok_or(AuthError::Session)?;
         session.state = next;
         Ok(())
     }
@@ -706,8 +857,10 @@ mod tests {
         let codes: Vec<String> = (0..20)
             .map(|i| {
                 let ids = open(&store, &format!("n{i}"), &b);
+                let mut wallet = user();
+                wallet.external_id = format!("e{i}");
                 store
-                    .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+                    .approve_bound(&Admitted::for_tests(), &ids.sid, wallet, 1)
                     .expect("approve")
                     .as_str()
                     .to_owned()
@@ -1091,6 +1244,222 @@ mod tests {
                 .create("n".into(), "r".into(), &b, 2 + SESSION_TTL_SECS)
                 .is_ok(),
             "once the last one has expired the payload opens again"
+        );
+    }
+
+    /// Opens `count` logins at `now_unix`, each from its own payload and its
+    /// own browser, the way a pile of harvested payloads arrives.
+    fn flood(store: &SessionStore, tag: &str, count: usize, now_unix: u64) {
+        for i in 0..count {
+            store
+                .create(format!("{tag}-{i}"), "r".into(), &browser(), now_unix)
+                .unwrap_or_else(|err| panic!("flood {tag}-{i}: {err}"));
+        }
+    }
+
+    #[test]
+    fn at_capacity_a_new_login_displaces_the_oldest_waiting_one() {
+        // Each forum visit mints a payload `/sso` accepts, so refusing at
+        // capacity would let a pile of harvested payloads refuse every
+        // sign-in.
+        let store = SessionStore::default();
+        let first = browser();
+        let oldest = store
+            .create("oldest".into(), "r".into(), &first, 0)
+            .expect("open");
+        flood(&store, "flood", MAX_SESSIONS - 1, 1);
+
+        let fresh = store.create("fresh".into(), "r".into(), &browser(), 2);
+
+        assert!(fresh.is_ok(), "a full store still opens a login: {fresh:?}");
+        assert_eq!(
+            store.status(&oldest.sid, &first, 3),
+            Err(AuthError::BrowserMismatch),
+            "the oldest login still waiting for its approval made room"
+        );
+    }
+
+    #[test]
+    fn a_full_store_displaces_an_ended_login_before_a_waiting_one() {
+        let store = SessionStore::with_capacity(3);
+        let (waiting, ended, newer) = (browser(), browser(), browser());
+        let older = store
+            .create("waiting".into(), "r".into(), &waiting, 0)
+            .expect("open");
+        let cancelled = store
+            .create("ended".into(), "r".into(), &ended, 1)
+            .expect("open");
+        store.cancel(&cancelled.sid, CancelReason::UserCancelled, 1);
+        let newest = store
+            .create("newer".into(), "r".into(), &newer, 2)
+            .expect("open");
+
+        store
+            .create("fresh".into(), "r".into(), &browser(), 3)
+            .expect("a full store makes room");
+
+        assert_eq!(
+            store.status(&cancelled.sid, &ended, 4),
+            Err(AuthError::BrowserMismatch)
+        );
+        assert_eq!(
+            store.status(&older.sid, &waiting, 4),
+            Ok(SessionStatus::Pending),
+            "the older login still waits for its approval, so it stays"
+        );
+        assert_eq!(
+            store.status(&newest.sid, &newer, 4),
+            Ok(SessionStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn a_login_past_its_approval_survives_any_flood() {
+        let store = SessionStore::with_capacity(4);
+        let (awaiting, confirmed) = (browser(), browser());
+        let awaiting_ids = open(&store, "awaiting", &awaiting);
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &awaiting_ids.sid, user(), 1)
+            .expect("approve");
+        let confirmed_ids = open(&store, "confirmed", &confirmed);
+        let confirmed_code = store
+            .approve_bound(&Admitted::for_tests(), &confirmed_ids.sid, user(), 1)
+            .expect("approve");
+        store
+            .confirm(&confirmed_ids.sid, &confirmed, confirmed_code.as_str(), 2)
+            .expect("confirm");
+
+        flood(&store, "flood", 40, 3);
+
+        assert_eq!(
+            store.confirm(&awaiting_ids.sid, &awaiting, code.as_str(), 4),
+            Ok(ConfirmOutcome::Confirmed)
+        );
+        assert!(matches!(
+            store.consume(&confirmed_ids.sid, &confirmed, 4),
+            Ok(Consumed::Login(_))
+        ));
+    }
+
+    #[test]
+    fn a_store_full_of_approved_logins_refuses_a_new_one() {
+        let store = SessionStore::with_capacity(MAX_APPROVED_PER_WALLET);
+        for i in 0..MAX_APPROVED_PER_WALLET {
+            let ids = open(&store, &format!("n{i}"), &browser());
+            store
+                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+                .expect("approve");
+        }
+
+        assert_eq!(
+            store
+                .create("fresh".into(), "r".into(), &browser(), 2)
+                .map(|_| ()),
+            Err(AuthError::Session)
+        );
+    }
+
+    #[test]
+    fn a_displaced_login_keeps_its_payloads_owner_and_count() {
+        let store = SessionStore::with_capacity(1);
+        let owner = browser();
+        store
+            .create("p".into(), "r".into(), &owner, 0)
+            .expect("first login");
+        flood(&store, "displace-first", 1, 1);
+
+        assert_eq!(
+            store
+                .create("p".into(), "r".into(), &browser(), 2)
+                .map(|_| ()),
+            Err(AuthError::BrowserMismatch),
+            "a displaced payload still belongs to the browser that opened it"
+        );
+        let second = store
+            .create("p".into(), "r".into(), &owner, 2)
+            .expect("its owner opens it again");
+        store.cancel(&second.sid, CancelReason::SubscriptionRequired, 2);
+        store
+            .create("p".into(), "r".into(), &owner, 3)
+            .expect("third login");
+        flood(&store, "displace-third", 1, 4);
+
+        assert_eq!(
+            store.create("p".into(), "r".into(), &owner, 5).map(|_| ()),
+            Err(AuthError::Session),
+            "displacing its third login did not buy the payload a fourth"
+        );
+        assert!(
+            store
+                .create("p".into(), "r".into(), &owner, 3 + SESSION_TTL_SECS)
+                .is_ok(),
+            "once its last login would have expired the payload opens again"
+        );
+    }
+
+    #[test]
+    fn a_flood_keeps_the_store_and_its_displaced_records_bounded() {
+        let capacity = 4;
+        let store = SessionStore::with_capacity(capacity);
+
+        flood(&store, "flood", 10 * capacity, 0);
+        flood(&store, "later", 10 * capacity, SESSION_TTL_SECS);
+
+        let sessions = store.sessions.lock().expect("sessions").len();
+        let by_qr = store.by_qr.lock().expect("qr index").len();
+        let displaced = store.displaced.lock().expect("displaced").len();
+        assert_eq!((sessions, by_qr, displaced), (capacity, capacity, capacity));
+    }
+
+    #[test]
+    fn one_wallet_holds_three_logins_past_their_approval_and_no_more() {
+        let store = SessionStore::default();
+        let browsers: Vec<BrowserKey> = (0..=MAX_APPROVED_PER_WALLET).map(|_| browser()).collect();
+        let logins: Vec<SessionIds> = browsers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| open(&store, &format!("n{i}"), b))
+            .collect();
+        let mut codes = Vec::new();
+        for ids in &logins[..MAX_APPROVED_PER_WALLET] {
+            codes.push(
+                store
+                    .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+                    .expect("approve"),
+            );
+        }
+        let last = &logins[MAX_APPROVED_PER_WALLET];
+
+        assert_eq!(
+            store
+                .approve_bound(&Admitted::for_tests(), &last.sid, user(), 2)
+                .map(|_| ()),
+            Err(AuthError::RateLimited)
+        );
+        assert!(
+            store.awaits_approval(&last.sid, 2),
+            "the refused one keeps waiting"
+        );
+        let mut stranger = user();
+        stranger.external_id = "another wallet".into();
+        let other = open(&store, "other", &browser());
+        assert!(
+            store
+                .approve_legacy(&Admitted::for_tests(), &other.sid, stranger, 2)
+                .is_ok(),
+            "another wallet is not held back"
+        );
+        store
+            .confirm(&logins[0].sid, &browsers[0], codes[0].as_str(), 3)
+            .expect("confirm");
+        store
+            .consume(&logins[0].sid, &browsers[0], 3)
+            .expect("complete");
+        assert!(
+            store
+                .approve_bound(&Admitted::for_tests(), &last.sid, user(), 4)
+                .is_ok(),
+            "a completed login gives its place back"
         );
     }
 

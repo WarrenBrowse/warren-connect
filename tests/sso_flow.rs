@@ -1430,6 +1430,26 @@ async fn a_second_approval_cannot_replace_the_first() {
 }
 
 #[tokio::test]
+async fn a_wallet_holding_three_approved_logins_is_told_to_wait_and_the_fourth_keeps_waiting() {
+    // A full store never displaces a login past its approval, so one paying
+    // wallet must not be able to hold more than a few.
+    let app = router(paid_state());
+    let (key, _) = paid_signer();
+    for i in 0..3u8 {
+        let page = open_sso(&app, &format!("n-held-{i}"), None).await;
+        let approval = send(&app, signed_bound_login(&key, &page.sid(), [0x60 + i; 16])).await;
+        assert_eq!(approval.status, 200, "{}", approval.body_utf8);
+    }
+    let fourth = open_sso(&app, "n-held-3", None).await;
+
+    let refused = send(&app, signed_bound_login(&key, &fourth.sid(), [0x63; 16])).await;
+
+    assert_eq!(refused.status, 429, "{}", refused.body_utf8);
+    let status = send(&app, status_request(&fourth.sid(), Some(&fourth.cookie()))).await;
+    assert_eq!(status.body_utf8, r#"{"status":"pending"}"#);
+}
+
+#[tokio::test]
 async fn an_unknown_login_version_is_refused_rather_than_served_an_older_form() {
     use warren_contract::auth::{
         HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,

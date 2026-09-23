@@ -78,9 +78,11 @@ by anyone relaying the request.
 | 401 | `{"error":"clock_skew"}` | device clock outside the 60 s window | clock-skew message (unchanged) |
 | 403 | text | wallet never subscribed | subscription-required (unchanged) |
 | 404 | text | session unknown, expired, cancelled, or already approved | expired (unchanged) |
+| 429 | text | the wallet already holds three sign-ins it approved and no browser completed; the session keeps waiting | generic failure |
 
 `notify_slot` is omitted when none was drawn, as in v1. `handle` and
-`notify_slot` keep their v1 meaning.
+`notify_slot` keep their v1 meaning. The vector does not pin the 429 body:
+every client maps it to its generic failure.
 
 A session accepts exactly one approval. A second approval, from any wallet,
 answers 404.
@@ -237,4 +239,10 @@ happen to a v2 client and maps to the generic failure.
     guesses until the TTL;
   - the legacy transition window for non-staff wallets while the flag is
     `allow`;
-  - an app-side cancel by anyone holding a sid, before the approval only.
+  - an app-side cancel by anyone holding a sid, before the approval only;
+  - the provider holds 10,000 sign-ins, and each forum visit mints a payload
+    `/sso` accepts, so a pile of harvested payloads fills it. A full provider
+    displaces the oldest sign-in that ended, then the oldest one still waiting
+    for its approval, whose browser then reads "no longer tied to its
+    sign-in" and starts again from the forum. A sign-in past its approval is
+    never displaced.
