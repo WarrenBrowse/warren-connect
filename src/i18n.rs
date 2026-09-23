@@ -140,6 +140,10 @@ pub(crate) struct Strings {
     pub(crate) a_update: &'static str,
     pub(crate) a_exhausted: &'static str,
     pub(crate) a_mismatch: &'static str,
+    /// Shown at once by a browser that reports cookies disabled: without the
+    /// login cookie it can never finish, and waiting would end on a message
+    /// that blames an expiry or somebody else.
+    pub(crate) a_cookies: &'static str,
     /// `/sso` opened by a browser other than the one that owns the login.
     pub(crate) e_heading: &'static str,
     pub(crate) e_body: &'static str,
@@ -150,6 +154,7 @@ pub(crate) struct Strings {
     pub(crate) h_mismatch_heading: &'static str,
     pub(crate) h_mismatch_body: &'static str,
     pub(crate) h_failed: &'static str,
+    pub(crate) h_cookies: &'static str,
     // Attach-logs page.
     pub(crate) l_tab: &'static str,
     pub(crate) l_heading: &'static str,
@@ -230,6 +235,7 @@ const EN: Strings = Strings {
     a_update: "Your Warren app is too old to approve this sign-in. Update it, then sign in again from the forum.",
     a_exhausted: "Too many wrong codes: this sign-in was cancelled. If you did not start it yourself, someone may have tried to sign in as you. To sign in, start again from the forum.",
     a_mismatch: "This page is no longer tied to its sign-in: it expired, or this browser blocks cookies. Close this page and sign in again from the forum.",
+    a_cookies: "This browser blocks cookies, so it cannot finish a forum sign-in. Allow cookies for this site, then sign in again from the forum.",
     e_heading: "This sign-in was started in another browser",
     e_body: "The sign-in link you opened already belongs to another browser, so it cannot continue here. Go back to the forum and select Log In again.",
     h_heading: "Finishing your sign-in",
@@ -237,6 +243,7 @@ const EN: Strings = Strings {
     h_mismatch_heading: "This browser did not start this sign-in",
     h_mismatch_body: "The sign-in your Warren app just approved was started in another browser, or it has expired. If you started it yourself in another browser, go back to it and type the code your Warren app shows. If someone sent you a link or a code to approve, they were trying to sign in to the forum as you: do not send them anything.",
     h_failed: "This sign-in could not be finished here. Go back to the sign-in page and try again.",
+    h_cookies: "This browser blocks cookies, so it cannot finish the sign-in here. Go back to the sign-in page and type the code your Warren app shows.",
     l_tab: "Warren, attach your logs",
     l_heading: "Send your logs to the Warren staff",
     l_body: "Your Warren app will prepare a redacted problem report from its recent logs. You can review it in the app before approving. The report goes privately to the Warren staff and is linked to your forum topic; it never appears publicly.",
@@ -308,6 +315,7 @@ const FR: Strings = Strings {
     a_update: "Votre application Warren est trop ancienne pour approuver cette connexion. Mettez-la \u{e0} jour, puis reconnectez-vous depuis le forum.",
     a_exhausted: "Trop de codes incorrects : cette connexion a \u{e9}t\u{e9} annul\u{e9}e. Si vous ne l'avez pas lanc\u{e9}e vous-m\u{ea}me, quelqu'un a peut-\u{ea}tre tent\u{e9} de se connecter \u{e0} votre place. Pour vous connecter, recommencez depuis le forum.",
     a_mismatch: "Cette page n'est plus li\u{e9}e \u{e0} sa connexion : elle a expir\u{e9}, ou ce navigateur bloque les cookies. Fermez cette page et reconnectez-vous depuis le forum.",
+    a_cookies: "Ce navigateur bloque les cookies et ne peut donc pas terminer une connexion au forum. Autorisez les cookies pour ce site, puis reconnectez-vous depuis le forum.",
     e_heading: "Cette connexion a \u{e9}t\u{e9} commenc\u{e9}e dans un autre navigateur",
     e_body: "Le lien de connexion que vous avez ouvert appartient d\u{e9}j\u{e0} \u{e0} un autre navigateur et ne peut pas continuer ici. Revenez au forum et cliquez \u{e0} nouveau sur Se connecter.",
     h_heading: "Finalisation de votre connexion",
@@ -315,6 +323,7 @@ const FR: Strings = Strings {
     h_mismatch_heading: "Ce navigateur n'a pas commenc\u{e9} cette connexion",
     h_mismatch_body: "La connexion que votre application Warren vient d'approuver a \u{e9}t\u{e9} commenc\u{e9}e dans un autre navigateur, ou elle a expir\u{e9}. Si vous l'avez commenc\u{e9}e vous-m\u{ea}me dans un autre navigateur, revenez-y et saisissez le code affich\u{e9} par votre application Warren. Si quelqu'un vous a envoy\u{e9} un lien ou un code \u{e0} approuver, cette personne essayait de se connecter au forum \u{e0} votre place : ne lui envoyez rien.",
     h_failed: "Cette connexion n'a pas pu \u{ea}tre finalis\u{e9}e ici. Revenez \u{e0} la page de connexion et r\u{e9}essayez.",
+    h_cookies: "Ce navigateur bloque les cookies et ne peut donc pas terminer la connexion ici. Revenez \u{e0} la page de connexion et saisissez le code affich\u{e9} par votre application Warren.",
     l_tab: "Warren, joindre vos journaux",
     l_heading: "Envoyer vos journaux au staff Warren",
     l_body: "Votre application Warren va pr\u{e9}parer un rapport de probl\u{e8}me expurg\u{e9} \u{e0} partir de ses journaux r\u{e9}cents. Vous pourrez le v\u{e9}rifier dans l'application avant d'approuver. Le rapport est envoy\u{e9} en priv\u{e9} au staff Warren et reli\u{e9} \u{e0} votre sujet ; il n'appara\u{ee}t jamais publiquement.",
@@ -386,6 +395,7 @@ const RO: Strings = Strings {
     a_update: "Aplica\u{21b}ia ta Warren este prea veche pentru a aproba aceast\u{103} autentificare. Actualizeaz-o, apoi autentific\u{103}-te din nou de pe forum.",
     a_exhausted: "Prea multe coduri gre\u{219}ite: aceast\u{103} autentificare a fost anulat\u{103}. Dac\u{103} nu ai pornit-o tu, poate cineva a \u{ee}ncercat s\u{103} se autentifice \u{ee}n locul t\u{103}u. Ca s\u{103} te autentifici, reia de pe forum.",
     a_mismatch: "Aceast\u{103} pagin\u{103} nu mai este legat\u{103} de autentificarea ei: a expirat sau acest browser blocheaz\u{103} cookie-urile. \u{ce}nchide pagina \u{219}i autentific\u{103}-te din nou de pe forum.",
+    a_cookies: "Acest browser blocheaz\u{103} cookie-urile, a\u{219}a c\u{103} nu poate finaliza o autentificare pe forum. Permite cookie-urile pentru acest site, apoi autentific\u{103}-te din nou de pe forum.",
     e_heading: "Aceast\u{103} autentificare a fost pornit\u{103} \u{ee}n alt browser",
     e_body: "Linkul de autentificare pe care l-ai deschis apar\u{21b}ine deja altui browser, a\u{219}a c\u{103} nu poate continua aici. Revino pe forum \u{219}i apas\u{103} din nou pe Autentificare.",
     h_heading: "Se finalizeaz\u{103} autentificarea",
@@ -393,6 +403,7 @@ const RO: Strings = Strings {
     h_mismatch_heading: "Acest browser nu a pornit aceast\u{103} autentificare",
     h_mismatch_body: "Autentificarea pe care aplica\u{21b}ia Warren tocmai a aprobat-o a fost pornit\u{103} \u{ee}n alt browser sau a expirat. Dac\u{103} ai pornit-o chiar tu \u{ee}n alt browser, revino acolo \u{219}i introdu codul afi\u{219}at de aplica\u{21b}ia Warren. Dac\u{103} cineva \u{21b}i-a trimis un link sau un cod de aprobat, \u{ee}ncerca s\u{103} se autentifice pe forum \u{ee}n locul t\u{103}u: nu-i trimite nimic.",
     h_failed: "Aceast\u{103} autentificare nu a putut fi finalizat\u{103} aici. Revino la pagina de autentificare \u{219}i \u{ee}ncearc\u{103} din nou.",
+    h_cookies: "Acest browser blocheaz\u{103} cookie-urile, a\u{219}a c\u{103} nu poate finaliza autentificarea aici. Revino la pagina de autentificare \u{219}i introdu codul afi\u{219}at de aplica\u{21b}ia Warren.",
     l_tab: "Warren, ata\u{219}eaz\u{103}-\u{21b}i jurnalele",
     l_heading: "Trimite jurnalele c\u{103}tre echipa Warren",
     l_body: "Aplica\u{21b}ia Warren va preg\u{103}ti un raport de problem\u{103} anonimizat din jurnalele sale recente. \u{ce}l po\u{21b}i verifica \u{ee}n aplica\u{21b}ie \u{ee}nainte de a aproba. Raportul este trimis privat echipei Warren \u{219}i legat de subiectul t\u{103}u; nu apare niciodat\u{103} public.",

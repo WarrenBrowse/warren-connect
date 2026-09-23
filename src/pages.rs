@@ -218,7 +218,7 @@ pub fn approval_page(
      data-expired="{expired}" data-subscription="{subscription}"
      data-cancelled="{cancelled}" data-clock="{clock}" data-update="{update}"
      data-exhausted="{exhausted}" data-mismatch="{mismatch}"
-     data-awaiting="{awaiting}">{waiting}</p>
+     data-awaiting="{awaiting}" data-cookies="{cookies}">{waiting}</p>
   <hr class="rule">
   <p class="foot tagline">{tagline}</p>
 </div>
@@ -349,7 +349,7 @@ pub fn approval_page(
       poll();
     }}
   }});
-  poll();
+  if (navigator.cookieEnabled) {{ poll(); }} else {{ stop(el.dataset.cookies); }}
 </script>
 </body>
 </html>"##,
@@ -385,6 +385,7 @@ pub fn approval_page(
         update = s.a_update,
         exhausted = s.a_exhausted,
         mismatch = s.a_mismatch,
+        cookies = s.a_cookies,
         tagline = s.tagline,
     )
 }
@@ -466,7 +467,7 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
   <p id="state" aria-live="polite" data-mismatch="{mismatch_body}" data-failed="{failed}"
      data-expired="{expired}" data-subscription="{subscription}" data-clock="{clock}"
      data-update="{update}" data-exhausted="{exhausted}"
-     data-cancelled="{cancelled}">{working}</p>
+     data-cancelled="{cancelled}" data-cookies="{cookies}">{working}</p>
   <hr class="rule">
   <p class="tagline">{tagline}</p>
 </div>
@@ -490,6 +491,7 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
       : reason === 'code_attempts_exhausted' ? el.dataset.exhausted
       : el.dataset.cancelled;
   const run = async () => {{
+    if (!navigator.cookieEnabled) {{ show(el.dataset.cookies); return; }}
     if (!/^[0-9a-f]{{32}}$/.test(sid) || !/^[0-9]{{6}}$/.test(code)) {{ show(el.dataset.failed); return; }}
     try {{
       const r = await fetch('/v1/session/' + sid + '/confirm', {{
@@ -529,6 +531,7 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
         update = s.a_update,
         exhausted = s.a_exhausted,
         cancelled = s.a_cancelled,
+        cookies = s.h_cookies,
         tagline = s.tagline,
     )
 }
@@ -1304,6 +1307,26 @@ mod tests {
                 !page.contains("/v1/session/0") && !page.contains("#sid="),
                 "no id is rendered, the fragment is the only carrier"
             );
+        }
+    }
+
+    #[test]
+    fn both_login_pages_tell_a_browser_that_blocks_cookies_before_it_waits() {
+        // Without the cookie the poll reads the app's view of the session
+        // and the handoff reads as another browser's: both would tell such a
+        // user something false ("expired", "someone tried to sign in as you").
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let s = lang.strings();
+            let approval = approval_page(lang, &ids("s", "q"), "h", NONCE);
+            let handoff = handoff_page(lang, NONCE);
+            for (page, text) in [(&approval, s.a_cookies), (&handoff, s.h_cookies)] {
+                assert!(page.contains("navigator.cookieEnabled"), "{lang:?}");
+                assert!(page.contains(text), "{lang:?}");
+                assert!(!text.is_empty() && !text.contains('"'), "{lang:?}");
+            }
+            let checked = handoff.find("navigator.cookieEnabled").expect("checks");
+            let posted = handoff.find("fetch(").expect("posts");
+            assert!(checked < posted, "the handoff checks before it confirms");
         }
     }
 
