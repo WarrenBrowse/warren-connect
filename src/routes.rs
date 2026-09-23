@@ -967,7 +967,24 @@ async fn admit_forum_identity(
     // nothing and refuses nothing: read as "never paid", a flood that loads
     // the database would turn every paying user's sign-in into a
     // subscription refusal.
-    let status = paywall_standing(state, identity, door).await?;
+    let status = if admin {
+        // No minted wallet is on the allowlist, so staff reads need no
+        // bulkhead, and staff pass without their standing, which only
+        // decides their groups: an outage is when operators need the forum.
+        state
+            .identity
+            .subscription_status(&identity.pubkey_ss58)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    kind = ?sqlx_error_kind(&e),
+                    "subscription lookup failed: staff admitted on the allowlist"
+                );
+                store::SubscriptionStatus::default()
+            })
+    } else {
+        paywall_standing(state, identity, door).await?
+    };
     if !login_allowed(status.ever_paid, admin) {
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);

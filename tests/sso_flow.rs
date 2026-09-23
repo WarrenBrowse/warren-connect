@@ -2444,6 +2444,24 @@ async fn a_warren_database_outage_answers_a_retryable_error_and_leaves_the_login
 }
 
 #[tokio::test]
+async fn an_allowlisted_wallet_signs_in_while_the_warren_database_is_down() {
+    // Staff pass on the allowlist, which no minted wallet is on: an outage is
+    // when operators need their forum most.
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        admins: &ss58,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let page = open_sso(&app, "n-staff-down", None).await;
+    memory(&state).warren_db.set_down(true);
+
+    let answer = send(&app, signed_bound_login(&key, &page.sid(), [0xa9; 16])).await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body_utf8);
+}
+
+#[tokio::test]
 async fn a_forum_link_that_cannot_be_written_answers_a_retryable_error_and_leaves_the_login_pending()
  {
     let state = paid_state();
