@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::intake::RateLimiter;
 use crate::store::{FORUM_POOL_CONNECTIONS, WARREN_POOL_CONNECTIONS};
 
 /// How long a "no" is answered from memory. Short, because the one wallet it
@@ -29,6 +30,12 @@ pub const NEGATIVE_TTL_SECS: u64 = 30;
 /// Answers each negative cache holds. A flood of fresh wallets only churns
 /// it; the bulkheads are what bound that flood.
 const NEGATIVE_MAX_ENTRIES: usize = 4_096;
+
+/// Topic fetches a signer may spend, per hour, on uploads to topics it did not
+/// write. The per-session count bounds one page, and a fresh page opens a
+/// fresh session; this bounds the signer, which the forum-link gate has
+/// already made a wallet that paid at least once.
+const AUTHOR_MISSES_PER_HOUR: usize = 10;
 
 const LOGIN_PERMITS: usize = 2;
 const OPEN_PERMITS: usize = 1;
@@ -67,6 +74,9 @@ pub struct Gates {
     pub never_paid: NegativeCache,
     /// Wallets found with no forum link.
     pub unlinked: NegativeCache,
+    /// Topic fetches that ended in a failed author check, per signer's
+    /// keyed forum id. An author's own uploads are given back.
+    pub author_misses: RateLimiter<String>,
 }
 
 impl Default for Gates {
@@ -77,6 +87,7 @@ impl Default for Gates {
             topic: GateLimiter::new(TOPIC_PERMITS, MAX_QUEUED, MAX_WAIT),
             never_paid: NegativeCache::new(NEGATIVE_TTL_SECS, NEGATIVE_MAX_ENTRIES),
             unlinked: NegativeCache::new(NEGATIVE_TTL_SECS, NEGATIVE_MAX_ENTRIES),
+            author_misses: RateLimiter::new(AUTHOR_MISSES_PER_HOUR, usize::MAX, 3_600),
         }
     }
 }

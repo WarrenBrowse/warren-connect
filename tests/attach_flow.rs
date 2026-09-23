@@ -2947,17 +2947,21 @@ async fn a_topic_session_pays_for_a_bounded_number_of_topic_fetches() {
 
 #[tokio::test]
 async fn a_topic_fetch_past_a_full_topic_gate_is_refused_at_once() {
-    let key = SigningKey::from_bytes(&[7u8; 32]);
     let (url, stub) = spawn_stub("someone-else", true).await;
     *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_secs(3));
     let state = test_state(Some(stub_api(&url)));
-    link(&state, &key).await;
+    let signers: Vec<SigningKey> = (0..11u8)
+        .map(|i| SigningKey::from_bytes(&[0x40 + i; 32]))
+        .collect();
+    for key in &signers {
+        link(&state, key).await;
+    }
     let upload = |i: u8| {
         let sid = state
             .attach
             .create(42, &a_browser(), now_unix())
             .expect("create");
-        signed_attach_request(&key, &upload_body(&sid, 42), [i; 16])
+        signed_attach_request(&signers[usize::from(i)], &upload_body(&sid, 42), [i; 16])
     };
     let in_flight: Vec<_> = (0..10u8)
         .map(|i| {
@@ -2971,7 +2975,7 @@ async fn a_topic_fetch_past_a_full_topic_gate_is_refused_at_once() {
     }
     let started = std::time::Instant::now();
 
-    let turned_away = send(&state, upload(0x10)).await;
+    let turned_away = send(&state, upload(10)).await;
 
     assert_eq!(turned_away.status, 502, "{}", turned_away.body_utf8);
     assert!(
@@ -3039,4 +3043,48 @@ async fn a_bind_past_a_full_topic_gate_is_refused_at_once_and_stays_retryable() 
     for task in in_flight {
         task.await.expect("task");
     }
+}
+
+#[tokio::test]
+async fn a_signer_refused_ten_times_as_not_the_author_fetches_no_topic_for_an_hour() {
+    // A fresh page opens a fresh session with fresh fetches, so the
+    // per-session count alone lets one linked wallet keep Discourse busy.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub("someone-else", true).await;
+    let state = test_state(Some(stub_api(&url)));
+    link(&state, &key).await;
+
+    let mut answers = Vec::new();
+    for i in 0..11u8 {
+        let sid = state
+            .attach
+            .create(42, &a_browser(), now_unix())
+            .expect("create");
+        let request = signed_attach_request(&key, &upload_body(&sid, 42), [i; 16]);
+        answers.push(send(&state, request).await.status);
+    }
+
+    assert_eq!(answers[..10], [403; 10]);
+    assert_eq!(answers[10], 429);
+    assert_eq!(topic_fetches(&stub), 10);
+}
+
+#[tokio::test]
+async fn an_authors_own_uploads_spend_nothing_of_that_budget() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(stub_api(&url)));
+    link(&state, &key).await;
+
+    let mut answers = Vec::new();
+    for i in 0..11u8 {
+        let sid = state
+            .attach
+            .create(42, &a_browser(), now_unix())
+            .expect("create");
+        let request = signed_attach_request(&key, &upload_body(&sid, 42), [i; 16]);
+        answers.push(send(&state, request).await.status);
+    }
+
+    assert_eq!(answers, [200; 11]);
 }

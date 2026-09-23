@@ -1545,6 +1545,18 @@ async fn forum_attach_logs(
     // deterministic handle bridges the two. The author has a forum account,
     // so a forum link: a wallet without one is refused before the fetch.
     admit_linked_signer(&state, identity, &forum).await?;
+    // Charged before the fetch and given back unless the author check fails.
+    let signer = forum.external_id.as_str();
+    state
+        .gates
+        .author_misses
+        .admit(signer.to_owned(), now)
+        .inspect_err(|_| {
+            tracing::info!(
+                topic_id = req.topic_id,
+                "attach-logs refused: the signer failed too many author checks"
+            );
+        })?;
     let fetch = async {
         // Charged once the gate lets the fetch run, so a saturated gate
         // spends none of the session's fetches.
@@ -1560,9 +1572,14 @@ async fn forum_attach_logs(
         Ok::<_, AuthError>(api.topic(req.topic_id).await?)
     };
     let topic = match state.gates.topic.run(fetch).await {
-        Ok(fetched) => fetched?,
+        Ok(Ok(topic)) => topic,
+        Ok(Err(err)) => {
+            state.gates.author_misses.release(signer);
+            return Err(err);
+        }
         Err(GateBusy) => {
             tracing::debug!("attach topic gate saturated");
+            state.gates.author_misses.release(signer);
             return Err(AuthError::Forum);
         }
     };
@@ -1575,6 +1592,7 @@ async fn forum_attach_logs(
         );
         return Err(AuthError::NotAuthor);
     }
+    state.gates.author_misses.release(signer);
     let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
         tracing::info!(
             topic_id = req.topic_id,
