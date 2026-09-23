@@ -52,6 +52,11 @@ struct Setup<'a> {
     admins: &'a str,
     /// `PUBLIC_HOST`, which the handoff URL names.
     public_host: &'a str,
+    /// The replay store's global cap; `None` is the deployed one.
+    nonce_cap: Option<usize>,
+    /// Wire both Discourse roles, to a database that never answers, so the
+    /// notification routes run as far as their first Discourse read.
+    discourse_wired: bool,
 }
 
 impl Default for Setup<'_> {
@@ -63,12 +68,15 @@ impl Default for Setup<'_> {
             forum_staff: None,
             admins: "",
             public_host: "connect.test",
+            nonce_cap: None,
+            discourse_wired: false,
         }
     }
 }
 
 fn build_state(setup: Setup<'_>) -> Arc<AppState> {
     let lazy = PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
         .expect("lazy pool never dials at build time");
     let memory = MemoryIdentity::default();
@@ -95,14 +103,16 @@ fn build_state(setup: Setup<'_>) -> Arc<AppState> {
         internal_token: "test-internal-token".into(),
         admins: Allowlist::parse(setup.admins).expect("allowlist"),
         forum_pool: lazy.clone(),
-        warren_pool: lazy,
+        warren_pool: lazy.clone(),
         identity: IdentityStore::Memory(memory),
-        discourse_pool: None,
-        seen_pool: None,
+        discourse_pool: setup.discourse_wired.then(|| lazy.clone()),
+        seen_pool: setup.discourse_wired.then_some(lazy),
         digest_generation: Default::default(),
         sessions: SessionStore::default(),
         legacy_approval: setup.legacy,
-        nonces: NonceStore::default(),
+        nonces: setup
+            .nonce_cap
+            .map_or_else(NonceStore::default, NonceStore::with_max_entries),
         attach: AttachStore::default(),
         forum_api: None,
         intake: None,
@@ -2039,4 +2049,326 @@ async fn a_code_of_the_wrong_shape_is_refused_without_spending_an_attempt() {
         answer.body_utf8, r#"{"attempts_left":4,"error":"code_invalid"}"#,
         "the malformed codes cost nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Replay store: only a request a route admits spends a nonce. A wallet is
+// free to mint, so a store every verified signature could write to would be a
+// store anybody could fill, failing every signed route closed.
+// ---------------------------------------------------------------------------
+
+/// The in-memory identity behind a suite state.
+fn memory(state: &AppState) -> &MemoryIdentity {
+    match &state.identity {
+        IdentityStore::Memory(memory) => memory,
+        IdentityStore::Postgres { .. } => unreachable!("the suite never builds the Postgres form"),
+    }
+}
+
+/// Records `key` as a wallet that paid for Warren.
+fn mark_paid(state: &AppState, key: &ed25519_dalek::SigningKey) {
+    memory(state).subscriptions.lock().expect("mutex").insert(
+        warren_contract::ss58::encode(&key.verifying_key().to_bytes()),
+        SubscriptionStatus {
+            ever_paid: true,
+            active: true,
+            expires_at_unix: Some(4_102_444_800),
+        },
+    );
+}
+
+/// Records `key`'s forum link, the way its forum sign-in does.
+fn mark_linked(state: &AppState, key: &ed25519_dalek::SigningKey) {
+    let forum = warren_connect::handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    memory(state)
+        .links
+        .lock()
+        .expect("mutex")
+        .insert(forum.external_id, (forum.username, None));
+}
+
+/// A wallet-signed POST of `body` to `path`, signed at `timestamp`.
+fn signed_post(
+    key: &ed25519_dalek::SigningKey,
+    path: &str,
+    body: &str,
+    timestamp: u64,
+    nonce: [u8; 16],
+) -> Request<Body> {
+    use warren_contract::auth::{
+        HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign_request,
+    };
+    let s = sign_request(key, "POST", path, body.as_bytes(), timestamp, nonce);
+    Request::post(path)
+        .header("Content-Type", "application/json")
+        .header(HEADER_PUBKEY, s.pubkey_ss58)
+        .header(HEADER_SIGNATURE, s.signature_hex)
+        .header(HEADER_TIMESTAMP, s.timestamp.to_string())
+        .header(HEADER_NONCE, s.nonce_hex)
+        .body(Body::from(body.to_owned()))
+        .expect("request")
+}
+
+fn bound_body(sid: &str) -> String {
+    format!(r#"{{"login_version":2,"sid":"{sid}"}}"#)
+}
+
+/// A key nobody paid for, one per `seed`.
+fn free_key(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+#[tokio::test]
+async fn a_flood_of_logins_from_wallets_that_never_paid_spends_no_nonce() {
+    let state = build_state(Setup {
+        nonce_cap: Some(4),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+
+    let mut answers = Vec::new();
+    for i in 0..8u8 {
+        let page = open_sso(&app, &format!("n-flood-{i}"), None).await;
+        let request = signed_post(
+            &free_key(0x70 + i),
+            "/v1/forum/login",
+            &bound_body(&page.sid()),
+            unix_now(),
+            [i; 16],
+        );
+        answers.push(send(&app, request).await.status);
+        let unknown = signed_post(
+            &free_key(0x70 + i),
+            "/v1/forum/login",
+            &bound_body(&"ab".repeat(16)),
+            unix_now(),
+            [0x80 + i; 16],
+        );
+        answers.push(send(&app, unknown).await.status);
+    }
+
+    assert_eq!(
+        answers,
+        [403, 404].repeat(8),
+        "every one is refused by the paywall or the session, never by a full store"
+    );
+    assert_eq!(state.nonces.held(), 0, "none of them holds a nonce");
+    let (key, _) = paid_signer();
+    mark_paid(&state, &key);
+    let page = open_sso(&app, "n-flood-paid", None).await;
+    let paid = send(&app, signed_bound_login(&key, &page.sid(), [0x90; 16])).await;
+    assert_eq!(paid.status, 200, "and a paying wallet still signs in");
+}
+
+#[tokio::test]
+async fn a_full_replay_store_refuses_a_paid_login() {
+    // The cap still fails closed, now for the admitted population only.
+    let state = build_state(Setup {
+        nonce_cap: Some(2),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let (first, second, third) = (free_key(0x61), free_key(0x62), free_key(0x63));
+    for key in [&first, &second, &third] {
+        mark_paid(&state, key);
+    }
+    for (i, key) in [&first, &second].into_iter().enumerate() {
+        let page = open_sso(&app, &format!("n-full-{i}"), None).await;
+        let answer = send(&app, signed_bound_login(key, &page.sid(), [0x91; 16])).await;
+        assert_eq!(answer.status, 200);
+    }
+
+    let page = open_sso(&app, "n-full-last", None).await;
+    let answer = send(&app, signed_bound_login(&third, &page.sid(), [0x92; 16])).await;
+
+    assert_eq!(answer.status, 401, "{}", answer.body_utf8);
+    let status = send(&app, status_request(&page.sid(), Some(&page.cookie()))).await;
+    assert_eq!(
+        status.body_utf8, r#"{"status":"pending"}"#,
+        "nothing was approved"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_login_is_refused_by_its_session_before_admission() {
+    // The sid is in the signed body and a session takes one approval, so the
+    // session state refuses the replay before it reaches the replay store.
+    let app = router(paid_state());
+    let page = open_sso(&app, "n-replay-login", None).await;
+    let (key, _) = paid_signer();
+    let now = unix_now();
+    let first = send(
+        &app,
+        signed_post(
+            &key,
+            "/v1/forum/login",
+            &bound_body(&page.sid()),
+            now,
+            [0x93; 16],
+        ),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+
+    let replay = send(
+        &app,
+        signed_post(
+            &key,
+            "/v1/forum/login",
+            &bound_body(&page.sid()),
+            now,
+            [0x93; 16],
+        ),
+    )
+    .await;
+
+    assert_eq!(replay.status, 404, "{}", replay.body_utf8);
+    let confirm = send(
+        &app,
+        confirm_request(&page.sid(), Some(&page.cookie()), &completion_code(&first)),
+    )
+    .await;
+    assert_eq!(
+        confirm.body_utf8, r#"{"status":"approved"}"#,
+        "the first approval's code still completes the login"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_login_spends_no_nonce_and_its_replay_changes_nothing() {
+    // Three refusals end the session they name before any admission: the
+    // paywall, the legacy form and a clock outside the window. The sid is in
+    // the signed body and the first delivery already ended that session, so
+    // a replay has nothing left to act on and needs no nonce to be refused.
+    struct Refusal {
+        case: &'static str,
+        paid: bool,
+        legacy: bool,
+        skew_secs: u64,
+        first: u16,
+        replay: u16,
+        reason: &'static str,
+    }
+    let refusals = [
+        Refusal {
+            case: "never paid",
+            paid: false,
+            legacy: false,
+            skew_secs: 0,
+            first: 403,
+            replay: 404,
+            reason: "subscription_required",
+        },
+        Refusal {
+            case: "legacy form",
+            paid: true,
+            legacy: true,
+            skew_secs: 0,
+            first: 400,
+            replay: 404,
+            reason: "app_update_required",
+        },
+        Refusal {
+            case: "clock skew",
+            paid: true,
+            legacy: false,
+            skew_secs: 120,
+            first: 401,
+            replay: 401,
+            reason: "clock_skew",
+        },
+    ];
+    let (key, _) = paid_signer();
+    for refusal in refusals {
+        let case = refusal.case;
+        let state = build_state(Setup::default());
+        if refusal.paid {
+            mark_paid(&state, &key);
+        }
+        let app = router(state.clone());
+        let page = open_sso(&app, "n-refused", None).await;
+        let body = if refusal.legacy {
+            format!(r#"{{"sid":"{}"}}"#, page.sid())
+        } else {
+            bound_body(&page.sid())
+        };
+        let at = unix_now() - refusal.skew_secs;
+        let request = || signed_post(&key, "/v1/forum/login", &body, at, [0x94; 16]);
+
+        let first = send(&app, request()).await;
+        let replay = send(&app, request()).await;
+
+        assert_eq!(first.status, refusal.first, "{case}: {}", first.body_utf8);
+        assert_eq!(
+            replay.status, refusal.replay,
+            "{case}: {}",
+            replay.body_utf8
+        );
+        let status = send(&app, status_request(&page.sid(), Some(&page.cookie()))).await;
+        assert_eq!(
+            status.body_utf8,
+            format!(r#"{{"reason":"{}","status":"cancelled"}}"#, refusal.reason),
+            "{case}"
+        );
+        assert_eq!(state.nonces.held(), 0, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn notification_calls_from_wallets_with_no_forum_link_spend_no_nonce() {
+    let state = build_state(Setup {
+        nonce_cap: Some(4),
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+
+    let mut answers = Vec::new();
+    for i in 0..8u8 {
+        for (path, nonce) in [
+            ("/v1/forum/notifications", [i; 16]),
+            ("/v1/forum/notifications/seen", [0x40 + i; 16]),
+        ] {
+            let request = signed_post(&free_key(0x70 + i), path, "{}", unix_now(), nonce);
+            answers.push(send(&app, request).await.body_utf8);
+        }
+    }
+
+    assert_eq!(
+        answers,
+        [r#"{"notifications":[]}"#, r#"{"seen":false}"#].repeat(8),
+        "an unlinked wallet gets its empty answer, never a full store"
+    );
+    assert_eq!(state.nonces.held(), 0);
+    let (key, _) = paid_signer();
+    mark_paid(&state, &key);
+    let page = open_sso(&app, "n-flood-notif", None).await;
+    let paid = send(&app, signed_bound_login(&key, &page.sid(), [0x95; 16])).await;
+    assert_eq!(paid.status, 200, "and a paying wallet still signs in");
+}
+
+#[tokio::test]
+async fn a_replayed_notification_call_is_refused() {
+    // The linked wallet's first call is admitted and reaches Discourse, which
+    // this suite cannot answer (404). Its replay never gets that far.
+    let state = build_state(Setup {
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    mark_linked(&state, &key);
+
+    for (path, nonce) in [
+        ("/v1/forum/notifications", [0x96; 16]),
+        ("/v1/forum/notifications/seen", [0x97; 16]),
+    ] {
+        let now = unix_now();
+        let first = send(&app, signed_post(&key, path, "{}", now, nonce)).await;
+        let replay = send(&app, signed_post(&key, path, "{}", now, nonce)).await;
+
+        assert_eq!(first.status, 404, "{path}: admitted, then Discourse failed");
+        assert_eq!(replay.status, 401, "{path}: {}", replay.body_utf8);
+        assert_eq!(replay.body_utf8, "nonce rejected", "{path}");
+    }
 }

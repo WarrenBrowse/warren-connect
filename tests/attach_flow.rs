@@ -234,6 +234,14 @@ fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
 }
 
 fn test_state_with_identity(forum_api: Option<ForumApi>, identity: IdentityStore) -> Arc<AppState> {
+    build_state(forum_api, identity, NonceStore::default())
+}
+
+fn build_state(
+    forum_api: Option<ForumApi>,
+    identity: IdentityStore,
+    nonces: NonceStore,
+) -> Arc<AppState> {
     let lazy = unreachable_pool();
     Arc::new(AppState {
         connect_secret: b"a-test-connect-secret-32-bytes!!".to_vec(),
@@ -249,7 +257,7 @@ fn test_state_with_identity(forum_api: Option<ForumApi>, identity: IdentityStore
         digest_generation: Default::default(),
         sessions: SessionStore::default(),
         legacy_approval: Default::default(),
-        nonces: NonceStore::default(),
+        nonces,
         attach: AttachStore::default(),
         forum_api,
         intake: None,
@@ -278,12 +286,21 @@ fn gz_b64(text: &str) -> String {
 }
 
 fn signed_attach_request(key: &SigningKey, body: &str, nonce: [u8; 16]) -> Request<Body> {
+    signed_attach_request_at(key, body, now_unix(), nonce)
+}
+
+fn signed_attach_request_at(
+    key: &SigningKey,
+    body: &str,
+    timestamp: u64,
+    nonce: [u8; 16],
+) -> Request<Body> {
     let s = sign_request(
         key,
         "POST",
         "/v1/forum/attach-logs",
         body.as_bytes(),
-        now_unix(),
+        timestamp,
         nonce,
     );
     Request::post("/v1/forum/attach-logs")
@@ -2695,5 +2712,143 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         &observe(response).await,
         &v.responses.attach.get("feature_disabled"),
         "attach.feature_disabled",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Replay store: only an upload the route admits (a linked wallet parking its
+// report, the topic's author delivering) spends a nonce.
+// ---------------------------------------------------------------------------
+
+fn upload_body(sid: &str, topic_id: u64) -> String {
+    format!(
+        r#"{{"sid":"{sid}","topic_id":{topic_id},"log_gz_b64":"{}"}}"#,
+        gz_b64(REPORT)
+    )
+}
+
+/// The same signed upload, byte for byte, each time it is called.
+fn replayable_upload(key: &SigningKey, sid: &str, topic_id: u64) -> impl Fn() -> Request<Body> {
+    let (key, body, at) = (key.clone(), upload_body(sid, topic_id), now_unix());
+    move || signed_attach_request_at(&key, &body, at, [0x55; 16])
+}
+
+async fn send(state: &Arc<AppState>, request: Request<Body>) -> forum_vector::Answer {
+    observe(
+        router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("infallible"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn uploads_the_route_refuses_spend_no_nonce() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = build_state(
+        Some(ForumApi::new(
+            &url,
+            "k".into(),
+            "system".into(),
+            "staff".into(),
+        )),
+        IdentityStore::Memory(MemoryIdentity::default()),
+        NonceStore::with_max_entries(4),
+    );
+    link(&state, &key).await;
+    let topic_sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+
+    let mut answers = Vec::new();
+    for i in 0..8u8 {
+        let stranger = SigningKey::from_bytes(&[0x70 + i; 32]);
+        let pre_sid = new_pre_sid(state.clone()).await;
+        let unlinked = signed_attach_request(&stranger, &upload_body(&pre_sid, 0), [i; 16]);
+        answers.push(send(&state, unlinked).await.body_utf8);
+        let not_author =
+            signed_attach_request(&stranger, &upload_body(&topic_sid, 42), [0x40 + i; 16]);
+        answers.push(send(&state, not_author).await.body_utf8);
+    }
+
+    assert_eq!(
+        answers,
+        vec![r#"{"error":"not_author"}"#; 16],
+        "an unlinked uploader and a non-author are refused by their gate, never by a full store"
+    );
+    assert_eq!(state.nonces.held(), 0);
+    let sid = new_pre_sid(state.clone()).await;
+    let parked = send(
+        &state,
+        signed_attach_request(&key, &upload_body(&sid, 0), [0x50; 16]),
+    )
+    .await;
+    assert_eq!(
+        parked.body_utf8, r#"{"status":"received"}"#,
+        "and a linked wallet still parks its report"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_pre_topic_upload_is_refused() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    link(&state, &key).await;
+    let sid = new_pre_sid(state.clone()).await;
+    let request = replayable_upload(&key, &sid, 0);
+
+    let first = send(&state, request()).await;
+    let replay = send(&state, request()).await;
+
+    assert_eq!(first.body_utf8, r#"{"status":"received"}"#);
+    assert_eq!(
+        (replay.status, replay.body_utf8.as_str()),
+        (401, "nonce rejected")
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_topic_upload_is_refused_while_its_session_stays_retryable() {
+    // A delivery Discourse failed leaves the session open for the app's own
+    // retry, which signs afresh. The captured request does not get a second go.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), false).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+    let request = replayable_upload(&key, &sid, 42);
+
+    let first = send(&state, request()).await;
+    let replay = send(&state, request()).await;
+
+    assert_eq!(first.status, 502, "{}", first.body_utf8);
+    assert_eq!(
+        (replay.status, replay.body_utf8.as_str()),
+        (401, "nonce rejected")
+    );
+    let retry = send(
+        &state,
+        signed_attach_request(&key, &upload_body(&sid, 42), [0x56; 16]),
+    )
+    .await;
+    assert_eq!(
+        retry.status, 502,
+        "a freshly signed retry is still admitted"
     );
 }

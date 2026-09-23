@@ -25,7 +25,7 @@ use crate::sessions::{
     SESSION_TTL_SECS, SessionStatus, SessionStore,
 };
 use crate::ticket::TicketKey;
-use crate::verify::{SignedHeaders, verify_signed_request};
+use crate::verify::{SignedHeaders, VerifiedRequest, verify_signed_request};
 use crate::{handle, pages, store};
 
 /// Shared application state.
@@ -668,10 +668,7 @@ async fn forum_login(
             return Err(err);
         }
     };
-    request.admit(&state.nonces, now).inspect_err(|err| {
-        tracing::debug!(error = %err, "forum login auth refused");
-    })?;
-    let identity = request.identity;
+    let identity = &request.identity;
 
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
     let form = LoginForm::of(login.login_version)?;
@@ -686,7 +683,7 @@ async fn forum_login(
         return Err(AuthError::Session);
     }
     if form == LoginForm::Legacy
-        && let Err(refusal) = legacy_admission(&state, &identity).await
+        && let Err(refusal) = legacy_admission(&state, identity).await
     {
         // The browser page tells the user to update the app; the app itself
         // predates this answer and shows a generic failure.
@@ -701,7 +698,11 @@ async fn forum_login(
         return Err(AuthError::AppUpdateRequired);
     }
 
-    let admitted = match admit_forum_identity(&state, &identity).await {
+    // The legacy refusal above and the paywall below end the session the
+    // signed body names without taking a nonce: once ended, that session no
+    // longer awaits an approval, so a replay stops at the check above, and
+    // whoever holds the sid can end it anyway through the unsigned cancel.
+    let admitted = match admit_forum_identity(&state, &request).await {
         Ok(admitted) => admitted,
         Err(AdmitError::NeverPaid) => {
             // Tell the browser so its approval page stops polling and explains why.
@@ -709,6 +710,13 @@ async fn forum_login(
                 .sessions
                 .cancel(&login.sid, CancelReason::SubscriptionRequired, now);
             return Err(AuthError::SubscriptionRequired);
+        }
+        Err(AdmitError::Nonce) => {
+            tracing::info!(
+                pubkey = %redact(&identity.pubkey_ss58),
+                "forum login refused: nonce not admitted"
+            );
+            return Err(AuthError::Nonce);
         }
         Err(AdmitError::Store) => return Err(AuthError::Session),
     };
@@ -769,18 +777,22 @@ struct AdmittedIdentity {
 enum AdmitError {
     /// Never paid and not staff: the anti-sybil paywall.
     NeverPaid,
+    /// Past the paywall, the nonce was not admitted: a replay, or the replay
+    /// store refused it.
+    Nonce,
     /// The link could not be recorded (database).
     Store,
 }
 
 /// The one admission path of a wallet-signed forum identity, shared by the
-/// login and the in-app report: the ever-paid gate, the link upsert and the
-/// digest slot. Two routes with two copies of this block would be two gates
-/// that can drift apart.
+/// login and the in-app report: the ever-paid gate, the nonce, the link upsert
+/// and the digest slot. Two routes with two copies of this block would be two
+/// gates that can drift apart.
 async fn admit_forum_identity(
     state: &AppState,
-    identity: &crate::verify::VerifiedIdentity,
+    request: &VerifiedRequest,
 ) -> Result<AdmittedIdentity, AdmitError> {
+    let identity = &request.identity;
     // Staff is an allowlist, independent of payment: admins are operators and
     // must not be locked out of their own forum by the paywall.
     let admin = state.admins.is_admin(&identity.pubkey_ss58);
@@ -804,6 +816,9 @@ async fn admit_forum_identity(
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);
     }
+    request
+        .admit(&state.nonces, now_unix())
+        .map_err(|_| AdmitError::Nonce)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
     state
@@ -907,8 +922,7 @@ async fn forum_notifications(
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
     let request = verify_signed_request(&signed, "POST", "/v1/forum/notifications", &body, now)?;
-    request.admit(&state.nonces, now)?;
-    let identity = request.identity;
+    let identity = &request.identity;
     let discourse_pool = state
         .discourse_pool
         .as_ref()
@@ -926,6 +940,7 @@ async fn forum_notifications(
     if !linked {
         return Ok(Json(serde_json::json!({ "notifications": [] })).into_response());
     }
+    request.admit(&state.nonces, now_unix())?;
 
     let rows = store::notifications_for_username(
         discourse_pool,
@@ -989,8 +1004,7 @@ async fn forum_notifications_seen(
     let now = now_unix();
     let request =
         verify_signed_request(&signed, "POST", "/v1/forum/notifications/seen", &body, now)?;
-    request.admit(&state.nonces, now)?;
-    let identity = request.identity;
+    let identity = &request.identity;
     let seen_pool = state.seen_pool.as_ref().ok_or(AuthError::FeatureDisabled)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
@@ -1007,6 +1021,7 @@ async fn forum_notifications_seen(
         // Discourse is not touched at all.
         return Ok(Json(serde_json::json!({ "seen": false })).into_response());
     }
+    request.admit(&state.nonces, now_unix())?;
 
     store::mark_seen_for_username(seen_pool, &forum.username)
         .await
@@ -1303,8 +1318,7 @@ async fn forum_attach_logs(
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
     let request = verify_signed_request(&signed, "POST", "/v1/forum/attach-logs", &body, now)?;
-    request.admit(&state.nonces, now)?;
-    let identity = request.identity;
+    let identity = &request.identity;
 
     // Every refusal below reaches the reporter as a generic failure, so each
     // branch names itself here: without this, four attach attempts against a
@@ -1331,7 +1345,13 @@ async fn forum_attach_logs(
     // Pre-topic session: no topic exists yet, so the report is parked in the
     // session (with the signer's handle for the author check at bind time).
     if kind == AttachKind::PreTopic {
-        admit_pre_topic_signer(&state, &identity, &forum).await?;
+        admit_pre_topic_signer(&state, identity, &forum).await?;
+        request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+            tracing::info!(
+                pubkey = %redact(&identity.pubkey_ss58),
+                "attach-logs refused: nonce not admitted"
+            );
+        })?;
         let (log_text, (version, os)) =
             decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
         state
@@ -1368,6 +1388,12 @@ async fn forum_attach_logs(
         );
         return Err(AuthError::NotAuthor);
     }
+    request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+        tracing::info!(
+            topic_id = req.topic_id,
+            "attach-logs refused: nonce not admitted"
+        );
+    })?;
 
     let (log_text, meta) =
         decode_report(&req.log_gz_b64, &identity.pubkey_ss58, Some(req.topic_id))?;
@@ -1655,7 +1681,6 @@ async fn forum_report(
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
     let request = verify_signed_request(&signed, "POST", "/v1/forum/report", &body, now)
-        .and_then(|request| request.admit(&state.nonces, now).map(|()| request))
         .inspect_err(|err| {
             if matches!(err, AuthError::Clock) {
                 tracing::info!(
@@ -1666,7 +1691,7 @@ async fn forum_report(
                 tracing::debug!(error = %err, "report auth refused");
             }
         })?;
-    let identity = request.identity;
+    let identity = &request.identity;
 
     let req: crate::report::ReportRequest = serde_json::from_slice(&body).map_err(|_| {
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "report refused: body is not valid JSON");
@@ -1674,14 +1699,23 @@ async fn forum_report(
     })?;
     crate::report::validate(&req)?;
 
-    let admitted = admit_forum_identity(&state, &identity)
+    let admitted = admit_forum_identity(&state, &request)
         .await
         .map_err(|err| match err {
             AdmitError::NeverPaid => AuthError::SubscriptionRequired,
+            AdmitError::Nonce => {
+                tracing::info!(
+                    pubkey = %redact(&identity.pubkey_ss58),
+                    "report refused: nonce not admitted"
+                );
+                AuthError::Nonce
+            }
             AdmitError::Store => AuthError::Forum,
         })?;
     // Charged after the signature and the gate: a forged or never-paid
-    // request must not burn a member's budget.
+    // request must not burn a member's budget. After the nonce too: the
+    // budget refuses only for a while, and a request it refused must not be
+    // filed by whoever replays it once the window has moved on.
     let wallet = admitted.forum.external_id.as_str();
     report_state.limiter.admit(wallet.to_owned(), now)?;
 

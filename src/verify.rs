@@ -5,7 +5,8 @@
 //! and the Ed25519 check mirror the production `WarrenAuthVerifier`
 //! (warren-core). The nonce is spent in a step of its own,
 //! [`VerifiedRequest::admit`], which only a proven signature can reach, so a
-//! garbage signature cannot burn a victim's nonce.
+//! garbage signature cannot burn a victim's nonce, and which each route takes
+//! only once it has decided to act on the request.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -17,6 +18,18 @@ use crate::nonces::NonceStore;
 /// Accepted clock skew between client and server, seconds. Mirrors the
 /// production API window.
 pub const TIMESTAMP_WINDOW_SECS: u64 = 60;
+
+/// How long after its signed timestamp a request may still be admitted, and
+/// so how long its nonce is remembered.
+///
+/// A route admits a request after its gate, which reads the database or the
+/// forum, so admission can come well after the verification the clock window
+/// bounds. Its twin has to be remembered until then, or a replay verified at
+/// the end of the window would find it forgotten. Twice the window on top of
+/// it covers the slowest gate at its timeouts: three database pool waits in a
+/// row on a legacy login (30 s each), or one forum fetch on an attach (60 s).
+/// A request whose gate took longer is refused.
+pub const ADMISSION_HORIZON_SECS: u64 = 3 * TIMESTAMP_WINDOW_SECS;
 
 /// The four raw header values of a signed request.
 #[derive(Debug, Clone)]
@@ -41,25 +54,53 @@ pub struct VerifiedIdentity {
 }
 
 /// A request whose signature is proven and whose nonce is not spent yet.
-#[derive(Debug)]
 pub struct VerifiedRequest {
     /// The wallet that signed it.
     pub identity: VerifiedIdentity,
     nonce_hex: String,
+    timestamp: u64,
 }
 
 impl VerifiedRequest {
-    /// Spends the request's nonce.
+    /// Spends the request's nonce. A route calls it once it has decided to act
+    /// on the request, past its own gate (paywall, forum link, topic author)
+    /// and before its first side effect, so each signed request is acted on at
+    /// most once. A request the gate refuses spends nothing, and the wallets no
+    /// gate admits, which cost nothing to mint, never reach the store. A
+    /// refusal whose cause changes while the signature is still valid (a read
+    /// that failed recovers, the wallet pays or gains its forum link) leaves
+    /// that request admissible once after the change.
+    ///
+    /// `now_unix` is the time of admission, read after the gate.
     ///
     /// # Errors
-    /// [`AuthError::Nonce`] on a replay, when the wallet is over its budget,
-    /// or when the store is full.
+    /// [`AuthError::Nonce`] on a replay, past [`ADMISSION_HORIZON_SECS`], when
+    /// the wallet is over its budget, or when the store is full.
     pub fn admit(&self, nonces: &NonceStore, now_unix: u64) -> Result<(), AuthError> {
-        if nonces.check_and_store(&self.identity.pubkey_ss58, &self.nonce_hex, now_unix) {
+        if nonces.check_and_store(
+            &self.identity.pubkey_ss58,
+            &self.nonce_hex,
+            self.timestamp,
+            now_unix,
+        ) {
             Ok(())
         } else {
             Err(AuthError::Nonce)
         }
+    }
+}
+
+/// Renders the signer redacted and leaves the nonce out: request
+/// authenticator material stays out of every log line, as `tests/log_privacy.rs`
+/// requires of the source.
+impl std::fmt::Debug for VerifiedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedRequest")
+            .field(
+                "signer",
+                &warren_contract::redact(&self.identity.pubkey_ss58),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,6 +167,7 @@ pub fn verify_signed_request(
             pubkey_ss58,
         },
         nonce_hex: headers.nonce_hex.clone(),
+        timestamp: headers.timestamp,
     })
 }
 
@@ -175,13 +217,83 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_stale_timestamp() {
+    fn the_clock_window_is_sixty_seconds_either_way() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
 
-        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000 + 61)
-            .expect_err("61 s of skew is outside the window");
-        assert!(matches!(err, AuthError::Clock));
+        for now in [1_000 - 60, 1_000 + 60] {
+            verify_signed_request(&h, "POST", "/p", b"", now)
+                .unwrap_or_else(|err| panic!("{now}: 60 s of skew is inside the window: {err}"));
+        }
+        for now in [1_000 - 61, 1_000 + 61] {
+            let err = verify_signed_request(&h, "POST", "/p", b"", now)
+                .expect_err("61 s of skew is outside the window");
+            assert!(matches!(err, AuthError::Clock), "{now}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_nonce_is_remembered_for_as_long_as_its_request_can_be_admitted() {
+        // The twin reaches the server at the first second its timestamp is
+        // valid and is admitted at once. The replay reaches it at the last
+        // second, and its route reads the database and the forum for two
+        // minutes before admitting it.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
+        let nonces = NonceStore::default();
+        let earliest = 1_000 - TIMESTAMP_WINDOW_SECS;
+        verify_signed_request(&h, "POST", "/p", b"", earliest)
+            .expect("the twin verifies")
+            .admit(&nonces, earliest)
+            .expect("and is admitted");
+
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000 + TIMESTAMP_WINDOW_SECS)
+            .expect("the replay verifies at the last second of the window")
+            .admit(&nonces, 1_000 + ADMISSION_HORIZON_SECS)
+            .expect_err("its twin must still be remembered when it reaches admission");
+        assert!(matches!(err, AuthError::Nonce));
+    }
+
+    #[test]
+    fn a_request_is_admitted_up_to_two_minutes_after_its_window_and_not_after() {
+        // Between verification and admission the slowest gate waits on the
+        // database pool three times (30 s each) or on the forum once (60 s),
+        // so a request verified at the last second of its window is still
+        // admitted two minutes later. Past that its twin may already be
+        // forgotten, and admitting it could admit a replay.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let nonces = NonceStore::default();
+        let on_time = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
+        verify_signed_request(&on_time, "POST", "/p", b"", 1_060)
+            .expect("verifies at the last second of the window")
+            .admit(&nonces, 1_180)
+            .expect("admitted two minutes later");
+
+        let too_late = signed(&key, "POST", "/p", b"", 1_000, [2; 16]);
+        let err = verify_signed_request(&too_late, "POST", "/p", b"", 1_060)
+            .expect("verifies")
+            .admit(&nonces, 1_181)
+            .expect_err("one second later it is refused");
+        assert!(matches!(err, AuthError::Nonce));
+        assert_eq!(nonces.held(), 1, "and stores nothing for it");
+    }
+
+    #[test]
+    fn a_verified_request_renders_neither_its_nonce_nor_its_full_signer() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let h = signed(&key, "POST", "/p", b"", 1_000, [0xab; 16]);
+
+        let rendered = format!(
+            "{:?}",
+            verify_signed_request(&h, "POST", "/p", b"", 1_000).expect("verifies")
+        );
+
+        assert!(!rendered.contains(&h.nonce_hex), "{rendered}");
+        assert!(!rendered.contains(&h.pubkey_ss58), "{rendered}");
+        assert!(
+            rendered.contains(&warren_contract::redact(&h.pubkey_ss58)),
+            "the redacted signer is what an incident needs: {rendered}"
+        );
     }
 
     #[test]

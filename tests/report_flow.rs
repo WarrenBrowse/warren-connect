@@ -194,6 +194,22 @@ fn state_with(
     paid_ss58: Option<&str>,
     per_wallet: usize,
 ) -> Arc<AppState> {
+    state_with_nonces(
+        handle_secret,
+        stub_url,
+        paid_ss58,
+        per_wallet,
+        NonceStore::default(),
+    )
+}
+
+fn state_with_nonces(
+    handle_secret: &[u8],
+    stub_url: Option<&str>,
+    paid_ss58: Option<&str>,
+    per_wallet: usize,
+    nonces: NonceStore,
+) -> Arc<AppState> {
     let lazy = PgPoolOptions::new()
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
         .expect("lazy pool never dials at build time");
@@ -239,7 +255,7 @@ fn state_with(
         digest_generation: Default::default(),
         sessions: SessionStore::default(),
         legacy_approval: Default::default(),
-        nonces: NonceStore::default(),
+        nonces,
         attach: AttachStore::default(),
         forum_api,
         intake: None,
@@ -1293,4 +1309,110 @@ async fn the_report_vector_pins_the_payload_too_large_answer() {
         "report.payload_too_large",
     );
     assert!(ops(&stub).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Replay store: only a report the gate admits spends a nonce, and it spends
+// it before the per-wallet budget, whose refusal does not last.
+// ---------------------------------------------------------------------------
+
+async fn send(state: &Arc<AppState>, request: Request<Body>) -> axum::response::Response {
+    warren_connect::routes::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("response")
+}
+
+fn topics_created(stub: &StubState) -> usize {
+    ops(stub).iter().filter(|op| *op == "topic_create").count()
+}
+
+#[tokio::test]
+async fn reports_from_wallets_that_never_paid_spend_no_nonce() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let paid = signer(1);
+    let paid_ss58 = warren_contract::ss58::encode(&paid.verifying_key().to_bytes());
+    let state = state_with_nonces(
+        HANDLE_SECRET,
+        Some(&url),
+        Some(&paid_ss58),
+        3,
+        NonceStore::with_max_entries(4),
+    );
+
+    let mut statuses = Vec::new();
+    for i in 0..8u8 {
+        let request = signed_report(&signer(0x70 + i), &report_body(None), [i; 16], now_unix());
+        statuses.push(send(&state, request).await.status());
+    }
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::FORBIDDEN; 8],
+        "each is refused by the paywall, never by a full store"
+    );
+    assert_eq!(state.nonces.held(), 0);
+    let admitted = send(
+        &state,
+        signed_report(&paid, &report_body(None), [0x50; 16], now_unix()),
+    )
+    .await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::CREATED,
+        "and a paying wallet still files its report"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_report_opens_no_second_topic() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(1);
+    let state = test_state(Some(&url), Some(&key), 3);
+    let (body, at) = (report_body(None), now_unix());
+
+    let first = send(&state, signed_report(&key, &body, [0x51; 16], at)).await;
+    let replay = send(&state, signed_report(&key, &body, [0x51; 16], at)).await;
+
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(topics_created(&stub), 1);
+}
+
+#[tokio::test]
+async fn a_report_over_its_budget_spends_its_nonce_so_its_replay_cannot_outwait_the_budget() {
+    // The budget refuses for a while, then admits again. A captured request
+    // it refused must not be filed by whoever replays it once the window has
+    // moved on, after its wallet already filed the report with a fresh one.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(1);
+    let state = test_state(Some(&url), Some(&key), 1);
+    let at = now_unix();
+    let filed = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x52; 16], at),
+    )
+    .await;
+    assert_eq!(filed.status(), StatusCode::CREATED);
+
+    let over = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x53; 16], at),
+    )
+    .await;
+    let replay = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x53; 16], at),
+    )
+    .await;
+
+    assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        replay.status(),
+        StatusCode::UNAUTHORIZED,
+        "refused as a replay, which lasts, rather than by the budget, which does not"
+    );
 }
