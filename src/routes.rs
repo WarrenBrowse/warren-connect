@@ -1108,7 +1108,7 @@ async fn forum_notifications(
     .await
     .map_err(|e| {
         tracing::error!(kind = ?sqlx_error_kind(&e), "notifications: query failed");
-        AuthError::Session
+        AuthError::Forum
     })?;
 
     let items: Vec<serde_json::Value> = rows
@@ -1176,7 +1176,7 @@ async fn forum_notifications_seen(
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "seen: update failed");
-            AuthError::Session
+            AuthError::Forum
         })?;
 
     // No handle and no bookmark value: both identify the account.

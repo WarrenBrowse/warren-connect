@@ -2383,7 +2383,7 @@ async fn notification_calls_from_wallets_with_no_forum_link_spend_no_nonce() {
 #[tokio::test]
 async fn a_replayed_notification_call_is_refused() {
     // The linked wallet's first call is admitted and reaches Discourse, which
-    // this suite cannot answer (404). Its replay never gets that far.
+    // this suite cannot answer (502). Its replay never gets that far.
     let state = build_state(Setup {
         discourse_wired: true,
         ..Setup::default()
@@ -2400,7 +2400,7 @@ async fn a_replayed_notification_call_is_refused() {
         let first = send(&app, signed_post(&key, path, "{}", now, nonce)).await;
         let replay = send(&app, signed_post(&key, path, "{}", now, nonce)).await;
 
-        assert_eq!(first.status, 404, "{path}: admitted, then Discourse failed");
+        assert_eq!(first.status, 502, "{path}: admitted, then Discourse failed");
         assert_eq!(replay.status, 401, "{path}: {}", replay.body_utf8);
         assert_eq!(replay.body_utf8, "nonce rejected", "{path}");
     }
@@ -2850,7 +2850,7 @@ async fn signing_in_forgets_that_the_wallet_had_no_forum_link() {
     .await;
 
     assert_eq!(
-        after.status, 404,
+        after.status, 502,
         "the link is read again and the call admitted, then Discourse, which this suite cannot \
          reach, fails: {}",
         after.body_utf8
