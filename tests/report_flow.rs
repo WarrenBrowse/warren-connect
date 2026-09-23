@@ -238,6 +238,7 @@ fn state_with(
         seen_pool: None,
         digest_generation: Default::default(),
         sessions: SessionStore::default(),
+        legacy_approval: Default::default(),
         nonces: NonceStore::default(),
         attach: AttachStore::default(),
         forum_api,

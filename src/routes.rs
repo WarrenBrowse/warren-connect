@@ -20,7 +20,10 @@ use crate::discourse::{self, SsoUser};
 use crate::error::AuthError;
 use crate::forum_api::{self, ForumApi};
 use crate::nonces::NonceStore;
-use crate::sessions::{SessionStatus, SessionStore};
+use crate::sessions::{
+    Approach, BrowserKey, BrowserSecret, CompletionCode, ConfirmOutcome, Consumed,
+    SESSION_TTL_SECS, SessionStatus, SessionStore,
+};
 use crate::ticket::TicketKey;
 use crate::verify::{SignedHeaders, verify_signed_request};
 use crate::{handle, pages, store};
@@ -60,6 +63,9 @@ pub struct AppState {
     pub digest_generation: crate::digest::GenerationStamp,
     /// Pending browser logins.
     pub sessions: SessionStore,
+    /// Whether an approval in the form that predates the completion code is
+    /// still accepted, from `WARREN_CONNECT_LEGACY_APPROVAL`.
+    pub legacy_approval: LegacyApproval,
     /// Anti-replay registry.
     pub nonces: NonceStore,
     /// Pending attach-logs sessions.
@@ -70,6 +76,105 @@ pub struct AppState {
     pub intake: Option<IntakeState>,
     /// In-app bug reports; `None` disables the report endpoint (503).
     pub report: Option<ReportState>,
+}
+
+/// Whether `POST /v1/forum/login` still accepts the approval form that
+/// predates the completion code (`WARREN_CONNECT_LEGACY_APPROVAL`).
+///
+/// That form carries no code, so the browser holding the cookie completes the
+/// login on its own, which is exactly the relayed-approval shape the code
+/// closes. `Allow` exists for the weeks the apps that predate the code are
+/// still installed, and even then it never admits a staff wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegacyApproval {
+    /// Refuse every legacy approval.
+    #[default]
+    Deny,
+    /// Accept a legacy approval from a wallet that is not staff.
+    Allow,
+}
+
+impl LegacyApproval {
+    /// Reads the setting. Unset or empty is [`Self::Deny`].
+    ///
+    /// # Errors
+    /// [`LegacyApprovalError`] for anything but `allow` or `deny`, so a typo
+    /// fails the start instead of silently picking one of the two.
+    pub fn parse(raw: Option<&str>) -> Result<Self, LegacyApprovalError> {
+        match raw.map(str::trim) {
+            None | Some("" | "deny") => Ok(Self::Deny),
+            Some("allow") => Ok(Self::Allow),
+            Some(_) => Err(LegacyApprovalError),
+        }
+    }
+}
+
+/// `WARREN_CONNECT_LEGACY_APPROVAL` holds something other than `allow` or
+/// `deny`.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("WARREN_CONNECT_LEGACY_APPROVAL must be `allow` or `deny`")]
+pub struct LegacyApprovalError;
+
+/// The cookie that binds a login to the browser that opened it. The
+/// `__Host-` prefix makes a browser refuse it unless it is `Secure`,
+/// host-only and `Path=/`, so no sibling subdomain can plant or overwrite it.
+pub const LOGIN_COOKIE: &str = "__Host-warren_login";
+
+/// What a request presented under [`LOGIN_COOKIE`].
+enum PresentedCookie {
+    /// No login cookie: the app, or a browser that never opened a login.
+    Absent,
+    /// A cookie of the shape this service mints.
+    Secret(BrowserSecret),
+    /// A login cookie of any other shape, which binds nothing.
+    Malformed,
+}
+
+fn presented_cookie(headers: &HeaderMap) -> PresentedCookie {
+    let mut named = false;
+    for value in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for pair in value.split(';') {
+            let Some((name, raw)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if name == LOGIN_COOKIE {
+                if let Some(secret) = BrowserSecret::parse(raw) {
+                    return PresentedCookie::Secret(secret);
+                }
+                named = true;
+            }
+        }
+    }
+    if named {
+        PresentedCookie::Malformed
+    } else {
+        PresentedCookie::Absent
+    }
+}
+
+/// The browser a browser-side login call comes from. Anything short of a
+/// well-formed login cookie is refused the way a stranger's cookie is.
+fn browser_key(headers: &HeaderMap) -> Result<BrowserKey, AuthError> {
+    match presented_cookie(headers) {
+        PresentedCookie::Secret(secret) => Ok(secret.key()),
+        PresentedCookie::Absent | PresentedCookie::Malformed => Err(AuthError::BrowserMismatch),
+    }
+}
+
+/// `Set-Cookie` for the login cookie. `Lax` keeps it on the top-level
+/// navigation back from the forum and off every cross-site subrequest;
+/// `HttpOnly` keeps it away from any script, the page's own included. It
+/// lives as long as a login does.
+fn login_cookie_header(secret: &BrowserSecret) -> axum::http::HeaderValue {
+    format!(
+        "{LOGIN_COOKIE}={}; Max-Age={SESSION_TTL_SECS}; Path=/; Secure; HttpOnly; SameSite=Lax",
+        secret.as_str()
+    )
+    .parse()
+    .expect("the cookie is ASCII by construction")
 }
 
 /// Everything the in-app report endpoint needs; absent = feature disabled.
@@ -125,17 +230,19 @@ fn login_allowed(ever_paid: bool, is_admin: bool) -> bool {
     ever_paid || is_admin
 }
 
-/// Whether this login may assert staff to Discourse.
+/// Whether this login may assert staff to Discourse: an allowlisted wallet,
+/// approving in the bound form, on the same-device id. The bound form means
+/// the browser completing it had to present the code this approval returned,
+/// so the claim reaches only the browser the wallet approved.
 ///
 /// The allowlist is a bootstrap floor, and Discourse keeps a grant it already
 /// holds because an ordinary login omits the field entirely. So withholding
 /// the claim on a cross-device approval costs an operator nothing: signing in
 /// from their phone still logs them in, still passes the paywall, and still
 /// finds them admin on the forum. What it removes is the ability to MINT staff
-/// through a link somebody else relayed to them, which is the whole payload of
-/// the QR-phishing path.
-fn staff_claim(is_admin: bool, approach: crate::sessions::Approach) -> bool {
-    is_admin && approach == crate::sessions::Approach::SameDevice
+/// through a link somebody else relayed to them.
+fn staff_claim(is_admin: bool, approach: Approach, form: LoginForm) -> bool {
+    is_admin && approach == Approach::SameDevice && form == LoginForm::Bound
 }
 
 /// Content-Security-Policy of the server-rendered pages.
@@ -280,7 +387,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/v1/session/{sid}/status", get(session_status))
         .route("/v1/session/{sid}/cancel", post(session_cancel))
+        .route(
+            "/v1/session/{sid}/confirm",
+            // The body is `{"code":"<6 digits>"}`.
+            post(session_confirm).layer(axum::extract::DefaultBodyLimit::max(256)),
+        )
         .route("/v1/session/{sid}/complete", get(session_complete))
+        .route("/handoff", get(handoff))
         .route("/attach", get(attach_entry))
         .route(
             "/v1/forum/attach-logs",
@@ -336,14 +449,34 @@ async fn sso_entry(
         &state.connect_secret,
         crate::FORUM_PUBLIC_URL,
     )?;
-    let ids = state
-        .sessions
-        .create(incoming.nonce, incoming.return_sso_url, now_unix())?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    Ok(html_page(
+    // A browser keeps one secret across the logins it opens, so a refresh and
+    // a second tab stay bound to the session they already have.
+    let secret = match presented_cookie(&headers) {
+        PresentedCookie::Secret(secret) => secret,
+        PresentedCookie::Absent | PresentedCookie::Malformed => BrowserSecret::generate(),
+    };
+    let ids = match state.sessions.create(
+        incoming.nonce,
+        incoming.return_sso_url,
+        &secret.key(),
+        now_unix(),
+    ) {
+        Ok(ids) => ids,
+        Err(AuthError::BrowserMismatch) => {
+            let mut page = html_page(|nonce| pages::started_elsewhere_page(lang, nonce), false);
+            *page.status_mut() = StatusCode::FORBIDDEN;
+            return Ok(page);
+        }
+        Err(err) => return Err(err),
+    };
+    let mut page = html_page(
         |nonce| pages::approval_page(lang, &ids, &state.public_host, nonce),
         false,
-    ))
+    );
+    page.headers_mut()
+        .insert(axum::http::header::SET_COOKIE, login_cookie_header(&secret));
+    Ok(page)
 }
 
 /// Extracts the raw `User-Agent` header value, if present and valid UTF-8.
@@ -372,6 +505,101 @@ fn accept_language(headers: &HeaderMap) -> Option<&str> {
 #[derive(Deserialize)]
 struct LoginBody {
     sid: String,
+    /// `2` for a bound approval, absent in the form that predates the
+    /// completion code. Part of the signed body, so a relay cannot strip it.
+    #[serde(default)]
+    login_version: Option<u32>,
+}
+
+/// The two approval forms `POST /v1/forum/login` knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginForm {
+    /// `login_version: 2`: the answer carries a completion code the browser
+    /// must present.
+    Bound,
+    /// No `login_version`: the apps that predate the completion code.
+    Legacy,
+}
+
+impl LoginForm {
+    /// # Errors
+    /// [`AuthError::Payload`] for a version this service does not speak: a
+    /// newer client is never silently served an older form.
+    fn of(version: Option<u32>) -> Result<Self, AuthError> {
+        match version {
+            None => Ok(Self::Legacy),
+            Some(2) => Ok(Self::Bound),
+            Some(_) => Err(AuthError::Payload),
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Why a legacy approval was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyRefusal {
+    /// The deployment accepts no legacy approval.
+    Disabled,
+    /// The wallet is staff, or its staff status could not be read.
+    Staff,
+}
+
+impl LegacyRefusal {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Staff => "staff",
+        }
+    }
+}
+
+/// The gate a legacy approval passes before anything is written for it.
+async fn legacy_admission(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+) -> Result<(), LegacyRefusal> {
+    if state.legacy_approval == LegacyApproval::Deny {
+        return Err(LegacyRefusal::Disabled);
+    }
+    if is_forum_staff(state, identity).await {
+        return Err(LegacyRefusal::Staff);
+    }
+    Ok(())
+}
+
+/// Staff for the legacy gate: on the allowlist, or admin or moderator of the
+/// wallet's forum account. Discourse keeps the grant of an account that is
+/// already staff whatever the login asserts, so the allowlist alone would
+/// miss every operator promoted from the admin UI. A status that cannot be
+/// read counts as staff: the gate fails closed.
+async fn is_forum_staff(state: &AppState, identity: &crate::verify::VerifiedIdentity) -> bool {
+    if state.admins.is_admin(&identity.pubkey_ss58) {
+        return true;
+    }
+    let forum = handle::derive(&state.handle_secret, &identity.pubkey);
+    match state.identity.forum_staff(&forum.username).await {
+        Ok(staff) => staff,
+        Err(err) => {
+            tracing::warn!(
+                kind = err.kind(),
+                "forum staff status unreadable: treated as staff"
+            );
+            true
+        }
+    }
+}
+
+/// Where the approving app sends its own browser after a same-device
+/// approval. The session id and the code ride in the fragment, which no
+/// browser sends to a server, so neither reaches an access log.
+fn handoff_url(host: &str, sid: &str, code: &CompletionCode) -> String {
+    format!("https://{host}/handoff#sid={sid}&code={}", code.as_str())
 }
 
 async fn forum_login(
@@ -419,16 +647,31 @@ async fn forum_login(
     };
 
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
+    let form = LoginForm::of(login.login_version)?;
 
     // Which of the session's two ids this approval arrived on. The QR is read
-    // from a second device, which is exactly the shape of a relayed
-    // (phished) approval, so nothing that GRANTS anything may ride on it.
+    // from a second device, so no staff claim rides on it.
     let (primary_sid, approach) = state.sessions.resolve(&login.sid, now)?;
-    // A cancelled session cannot be approved (the browser already gave up on
-    // it), so refuse here rather than after the lookup and the link upsert:
-    // a corrected retry after a clock-skew cancel is the common shape.
-    if state.sessions.is_cancelled(&primary_sid, now) {
+    // Only a login still waiting for its approval can take one, so refuse
+    // here rather than after the lookup and the link upsert: a corrected
+    // retry after a clock-skew cancel is the common shape.
+    if !state.sessions.awaits_approval(&primary_sid, now) {
         return Err(AuthError::Session);
+    }
+    if form == LoginForm::Legacy
+        && let Err(refusal) = legacy_admission(&state, &identity).await
+    {
+        // The browser page tells the user to update the app; the app itself
+        // predates this answer and shows a generic failure.
+        state
+            .sessions
+            .cancel(&primary_sid, "app_update_required", now);
+        tracing::info!(
+            pubkey = %redact(&identity.pubkey_ss58),
+            refusal = refusal.token(),
+            "forum login refused: legacy approval"
+        );
+        return Err(AuthError::AppUpdateRequired);
     }
 
     let admitted = match admit_forum_identity(&state, &identity).await {
@@ -446,28 +689,39 @@ async fn forum_login(
     // Kept before the payload moves `username` into the session: the approving
     // client gets its own handle back (see `login_approved_body`).
     let handle_for_client = admitted.forum.username.clone();
-    state.sessions.approve(
-        &primary_sid,
-        SsoUser {
-            external_id: admitted.forum.external_id,
-            username: admitted.forum.username,
-            email: admitted.forum.email,
-            member: admitted.status.ever_paid,
-            subscriber: admitted.status.active,
-            admin: staff_claim(admitted.admin, approach),
-        },
-        now,
-    )?;
+    let user = SsoUser {
+        external_id: admitted.forum.external_id,
+        username: admitted.forum.username,
+        email: admitted.forum.email,
+        member: admitted.status.ever_paid,
+        subscriber: admitted.status.active,
+        admin: staff_claim(admitted.admin, approach, form),
+    };
+    let body = match form {
+        LoginForm::Bound => {
+            let code = state.sessions.approve_bound(&primary_sid, user, now)?;
+            let handoff = (approach == Approach::SameDevice)
+                .then(|| handoff_url(&state.public_host, &primary_sid, &code));
+            bound_approved_body(
+                &handle_for_client,
+                admitted.notify_slot,
+                &code,
+                handoff.as_deref(),
+            )
+        }
+        LoginForm::Legacy => {
+            state.sessions.approve_legacy(&primary_sid, user, now)?;
+            login_approved_body(&handle_for_client, admitted.notify_slot)
+        }
+    };
 
-    tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum login approved");
-    Ok((
-        StatusCode::OK,
-        Json(login_approved_body(
-            &handle_for_client,
-            admitted.notify_slot,
-        )),
-    )
-        .into_response())
+    tracing::info!(
+        pubkey = %redact(&identity.pubkey_ss58),
+        form = form.token(),
+        cross_device = approach == Approach::CrossDevice,
+        "forum login approved"
+    );
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 /// A wallet that passed the forum gate, with everything the two admitting
@@ -584,6 +838,26 @@ fn identity_fields(
 /// costs the device its badge until the next login and nothing else.
 fn login_approved_body(handle: &str, notify_slot: Option<i32>) -> serde_json::Value {
     let mut body = identity_fields(handle, notify_slot);
+    body.insert("status".into(), "approved".into());
+    serde_json::Value::Object(body)
+}
+
+/// Body of a bound approval: the legacy body plus the `completion` object,
+/// which carries the code only this answer ever holds, and the handoff URL
+/// when the approval came from the same device as the browser.
+fn bound_approved_body(
+    handle: &str,
+    notify_slot: Option<i32>,
+    code: &CompletionCode,
+    handoff_url: Option<&str>,
+) -> serde_json::Value {
+    let mut completion = serde_json::Map::new();
+    completion.insert("code".into(), code.as_str().into());
+    if let Some(url) = handoff_url {
+        completion.insert("handoff_url".into(), url.into());
+    }
+    let mut body = identity_fields(handle, notify_slot);
+    body.insert("completion".into(), serde_json::Value::Object(completion));
     body.insert("status".into(), "approved".into());
     serde_json::Value::Object(body)
 }
@@ -767,9 +1041,10 @@ async fn forum_digest(
     ))
 }
 
-/// App-initiated cancel (the user declined the consent popup). No signature:
-/// the `sid` is a 128-bit opaque secret held only by the browser and the app,
-/// so cancelling by sid is not a meaningful attack surface.
+/// App-initiated cancel (the user declined the consent popup). No signature
+/// and no cookie: the app has neither, and a cancel only ever ends a login
+/// that still waits for its approval (see `SessionStore::cancel`), so holding
+/// an id buys nothing past that point. Answers the same for any id.
 async fn session_cancel(
     State(state): State<Arc<AppState>>,
     Path(sid): Path<String>,
@@ -778,26 +1053,120 @@ async fn session_cancel(
     Json(serde_json::json!({"status": "cancelled"}))
 }
 
-async fn session_status(
-    State(state): State<Arc<AppState>>,
-    Path(sid): Path<String>,
-) -> Result<Json<serde_json::Value>, AuthError> {
-    let status = state.sessions.status(&sid, now_unix())?;
-    Ok(Json(match status {
+/// The state document of a login, as the browser-side endpoints answer it.
+fn status_body(status: &SessionStatus) -> serde_json::Value {
+    match status {
         SessionStatus::Pending => serde_json::json!({ "status": "pending" }),
+        SessionStatus::AwaitingCode => serde_json::json!({ "status": "awaiting_code" }),
         SessionStatus::Approved => serde_json::json!({ "status": "approved" }),
+        SessionStatus::Completed => serde_json::json!({ "status": "completed" }),
         SessionStatus::Cancelled { reason } => {
             serde_json::json!({ "status": "cancelled", "reason": reason })
         }
-    }))
+    }
+}
+
+/// Two readers, told apart by the login cookie. The browser that opened the
+/// login presents it and gets the full state. The app reads this before it
+/// signs (the `Date` header corrects its clock) and presents no cookie: it
+/// gets `pending` while the login waits for an approval and 404 otherwise,
+/// which is no more than a signed approval would tell it.
+async fn session_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    let now = now_unix();
+    match presented_cookie(&headers) {
+        PresentedCookie::Absent => {
+            if state.sessions.awaits_approval(&sid, now) {
+                Ok(Json(status_body(&SessionStatus::Pending)))
+            } else {
+                Err(AuthError::Session)
+            }
+        }
+        PresentedCookie::Secret(secret) => Ok(Json(status_body(&state.sessions.status(
+            &sid,
+            &secret.key(),
+            now,
+        )?))),
+        PresentedCookie::Malformed => Err(AuthError::BrowserMismatch),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfirmBody {
+    code: String,
+}
+
+/// The browser presents the code its user read in the app, or the handoff
+/// page presents the one the app handed it.
+async fn session_confirm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Response, AuthError> {
+    // Same boundary as the guest intake: JSON is not a CORS simple type, so
+    // no other origin can post this without a preflight nobody grants.
+    if !is_json(&headers) {
+        return Err(AuthError::Payload);
+    }
+    let browser = browser_key(&headers)?;
+    let confirm: ConfirmBody = serde_json::from_slice(&body).map_err(|_| AuthError::Payload)?;
+    let typed: String = confirm
+        .code
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    Ok(
+        match state.sessions.confirm(&sid, &browser, &typed, now_unix())? {
+            ConfirmOutcome::Confirmed => {
+                Json(status_body(&SessionStatus::Approved)).into_response()
+            }
+            ConfirmOutcome::Wrong { attempts_left } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "attempts_left": attempts_left,
+                    "error": "code_invalid",
+                })),
+            )
+                .into_response(),
+            ConfirmOutcome::Exhausted => {
+                // The one trace a brute force against a relayed approval leaves.
+                tracing::info!("forum login cancelled: completion code attempts exhausted");
+                (
+                    StatusCode::CONFLICT,
+                    Json(status_body(&SessionStatus::Cancelled {
+                        reason: "code_attempts_exhausted".to_owned(),
+                    })),
+                )
+                    .into_response()
+            }
+            ConfirmOutcome::NotAwaitingCode(status) => {
+                (StatusCode::CONFLICT, Json(status_body(&status))).into_response()
+            }
+        },
+    )
 }
 
 async fn session_complete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(sid): Path<String>,
-) -> Result<Redirect, AuthError> {
-    let done = state.sessions.consume(&sid, now_unix())?;
+) -> Result<Response, AuthError> {
+    let browser = browser_key(&headers)?;
+    let done = match state.sessions.consume(&sid, &browser, now_unix())? {
+        Consumed::Login(done) => done,
+        // Another tab of this browser completed first, and the forum session
+        // it opened is this tab's too.
+        Consumed::AlreadyCompleted => {
+            return Ok(Redirect::to(&format!("{}/", crate::FORUM_PUBLIC_URL)).into_response());
+        }
+        Consumed::NotReady(status) => {
+            return Ok((StatusCode::CONFLICT, Json(status_body(&status))).into_response());
+        }
+    };
     // This endpoint is hit by the user's browser, so its Accept-Language is
     // the user's real preference: forwarded so Discourse creates the account
     // in that interface language (first login only, never overrides later
@@ -815,7 +1184,15 @@ async fn session_complete(
         urlencoding::encode(&sso),
         sig
     );
-    Ok(Redirect::to(&url))
+    Ok(Redirect::to(&url).into_response())
+}
+
+/// The page the approving app opens in its own default browser after a
+/// same-device approval. It carries no session in its markup: the id and the
+/// code arrive in the URL fragment, which only the page's script reads.
+async fn handoff(headers: HeaderMap) -> Response {
+    let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
+    html_page(|nonce| pages::handoff_page(lang, nonce), false)
 }
 
 /// Requires the Discourse admin API to be configured; every attach-logs
@@ -1454,6 +1831,25 @@ fn intake_client_ip(headers: &HeaderMap) -> Option<std::net::IpAddr> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Whether the request declares the JSON media type. Beyond hygiene this is a
+/// CSRF boundary: application/json is NOT a CORS "simple request" content
+/// type, so a cross-origin browser call must preflight, and the preflight is
+/// only granted to the allowlisted origins. Without it any web page could
+/// fire text/plain POSTs from its visitors' browsers (side effects land even
+/// though the response stays unreadable).
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+}
+
 /// Largest intake body accepted. Sized for the form's ceiling: two files of
 /// [`crate::intake::MAX_ATTACHMENT_BYTES`], which base64 inflates by a third,
 /// plus the message and JSON overhead.
@@ -1470,23 +1866,7 @@ async fn guest_body(
     limiter: &crate::intake::RateLimiter,
 ) -> Result<axum::body::Bytes, AuthError> {
     let headers = request.headers();
-    // Require the JSON media type. Beyond hygiene this is a CSRF boundary:
-    // application/json is NOT a CORS "simple request" content type, so a
-    // cross-origin browser call must preflight, and the preflight is only
-    // granted to the allowlisted origins. Without this check any web page
-    // could fire text/plain POSTs from its visitors' browsers (side effects
-    // land even though the response stays unreadable).
-    let is_json = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("application/json")
-        });
-    if !is_json {
+    if !is_json(headers) {
         return Err(AuthError::InvalidIntake);
     }
     // Refuse an over-cap body on its declared length alone, before reading a
@@ -1754,7 +2134,11 @@ fn extract_signed_headers(headers: &HeaderMap) -> Result<SignedHeaders, AuthErro
 
 #[cfg(test)]
 mod tests {
-    use super::{login_allowed, login_approved_body, staff_claim};
+    use super::{
+        AuthError, HeaderMap, LOGIN_COOKIE, LegacyApproval, LegacyApprovalError, LoginForm,
+        PresentedCookie, SsoUser, bound_approved_body, browser_key, handoff_url, login_allowed,
+        login_approved_body, presented_cookie, staff_claim,
+    };
 
     #[test]
     fn approved_login_echoes_the_handle_and_slot_and_nothing_else() {
@@ -1807,32 +2191,141 @@ mod tests {
     }
 
     #[test]
-    fn staff_is_asserted_only_on_a_same_device_approval() {
+    fn staff_is_asserted_only_on_a_bound_same_device_approval() {
         use crate::sessions::Approach;
 
-        assert!(staff_claim(true, Approach::SameDevice));
+        assert!(staff_claim(true, Approach::SameDevice, LoginForm::Bound));
         assert!(
-            !staff_claim(true, Approach::CrossDevice),
+            !staff_claim(true, Approach::CrossDevice, LoginForm::Bound),
             "a QR is read from another device, which is the exact shape of a relayed approval: \
              no grant may ride on it"
         );
-        assert!(!staff_claim(false, Approach::SameDevice));
-        assert!(!staff_claim(false, Approach::CrossDevice));
+        assert!(
+            !staff_claim(true, Approach::SameDevice, LoginForm::Legacy),
+            "a legacy approval completes without the code, so it never carries a grant"
+        );
+        assert!(!staff_claim(false, Approach::SameDevice, LoginForm::Bound));
+        assert!(!staff_claim(false, Approach::CrossDevice, LoginForm::Bound));
     }
 
     #[test]
     fn a_cross_device_login_still_signs_in() {
         use crate::sessions::Approach;
 
-        // The fix must not cost the feature: an operator signing in from their
-        // phone is still let through the paywall and still logs in. Only the
-        // staff CLAIM is withheld, and Discourse keeps the grant it holds.
+        // An operator signing in from their phone is still let through the
+        // paywall and still logs in. Only the staff CLAIM is withheld, and
+        // Discourse keeps the grant it holds.
         assert!(
             login_allowed(false, true),
             "the gate reads the allowlist, not the approach"
         );
         let body = login_approved_body("lusab-babad-dovok", Some(1));
         assert_eq!(body["status"], "approved");
-        assert!(!staff_claim(true, Approach::CrossDevice));
+        assert!(!staff_claim(true, Approach::CrossDevice, LoginForm::Bound));
+    }
+
+    #[test]
+    fn the_legacy_setting_is_allow_or_deny_and_nothing_else() {
+        assert_eq!(LegacyApproval::parse(None), Ok(LegacyApproval::Deny));
+        assert_eq!(LegacyApproval::parse(Some("")), Ok(LegacyApproval::Deny));
+        assert_eq!(
+            LegacyApproval::parse(Some("deny")),
+            Ok(LegacyApproval::Deny)
+        );
+        assert_eq!(
+            LegacyApproval::parse(Some(" allow ")),
+            Ok(LegacyApproval::Allow)
+        );
+        for typo in ["Allow", "yes", "true", "allowed"] {
+            assert_eq!(
+                LegacyApproval::parse(Some(typo)),
+                Err(LegacyApprovalError),
+                "{typo} must fail the start, not pick a side"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_form_is_named_by_its_version_and_an_unknown_one_is_refused() {
+        assert_eq!(LoginForm::of(None), Ok(LoginForm::Legacy));
+        assert_eq!(LoginForm::of(Some(2)), Ok(LoginForm::Bound));
+        assert_eq!(LoginForm::of(Some(1)), Err(AuthError::Payload));
+        assert_eq!(LoginForm::of(Some(3)), Err(AuthError::Payload));
+    }
+
+    #[test]
+    fn a_bound_approval_answers_the_legacy_fields_plus_the_completion() {
+        let store = crate::sessions::SessionStore::default();
+        let browser = crate::sessions::BrowserSecret::generate().key();
+        let ids = store
+            .create("n".into(), "r".into(), &browser, 0)
+            .expect("create");
+        let code = store
+            .approve_bound(
+                &ids.sid,
+                SsoUser {
+                    external_id: "e".into(),
+                    username: "u".into(),
+                    email: "e@x".into(),
+                    member: true,
+                    subscriber: true,
+                    admin: false,
+                },
+                1,
+            )
+            .expect("approve");
+        let url = handoff_url("connect.example.test", &ids.sid, &code);
+
+        let body = bound_approved_body("lusab-babad-dovok", Some(3), &code, Some(&url));
+
+        assert_eq!(
+            body.to_string(),
+            format!(
+                r#"{{"completion":{{"code":"{c}","handoff_url":"https://connect.example.test/handoff#sid={sid}&code={c}"}},"handle":"lusab-babad-dovok","notify_slot":3,"status":"approved"}}"#,
+                c = code.as_str(),
+                sid = ids.sid
+            ),
+            "keys in ascending order, the id and the code in the fragment only"
+        );
+        let without = bound_approved_body("lusab-babad-dovok", None, &code, None);
+        assert_eq!(
+            without["completion"].as_object().map(|c| c.len()),
+            Some(1),
+            "a cross-device completion is the code alone"
+        );
+    }
+
+    fn cookie_headers(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                axum::http::header::COOKIE,
+                value.parse().expect("header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn the_login_cookie_is_found_among_others_and_a_bad_one_is_told_from_none() {
+        let secret = "0123456789abcdef".repeat(4);
+        let found = presented_cookie(&cookie_headers(&[
+            "_forum_session=x",
+            &format!("theme=dark; {LOGIN_COOKIE}={secret}"),
+        ]));
+        assert!(matches!(found, PresentedCookie::Secret(s) if s.as_str() == secret));
+        assert!(matches!(
+            presented_cookie(&cookie_headers(&["theme=dark"])),
+            PresentedCookie::Absent
+        ));
+        assert!(matches!(
+            presented_cookie(&cookie_headers(&[&format!("{LOGIN_COOKIE}=forged")])),
+            PresentedCookie::Malformed
+        ));
+        assert_eq!(
+            browser_key(&cookie_headers(&[&format!("{LOGIN_COOKIE}=forged")])).map(|_| ()),
+            Err(AuthError::BrowserMismatch),
+            "a cookie that binds nothing is refused like a stranger's"
+        );
     }
 }

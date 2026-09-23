@@ -175,6 +175,15 @@ pub fn approval_page(
   button.copy{{font:inherit;font-size:.85rem;font-weight:600;color:var(--primary);
     background:transparent;border:1px solid var(--primary);border-radius:8px;
     padding:.3rem .7rem;margin-left:.4rem;cursor:pointer;}}
+  /* Confirm step: shown once the app approved. */
+  #confirm{{background:oklch(0.9 0.035 80);border:1px solid var(--border);border-radius:12px;
+    padding:.9rem 1rem;margin:1rem 0 .4rem;}}
+  #confirm h2{{font-size:1.05rem;margin:0 0 .5rem;}}
+  #confirm p{{font-size:.9rem;margin:.45rem 0;}}
+  #code{{font:inherit;font-size:1.6rem;letter-spacing:.3em;text-align:center;width:9.5rem;
+    padding:.35rem .5rem;border:1px solid var(--border);border-radius:8px;background:#fff;}}
+  button.finish{{font:inherit;font-weight:600;background:var(--primary);color:var(--primary-fg);
+    border:0;border-radius:10px;padding:.6rem 1.2rem;margin-top:.6rem;cursor:pointer;}}
 </style>
 </head>
 <body>
@@ -193,12 +202,23 @@ pub fn approval_page(
        data-copied="{copied}">{copy}</button></p>
     <p>{noapp_install}</p>
   </div>
+  <div id="confirm" hidden>
+    <h2>{code_heading}</h2>
+    <p>{code_body}</p>
+    <p><input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+       maxlength="7" aria-label="{code_label}"></p>
+    <p><button class="finish" id="finish" type="button">{code_button}</button></p>
+    <p id="code-state" class="muted" aria-live="polite" data-wrong="{code_wrong}"
+       data-shape="{code_shape}" data-retry="{code_retry}"></p>
+  </div>
   <p class="muted">{scan}</p>
   <div class="qr">{qr_svg}</div>
   <p class="muted">{session} <code>{sid}</code> &middot; {expires}</p>
-  <p id="state" class="muted"
+  <p id="state" class="muted" aria-live="polite"
      data-expired="{expired}" data-subscription="{subscription}"
-     data-cancelled="{cancelled}" data-clock="{clock}">{waiting}</p>
+     data-cancelled="{cancelled}" data-clock="{clock}" data-update="{update}"
+     data-exhausted="{exhausted}" data-mismatch="{mismatch}"
+     data-awaiting="{awaiting}">{waiting}</p>
   <hr class="rule">
   <p class="foot tagline">{tagline}</p>
 </div>
@@ -246,6 +266,32 @@ pub fn approval_page(
       copy.textContent = copy.dataset.copied;
     }} catch (e) {{}}
   }});
+  const confirmBox = document.getElementById('confirm');
+  const codeInput = document.getElementById('code');
+  const codeState = document.getElementById('code-state');
+  // Completion is a navigation this page makes once the login is ready.
+  // The cookie that binds it rides along; the code never leaves this page
+  // except in the one POST below.
+  const finish = () => {{ done = true; window.location = '/v1/session/{sid}/complete'; }};
+  const stop = (message) => {{ done = true; confirmBox.hidden = true; el.textContent = message; }};
+  const reasonText = (reason) =>
+    reason === 'subscription_required' ? el.dataset.subscription
+      : reason === 'clock_skew' ? el.dataset.clock
+      : reason === 'app_update_required' ? el.dataset.update
+      : reason === 'code_attempts_exhausted' ? el.dataset.exhausted
+      : el.dataset.cancelled;
+  // One state document shape for the poll and the confirm answer.
+  const follow = (s) => {{
+    if (s.status === 'approved' || s.status === 'completed') {{ finish(); return true; }}
+    if (s.status === 'cancelled') {{ stop(reasonText(s.reason)); return true; }}
+    if (s.status === 'awaiting_code' && confirmBox.hidden) {{
+      confirmBox.hidden = false;
+      noapp.hidden = true;
+      el.textContent = el.dataset.awaiting;
+      codeInput.focus();
+    }}
+    return false;
+  }};
   const poll = async () => {{
     timer = null;
     if (done) return;
@@ -254,22 +300,44 @@ pub fn approval_page(
       // chain is stranded with nothing left to reschedule it.
       const r = await fetch('/v1/session/{sid}/status',
         {{ signal: AbortSignal.timeout(5000) }});
-      // Only "no such session" is terminal; a 502 while the service restarts
-      // is not, and the next poll recovers from it.
-      if (r.status === 404) {{ done = true; el.textContent = el.dataset.expired; return; }}
+      // A dead session and a lost binding are terminal; a 502 while the
+      // service restarts is not, and the next poll recovers from it.
+      if (r.status === 404) {{ stop(el.dataset.expired); return; }}
+      if (r.status === 403) {{ stop(el.dataset.mismatch); return; }}
       if (!r.ok) {{ timer = setTimeout(poll, 700); return; }}
-      const s = await r.json();
-      if (s.status === 'approved') {{ done = true; window.location = '/v1/session/{sid}/complete'; return; }}
-      if (s.status === 'cancelled') {{
-        done = true;
-        el.textContent = s.reason === 'subscription_required' ? el.dataset.subscription
-          : s.reason === 'clock_skew' ? el.dataset.clock
-          : el.dataset.cancelled;
-        return;
-      }}
+      if (follow(await r.json())) return;
     }} catch (e) {{}}
     timer = setTimeout(poll, 700);
   }};
+  let sending = false;
+  const submit = async () => {{
+    const code = codeInput.value.replace(/\s+/g, '');
+    if (!/^[0-9]{{6}}$/.test(code)) {{ codeState.textContent = codeState.dataset.shape; return; }}
+    if (sending || done) return;
+    sending = true;
+    try {{
+      const r = await fetch('/v1/session/{sid}/confirm', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ code }}),
+        signal: AbortSignal.timeout(5000),
+      }});
+      if (r.status === 403) {{ stop(el.dataset.mismatch); return; }}
+      const s = await r.json();
+      if (r.status === 422) {{
+        codeInput.value = '';
+        codeState.textContent = codeState.dataset.wrong.replace('{{n}}', String(s.attempts_left));
+        return;
+      }}
+      follow(s);
+    }} catch (e) {{
+      codeState.textContent = codeState.dataset.retry;
+    }} finally {{
+      sending = false;
+    }}
+  }};
+  document.getElementById('finish').addEventListener('click', submit);
+  codeInput.addEventListener('keydown', (e) => {{ if (e.key === 'Enter') submit(); }});
   // Tapping the button backgrounds this tab and the browser freezes its
   // timers (measured live 2026-08-18: an approved login sat on "waiting" for
   // ~50 s after the return). Poll the moment the page is visible again. A
@@ -306,6 +374,161 @@ pub fn approval_page(
         noapp_install = s.a_noapp_install,
         copy = s.a_copy,
         copied = s.a_copied,
+        awaiting = s.a_awaiting,
+        code_heading = s.a_code_heading,
+        code_body = s.a_code_body,
+        code_label = s.a_code_label,
+        code_button = s.a_code_button,
+        code_wrong = s.a_code_wrong,
+        code_shape = s.a_code_shape,
+        code_retry = s.a_code_retry,
+        update = s.a_update,
+        exhausted = s.a_exhausted,
+        mismatch = s.a_mismatch,
+        tagline = s.tagline,
+    )
+}
+
+/// The card every short notice page shares: brand, heading, body.
+const NOTICE_STYLE: &str = r#"
+  body{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;
+    padding:2.4rem 2rem;max-width:27rem;width:100%;text-align:center;
+    box-shadow:0 18px 40px -24px oklch(0.25 0.03 60 / .5);}
+  .brand{display:block;margin-bottom:.5rem;}
+  h1{font-size:1.4rem;margin:.5rem 0 1rem;}
+  p{margin:.6rem 0;}
+"#;
+
+/// Served by `/sso` to a browser replaying a sign-in link another browser
+/// opened first. Names nothing about that login.
+#[must_use]
+pub fn started_elsewhere_page(lang: Lang, nonce: &str) -> String {
+    let s = lang.strings();
+    format!(
+        r##"<!doctype html>
+<html lang="{code}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{tab}</title>
+<style nonce="{nonce}">{style}{notice}</style>
+</head>
+<body>
+<div class="card">
+  <span class="brand">Warren</span>
+  <div class="spark">&#10022;</div>
+  <h1>{heading}</h1>
+  <p>{body}</p>
+  <hr class="rule">
+  <p class="tagline">{tagline}</p>
+</div>
+</body>
+</html>"##,
+        code = lang.code(),
+        tab = s.a_tab,
+        style = STYLE,
+        notice = NOTICE_STYLE,
+        heading = s.e_heading,
+        body = s.e_body,
+        tagline = s.tagline,
+    )
+}
+
+/// The page the approving app opens in its own default browser after a
+/// same-device approval (`/handoff#sid=<sid>&code=<code>`).
+///
+/// The id and the code arrive in the fragment, which never reaches a server,
+/// and the script drops it from the address bar and the history before doing
+/// anything else. It posts the confirm with this browser's cookie: the
+/// browser that opened the login completes it; any other browser is told it
+/// did not start this sign-in, which is what a relay victim needs to read.
+/// The code is never written into the page.
+#[must_use]
+pub fn handoff_page(lang: Lang, nonce: &str) -> String {
+    let s = lang.strings();
+    format!(
+        r##"<!doctype html>
+<html lang="{code}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{tab}</title>
+<style nonce="{nonce}">{style}{notice}</style>
+</head>
+<body>
+<div class="card">
+  <span class="brand">Warren</span>
+  <div class="spark">&#10022;</div>
+  <h1 id="heading" data-mismatch="{mismatch_heading}">{heading}</h1>
+  <p id="state" aria-live="polite" data-mismatch="{mismatch_body}" data-failed="{failed}"
+     data-expired="{expired}" data-subscription="{subscription}" data-clock="{clock}"
+     data-update="{update}" data-exhausted="{exhausted}"
+     data-cancelled="{cancelled}">{working}</p>
+  <hr class="rule">
+  <p class="tagline">{tagline}</p>
+</div>
+<script nonce="{nonce}">
+  const heading = document.getElementById('heading');
+  const el = document.getElementById('state');
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const sid = params.get('sid') || '';
+  const code = params.get('code') || '';
+  // Out of the address bar and the history before anything can read it.
+  history.replaceState(null, '', window.location.pathname);
+  const show = (text) => {{ el.textContent = text; }};
+  const mismatch = () => {{
+    heading.textContent = heading.dataset.mismatch;
+    show(el.dataset.mismatch);
+  }};
+  const reasonText = (reason) =>
+    reason === 'subscription_required' ? el.dataset.subscription
+      : reason === 'clock_skew' ? el.dataset.clock
+      : reason === 'app_update_required' ? el.dataset.update
+      : reason === 'code_attempts_exhausted' ? el.dataset.exhausted
+      : el.dataset.cancelled;
+  const run = async () => {{
+    if (!/^[0-9a-f]{{32}}$/.test(sid) || !/^[0-9]{{6}}$/.test(code)) {{ show(el.dataset.failed); return; }}
+    try {{
+      const r = await fetch('/v1/session/' + sid + '/confirm', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ code }}),
+        signal: AbortSignal.timeout(10000),
+      }});
+      if (r.status === 403) {{ mismatch(); return; }}
+      const s = await r.json();
+      if (r.ok || s.status === 'approved' || s.status === 'completed') {{
+        window.location = '/v1/session/' + sid + '/complete';
+        return;
+      }}
+      if (s.status === 'cancelled') {{ show(reasonText(s.reason)); return; }}
+      show(el.dataset.failed);
+    }} catch (e) {{
+      show(el.dataset.failed);
+    }}
+  }};
+  run();
+</script>
+</body>
+</html>"##,
+        code = lang.code(),
+        tab = s.a_tab,
+        style = STYLE,
+        notice = NOTICE_STYLE,
+        heading = s.h_heading,
+        working = s.h_working,
+        mismatch_heading = s.h_mismatch_heading,
+        mismatch_body = s.h_mismatch_body,
+        failed = s.h_failed,
+        expired = s.a_expired,
+        subscription = s.a_subscription,
+        clock = s.a_clock,
+        update = s.a_update,
+        exhausted = s.a_exhausted,
+        cancelled = s.a_cancelled,
         tagline = s.tagline,
     )
 }
@@ -966,6 +1189,135 @@ mod tests {
         );
         assert!(!page.contains("window.location = 'warren://"));
         assert!(!page.contains("setTimeout(() => { window.location"));
+    }
+
+    #[test]
+    fn the_approval_page_asks_for_the_apps_code_once_the_app_approved() {
+        let page = approval_page(
+            Lang::En,
+            &ids("deadbeef", "cafe"),
+            "connect.warrenbrowse.com",
+            NONCE,
+        );
+        assert!(
+            page.contains(r#"<div id="confirm" hidden>"#),
+            "the code field waits for the approval"
+        );
+        assert!(page.contains("s.status === 'awaiting_code'"));
+        assert!(page.contains("Enter the code from your Warren app"));
+        assert!(page.contains(r#"autocomplete="one-time-code""#));
+        assert!(
+            page.contains("'/v1/session/deadbeef/confirm'"),
+            "the code goes to this login's confirm"
+        );
+        assert!(
+            page.contains("'Content-Type': 'application/json'"),
+            "the confirm refuses anything else"
+        );
+        assert!(
+            page.contains("Never give this code to anyone"),
+            "the person typing is told the code is theirs alone"
+        );
+        for reason in ["app_update_required", "code_attempts_exhausted"] {
+            assert!(page.contains(reason), "the page explains {reason}");
+        }
+        assert!(
+            page.contains("r.status === 403"),
+            "a lost binding is terminal, not polled forever"
+        );
+    }
+
+    #[test]
+    fn the_confirm_step_and_the_new_endings_speak_every_page_language() {
+        for (lang, heading, update) in [
+            (Lang::En, "Enter the code from your Warren app", "too old"),
+            (
+                Lang::Fr,
+                "Saisissez le code de votre application Warren",
+                "trop ancienne",
+            ),
+            (
+                Lang::Ro,
+                "Introdu codul din aplica\u{21b}ia Warren",
+                "prea veche",
+            ),
+        ] {
+            let page = approval_page(lang, &ids("s", "q"), "h", NONCE);
+            assert!(page.contains(heading), "{lang:?}");
+            assert!(page.contains(update), "{lang:?}");
+            let s = lang.strings();
+            assert!(
+                s.a_code_wrong.contains("{n}"),
+                "{lang:?} counts the attempts"
+            );
+            for text in [
+                s.a_awaiting,
+                s.a_code_body,
+                s.a_code_label,
+                s.a_code_button,
+                s.a_code_shape,
+                s.a_code_retry,
+                s.a_exhausted,
+                s.a_mismatch,
+                s.e_heading,
+                s.e_body,
+                s.h_heading,
+                s.h_working,
+                s.h_mismatch_heading,
+                s.h_mismatch_body,
+                s.h_failed,
+            ] {
+                assert!(!text.is_empty(), "{lang:?}");
+                assert!(
+                    !text.contains('"'),
+                    "{lang:?}: the copy lands in attributes: {text}"
+                );
+            }
+        }
+        assert_ne!(
+            Lang::Fr.strings().h_mismatch_body,
+            Lang::En.strings().h_mismatch_body
+        );
+        assert_ne!(
+            Lang::Ro.strings().h_mismatch_body,
+            Lang::En.strings().h_mismatch_body
+        );
+    }
+
+    #[test]
+    fn the_handoff_page_carries_no_session_and_warns_a_browser_that_did_not_start_it() {
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let page = handoff_page(lang, NONCE);
+            let s = lang.strings();
+            assert!(page.contains(&format!(r#"lang="{}""#, lang.code())));
+            assert!(page.contains(s.h_mismatch_body), "{lang:?}");
+            assert!(page.contains(&format!(r#"<script nonce="{NONCE}">"#)));
+            let dropped = page
+                .find("history.replaceState")
+                .expect("drops the fragment");
+            let posted = page.find("fetch(").expect("posts the confirm");
+            assert!(
+                dropped < posted,
+                "the fragment leaves the history before any request"
+            );
+            assert!(
+                !page.contains("/v1/session/0") && !page.contains("#sid="),
+                "no id is rendered, the fragment is the only carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn the_replay_page_names_nothing_about_the_login() {
+        let page = started_elsewhere_page(Lang::En, NONCE);
+        assert!(page.contains("This sign-in was started in another browser"));
+        assert!(!page.contains("forum-login?sid="), "no deep link");
+        assert!(!page.contains("<svg"), "no QR");
+        assert!(!page.contains("<script"), "nothing to run");
+        let fr = started_elsewhere_page(Lang::Fr, NONCE);
+        assert!(fr.contains("autre navigateur"));
+        let ro = started_elsewhere_page(Lang::Ro, NONCE);
+        assert!(ro.contains("alt browser"));
     }
 
     #[test]

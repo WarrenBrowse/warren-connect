@@ -386,6 +386,52 @@ pub async fn mark_seen_for_username(
     Ok(seen.unwrap_or(0))
 }
 
+/// Whether the Discourse account `username` is staff (admin or moderator).
+/// An account the forum does not have is not staff.
+///
+/// Read through the SELECT-only Discourse role, like the notification reads.
+/// `username_lower` is the column Discourse indexes and keeps unique, so a
+/// case difference between the derived handle and the stored name cannot
+/// turn a staff account into "not found".
+///
+/// # Errors
+/// Propagates sqlx errors.
+pub async fn forum_staff_for_username(
+    discourse_pool: &PgPool,
+    username: &str,
+) -> Result<bool, sqlx::Error> {
+    let staff: Option<bool> = sqlx::query_scalar(
+        "SELECT (admin OR moderator) FROM users WHERE username_lower = lower($1)",
+    )
+    .bind(username)
+    .fetch_optional(discourse_pool)
+    .await?;
+    Ok(staff.unwrap_or(false))
+}
+
+/// Why a forum account's staff status could not be established.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StaffLookupError {
+    /// No Discourse database is wired (`DISCOURSE_DATABASE_URL_RO` unset).
+    #[error("the Discourse database is not wired")]
+    NotWired,
+    /// The query failed.
+    #[error("the Discourse staff query failed")]
+    Query(#[source] sqlx::Error),
+}
+
+impl StaffLookupError {
+    /// A value-free category, safe to log (see [`error_kind`]).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            StaffLookupError::NotWired => "not_wired",
+            StaffLookupError::Query(err) => error_kind(err),
+        }
+    }
+}
+
 /// A wallet's subscription standing, derived from the single `subscriptions`
 /// row (created only on payment, never purged on expiry by `retention.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -524,12 +570,15 @@ pub async fn purge_inactive_links(pool: &PgPool, cutoff_unix: i64) -> Result<u64
 #[derive(Debug)]
 pub enum IdentityStore {
     /// The real thing: `forum_auth` for the links, the Warren API database
-    /// (read-only role) for the subscription standing.
+    /// (read-only role) for the subscription standing, Discourse's own
+    /// database (read-only role) for the staff status.
     Postgres {
         /// `forum_auth` database.
         forum: PgPool,
         /// Warren API database, read-only role.
         warren: PgPool,
+        /// Discourse's database, read-only role; `None` when not wired.
+        discourse: Option<PgPool>,
     },
     /// Test double: in-memory maps with the same semantics.
     Memory(MemoryIdentity),
@@ -543,6 +592,9 @@ pub struct MemoryIdentity {
     pub subscriptions: std::sync::Mutex<std::collections::HashMap<String, SubscriptionStatus>>,
     /// Registered links: `external_id` to `(username, notify_slot)`.
     pub links: std::sync::Mutex<std::collections::HashMap<String, (String, Option<i32>)>>,
+    /// Forum staff by username. `None` stands for a Discourse database that
+    /// is not wired, which is also the default.
+    pub forum_staff: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>>,
 }
 
 impl IdentityStore {
@@ -585,6 +637,30 @@ impl IdentityStore {
                     .or_insert_with(|| (username.to_owned(), None));
                 Ok(())
             }
+        }
+    }
+
+    /// Whether the forum account `username` is admin or moderator on the
+    /// forum; an account the forum does not have is not.
+    ///
+    /// # Errors
+    /// [`StaffLookupError`] when the status cannot be established: no
+    /// Discourse database wired, or the query failed.
+    pub async fn forum_staff(&self, username: &str) -> Result<bool, StaffLookupError> {
+        match self {
+            IdentityStore::Postgres { discourse, .. } => {
+                let pool = discourse.as_ref().ok_or(StaffLookupError::NotWired)?;
+                forum_staff_for_username(pool, username)
+                    .await
+                    .map_err(StaffLookupError::Query)
+            }
+            IdentityStore::Memory(m) => m
+                .forum_staff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|staff| staff.get(username).copied().unwrap_or(false))
+                .ok_or(StaffLookupError::NotWired),
         }
     }
 
@@ -758,6 +834,9 @@ mod tests {
             "CREATE TABLE users (
                  id INTEGER PRIMARY KEY,
                  username TEXT NOT NULL,
+                 username_lower TEXT,
+                 admin BOOLEAN NOT NULL DEFAULT false,
+                 moderator BOOLEAN NOT NULL DEFAULT false,
                  seen_notification_id BIGINT NOT NULL DEFAULT 0
              )",
         )
@@ -813,8 +892,10 @@ mod tests {
         sqlx::query(
             // seen_notification_id 0: nobody has glanced at their list yet,
             // so every unread row still counts.
-            "INSERT INTO users (id, username, seen_notification_id) VALUES
-                 (1, 'lusab-babad-dovok', 0), (2, 'rudop-tijub-sozom', 0), (-1, 'system', 0)",
+            "INSERT INTO users (id, username, username_lower, moderator, seen_notification_id) VALUES
+                 (1, 'lusab-babad-dovok', 'lusab-babad-dovok', false, 0),
+                 (2, 'rudop-tijub-sozom', 'rudop-tijub-sozom', true, 0),
+                 (-1, 'system', 'system', false, 0)",
         )
         .execute(pool)
         .await
@@ -840,6 +921,41 @@ laisse passer ?', NULL),
         .execute(pool)
         .await
         .expect("fake posts");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn staff_is_read_off_the_forum_account_and_an_unknown_account_is_not_staff(pool: PgPool) {
+        seed_fake_discourse(&pool).await;
+        sqlx::query(
+            "INSERT INTO users (id, username, username_lower, admin) \
+             VALUES (3, 'Kobal-Nisop-Tadir', 'kobal-nisop-tadir', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("admin row");
+
+        assert!(
+            forum_staff_for_username(&pool, "rudop-tijub-sozom")
+                .await
+                .expect("moderator"),
+            "a moderator is staff"
+        );
+        assert!(
+            forum_staff_for_username(&pool, "kobal-nisop-tadir")
+                .await
+                .expect("admin"),
+            "an admin is staff, whatever the case the forum stored the name in"
+        );
+        assert!(
+            !forum_staff_for_username(&pool, "lusab-babad-dovok")
+                .await
+                .expect("member")
+        );
+        assert!(
+            !forum_staff_for_username(&pool, "nobod-yhere-atall")
+                .await
+                .expect("absent")
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -242,7 +242,19 @@ async fn main() -> anyhow::Result<()> {
     let identity = warren_connect::store::IdentityStore::Postgres {
         forum: forum_pool.clone(),
         warren: warren_pool.clone(),
+        discourse: discourse_pool.clone(),
     };
+
+    // The login form that predates the completion code. Denied unless the
+    // operator allows it for the weeks those apps are still installed; staff
+    // are refused it either way.
+    let legacy_approval = warren_connect::routes::LegacyApproval::parse(
+        std::env::var("WARREN_CONNECT_LEGACY_APPROVAL")
+            .ok()
+            .as_deref(),
+    )
+    .context("WARREN_CONNECT_LEGACY_APPROVAL")?;
+    tracing::info!(?legacy_approval, "legacy forum login approvals");
     let state = Arc::new(AppState {
         connect_secret,
         handle_secret,
@@ -256,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
         seen_pool,
         digest_generation: warren_connect::digest::GenerationStamp::default(),
         sessions: SessionStore::default(),
+        legacy_approval,
         nonces: NonceStore::default(),
         attach: AttachStore::default(),
         forum_api,

@@ -326,3 +326,89 @@ fn the_qualification_check_sees_a_bare_call_site() {
         bare.matches("tracing::info!(").count()
     );
 }
+
+/// Identifiers a login capability travels under. A session id is relayable
+/// by design, and one in a retained log line is a login anybody reading the
+/// log can take over while it lives; the completion code and the login
+/// cookie are the two proofs that complete it.
+const CAPABILITY_IDENTIFIERS: &[&str] = &[
+    "sid",
+    "qr_sid",
+    "primary_sid",
+    "code",
+    "typed",
+    "cookie",
+    "secret",
+    "browser",
+    "completion",
+    "handoff",
+];
+
+/// The identifiers of a call site, string literals skipped, so the message
+/// text ("code attempts exhausted") is free to name what the fields may not.
+fn identifiers_outside_strings(site: &str) -> Vec<String> {
+    let mut outside = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in site.chars() {
+        if in_string {
+            match ch {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            outside.push(' ');
+        } else {
+            outside.push(ch);
+        }
+    }
+    outside
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn capabilities_in(body: &str) -> Vec<String> {
+    tracing_call_sites(&code_only(body))
+        .into_iter()
+        .filter(|site| {
+            identifiers_outside_strings(site).iter().any(|ident| {
+                CAPABILITY_IDENTIFIERS.contains(&ident.as_str()) || ident.ends_with("_sid")
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn no_log_line_carries_a_session_id_a_completion_code_or_the_login_cookie() {
+    let mut files = Vec::new();
+    collect_rs_files(std::path::Path::new("src"), "", &mut files);
+    for file in files {
+        let leaks = capabilities_in(&read_module(&file));
+        assert!(
+            leaks.is_empty(),
+            "src/{file} logs a login capability: {leaks:?}"
+        );
+    }
+}
+
+#[test]
+fn the_capability_scan_rejects_each_carrier_and_keeps_a_message_that_names_one() {
+    for leak in [
+        r#"tracing::info!(sid = %sid, "forum login approved");"#,
+        r#"tracing::info!(session = %ids.qr_sid, "created");"#,
+        r#"tracing::debug!(?code, "code rejected");"#,
+        r#"tracing::warn!(value = cookie.as_str(), "bad cookie");"#,
+        r#"tracing::info!(url = %handoff_url(&host, &primary_sid, &code), "handoff");"#,
+        r#"tracing::info!(login = %login.sid, "approved");"#,
+    ] {
+        assert_eq!(capabilities_in(leak).len(), 1, "must reject: {leak}");
+    }
+    let clean = r#"tracing::info!("forum login cancelled: completion code attempts exhausted");"#;
+    assert!(capabilities_in(clean).is_empty());
+}

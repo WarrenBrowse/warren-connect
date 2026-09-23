@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 
 /// Login/SSO failures. Rendered messages are deliberately generic: the
 /// distinction matters for logs (redacted) and tests, not for the caller.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// The DiscourseConnect HMAC on an incoming `sso` payload is wrong.
@@ -37,6 +37,15 @@ pub enum AuthError {
     /// The login session does not exist, expired, or was already consumed.
     #[error("unknown or expired session")]
     Session,
+    /// A browser-side login call did not present the cookie of the browser
+    /// that opened the session, or named no live session: the two answer the
+    /// same on purpose.
+    #[error("browser_mismatch")]
+    BrowserMismatch,
+    /// A login approval in the form that predates the completion code, from
+    /// a wallet or a deployment that no longer accepts it.
+    #[error("app_update_required")]
+    AppUpdateRequired,
     /// The wallet is valid but has never paid for Warren: forum accounts
     /// require a Warren subscription (past or present).
     #[error("forum access requires a Warren subscription")]
@@ -103,6 +112,22 @@ impl IntoResponse for AuthError {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({"error": "invalid_report"})),
+            )
+                .into_response();
+        }
+        // The approval page and the handoff page render these two, and the
+        // browser mismatch must read the same whether or not the id exists.
+        if matches!(self, AuthError::BrowserMismatch) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "browser_mismatch"})),
+            )
+                .into_response();
+        }
+        if matches!(self, AuthError::AppUpdateRequired) {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "app_update_required"})),
             )
                 .into_response();
         }

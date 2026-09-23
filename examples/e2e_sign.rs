@@ -1,6 +1,8 @@
 //! E2E signing helper: prints the four `X-Warren-*` header values for a
-//! signed `POST /v1/forum/login`, so a shell script can drive the full SSO
-//! flow with curl. Uses an ephemeral key by default (any valid Ed25519 key
+//! signed `POST /v1/forum/login` (the bound form by default), so a shell
+//! script can drive the full SSO flow with curl. The script then holds the
+//! `__Host-warren_login` cookie from `/sso` and confirms with the
+//! `completion.code` of the answer before it completes. Uses an ephemeral key by default (any valid Ed25519 key
 //! is accepted; subscription simply resolves to inactive) or a 32-byte seed
 //! from `SEED_HEX`.
 //!
@@ -30,7 +32,8 @@ fn main() {
 
     // The caller shares the exact body bytes via env so the signed preimage
     // and the bytes sent by curl cannot drift (shell quote-stripping bit us).
-    let body = std::env::var("WFA_BODY").unwrap_or_else(|_| format!("{{\"sid\":\"{sid}\"}}"));
+    let body = std::env::var("WFA_BODY")
+        .unwrap_or_else(|_| format!("{{\"login_version\":2,\"sid\":\"{sid}\"}}"));
     // Same drift rationale as WFA_BODY: the attach flow signs a different
     // path, so the caller can override it without a second binary.
     let path = std::env::var("WFA_PATH").unwrap_or_else(|_| "/v1/forum/login".to_owned());

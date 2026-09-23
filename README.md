@@ -17,10 +17,13 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 
 | Route | Purpose |
 |---|---|
-| `GET /sso` | DiscourseConnect entry (HMAC-verified), renders the approval page |
-| `POST /v1/forum/login` | Wallet-signed approval from the Warren app |
-| `GET /v1/session/:sid/status` | Browser poll: `pending` / `approved` |
-| `GET /v1/session/:sid/complete` | Redirect back into Discourse with the signed payload |
+| `GET /sso` | DiscourseConnect entry (HMAC-verified): sets the `__Host-warren_login` cookie that binds the sign-in to this browser and renders the approval page |
+| `POST /v1/forum/login` | Wallet-signed approval from the Warren app. Body `{"login_version":2,"sid"}`; the answer carries the one-time completion code (and, for a same-device approval, the handoff URL). The form without `login_version` is refused unless `WARREN_CONNECT_LEGACY_APPROVAL=allow`, and always for staff |
+| `GET /v1/session/:sid/status` | Browser poll with the cookie: `pending` / `awaiting_code` / `approved` / `completed` / `cancelled`. Without it (the app's preflight): `pending` or 404 |
+| `POST /v1/session/:sid/confirm` | The browser presents the code the app received (cookie required, 5 attempts) |
+| `GET /v1/session/:sid/complete` | Redirect back into Discourse with the signed payload (cookie required, after the confirm) |
+| `POST /v1/session/:sid/cancel` | App-initiated decline of a sign-in still waiting for its approval |
+| `GET /handoff` | Page the app opens in its own browser after a same-device approval; the sid and the code ride in the URL fragment |
 | `GET /attach?topic=<id>` | Attach-logs page for an existing bug topic: deep link + polling |
 | `GET /attach?sid=<sid>` | Attach-logs page for a pre-topic session minted by `/v1/attach/new` |
 | `POST /v1/forum/attach-logs` | Wallet-signed gzipped problem report from the Warren app |
@@ -41,7 +44,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 
 Staff is an allowlist of Warren pubkeys configured in `WARREN_ADMIN_PUBKEYS`: a
 listed wallet is promoted to Discourse admin/moderator via the SSO payload on
-every login. The roster is deployment configuration rather than source, so this
+every bound login approved from the same device. The roster is deployment configuration rather than source, so this
 repository carries the mechanism without naming its operators. An entry that is
 not a valid Warren address refuses startup, identified by position (the no-log
 rule forbids echoing the material). An empty roster leaves the forum with no
@@ -65,6 +68,7 @@ warren-admin.
 | `DISCOURSE_API_USERNAME` | acting API user, default `system` |
 | `WARREN_STAFF_GROUP` | group receiving the log PMs, default `staff` |
 | `WARREN_ADMIN_PUBKEYS` | forum staff wallets, comma-separated SS58; empty means no staff |
+| `WARREN_CONNECT_LEGACY_APPROVAL` | `allow` accepts the login approval form that predates the completion code from wallets that are not staff; unset or `deny` refuses it; any other value refuses to start. Staff status for this gate also reads `DISCOURSE_DATABASE_URL_RO`, and unset or unreadable counts as staff |
 | `DISCOURSE_INTAKE_CATEGORY_ID` | category id (u64) for guest intake topics; unset disables the intake endpoint (503) |
 | `DISCOURSE_INTAKE_USERNAME` | low-privilege bot user authoring guest intake topics, default `warren-intake` |
 | `DISCOURSE_INTAKE_API_KEY` | user API key minted for the intake bot (the attach-logs key is tied to `system` and cannot impersonate the bot); falls back to `DISCOURSE_API_KEY` when that one is a global key |
@@ -157,8 +161,12 @@ docker build -t warren-connect:vX.Y.Z .
 The integration tests replay the shared golden vectors from the `vectors/`
 submodule ([warren-vectors](https://github.com/WarrenBrowse/warren-vectors)):
 `forum_login_v1.json` pins the exact signed request bytes a client builds for
-`/v1/forum/login` and `/v1/forum/report` and the exact answer this service
-gives per outcome, so the app and this broker are held to the same bytes.
+`/v1/forum/report` and the attach-logs upload, and the login form that
+predates the completion code; `forum_login_v2.json` pins the bound login (the
+approval request, its completion object, the cookie, the confirm step and the
+completion). Both carry the exact answer this service gives per outcome, so
+the app and this broker are held to the same bytes. The bound login's
+protocol and the app behaviour it expects: [docs/FORUM-LOGIN-V2.md](docs/FORUM-LOGIN-V2.md).
 
 Deployed on the API host as part of the forum compose stack.
 
