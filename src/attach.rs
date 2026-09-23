@@ -46,7 +46,10 @@ const MAX_SESSIONS: usize = 10_000;
 /// full capacity, LESS than the 100 x 8 MiB it replaces. Pre-topic sessions
 /// hold their log only between the app's delivery and the topic's creation,
 /// usually seconds, so a low count costs nothing in practice and the eviction
-/// is graceful.
+/// is graceful. Only a wallet with a forum link parks a report, and its next
+/// report replaces it unless a bind is delivering it, so filling the store
+/// takes about that many wallets that passed the forum's admission gate, which
+/// asks for a paid subscription.
 pub const MAX_LOG_SESSIONS: usize = 16;
 
 /// Wire cap on the base64 gzip field (~12 MiB of gzip).
@@ -163,6 +166,16 @@ impl AttachSession {
     /// delivered, no report parked, and not finished either way.
     fn awaits_upload(&self) -> bool {
         !self.done && self.cancelled.is_none() && !self.processing && self.received.is_none()
+    }
+
+    /// Holds a report `username` parked that no bind is delivering: the one
+    /// that wallet's next report replaces.
+    fn replaceable_by(&self, username: &str) -> bool {
+        !self.binding
+            && self
+                .received
+                .as_ref()
+                .is_some_and(|r| r.username == username && r.log_text.is_some())
     }
 }
 
@@ -395,11 +408,19 @@ impl AttachStore {
     }
 
     /// Parks the app's delivered report in a pre-topic session (state becomes
-    /// Received). Enforces [`MAX_LOG_SESSIONS`]: at capacity, the oldest
+    /// Received), signed by the wallet whose forum handle is `username`.
+    ///
+    /// One parked report per wallet: this one replaces any other report the
+    /// same wallet parked that no bind is delivering, and a session already
+    /// holding another wallet's report refuses it. The handle stands for the
+    /// wallet because the caller parks only for a wallet with a forum link,
+    /// and the links are unique on it.
+    /// Enforces [`MAX_LOG_SESSIONS`] across wallets: at capacity, the oldest
     /// log-holding session is evicted (logged as a coarse count only).
     ///
     /// # Errors
-    /// [`AuthError::Session`] if unknown, expired, finished, or topic-bound.
+    /// [`AuthError::Session`] if unknown, expired, finished, or topic-bound;
+    /// [`AuthError::NotAuthor`] if it holds another wallet's report.
     pub fn store_received(
         &self,
         sid: &str,
@@ -416,7 +437,15 @@ impl AttachStore {
             if session.topic_id.is_some() || session.done || session.cancelled.is_some() {
                 return Err(AuthError::Session);
             }
+            if session
+                .received
+                .as_ref()
+                .is_some_and(|r| r.username != username)
+            {
+                return Err(AuthError::NotAuthor);
+            }
         }
+        sessions.retain(|other, s| other.as_str() == sid || !s.replaceable_by(username));
         let holding: Vec<(String, u64, bool)> = sessions
             .iter()
             .filter(|(other, s)| other.as_str() != sid && s.holds_log())
@@ -1137,13 +1166,13 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, "u", "log".into(), None, None, i)
+                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
                 .expect("fill");
             sids.push(sid);
         }
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
             .expect("101st log evicts the oldest holder");
         assert!(
             store.status(&sids[0], 501).is_err(),
@@ -1168,7 +1197,7 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, "u", "log".into(), None, None, i)
+                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
                 .expect("fill");
             sids.push(sid);
         }
@@ -1176,7 +1205,7 @@ mod tests {
 
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
             .expect("the next oldest makes room");
 
         assert_eq!(
@@ -1192,13 +1221,125 @@ mod tests {
     }
 
     #[test]
+    fn a_second_report_from_one_wallet_replaces_its_own_and_evicts_no_one_else() {
+        // One parked report per wallet: without it a single signer could
+        // take every slot and push out everybody else's.
+        let store = AttachStore::default();
+        let oldest = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&oldest, "a", "log".into(), None, None, 0)
+            .expect("the oldest report");
+        let earlier = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&earlier, "w", "log".into(), None, None, 1)
+            .expect("the wallet's first report");
+        for i in 2..MAX_LOG_SESSIONS as u64 {
+            let sid = store.create_pre(0).expect("create_pre");
+            store
+                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .expect("fill");
+        }
+
+        let again = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&again, "w", "log".into(), None, None, 500)
+            .expect("the wallet's second report");
+
+        assert!(
+            store.status(&earlier, 501).is_err(),
+            "the wallet's earlier report is the one replaced"
+        );
+        assert_eq!(
+            store
+                .status(&oldest, 501)
+                .expect("nobody else's report paid for it"),
+            AttachStatus::Received
+        );
+        assert_eq!(
+            store.status(&again, 501).expect("the new report is parked"),
+            AttachStatus::Received
+        );
+    }
+
+    #[test]
+    fn a_parked_report_is_replaced_only_by_its_own_wallet() {
+        // An upload names nothing but the sid, so without this anybody holding
+        // it could swap the reporter's logs for their own, and the bind, which
+        // checks the signer against the topic author, would then spend the
+        // session on the swapped report.
+        let store = AttachStore::default();
+        let sid = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&sid, "w", "first".into(), None, None, 1)
+            .expect("the reporter parks");
+
+        assert!(matches!(
+            store.store_received(&sid, "x", "other".into(), None, None, 2),
+            Err(AuthError::NotAuthor)
+        ));
+        store
+            .store_received(&sid, "w", "second".into(), None, None, 3)
+            .expect("its own wallet may send it again");
+
+        let data = store.claim_bind(&sid, 4).expect("bind data");
+        assert_eq!(
+            (data.username.as_str(), data.log_text.as_str()),
+            ("w", "second")
+        );
+    }
+
+    #[test]
+    fn a_report_whose_bind_is_in_flight_is_not_replaced_by_its_own_wallet() {
+        // Its bind is writing to Discourse: dropping it would fail that bind
+        // after the staff already received the report.
+        let store = AttachStore::default();
+        let binding = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&binding, "w", "log".into(), None, None, 1)
+            .expect("the first report");
+        store.claim_bind(&binding, 2).expect("bind in flight");
+
+        let next = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&next, "w", "log".into(), None, None, 3)
+            .expect("the second report");
+
+        assert!(
+            store.complete(&binding, 4).is_ok(),
+            "the bind in flight still completes"
+        );
+    }
+
+    #[test]
+    fn a_wallets_finished_report_is_not_replaced_by_its_next_one() {
+        // A delivered report holds no bytes, and its page still polls the
+        // session for the outcome.
+        let store = AttachStore::default();
+        let delivered = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&delivered, "w", "log".into(), None, None, 1)
+            .expect("the first report");
+        store.complete(&delivered, 2).expect("bound and delivered");
+
+        let next = store.create_pre(0).expect("create_pre");
+        store
+            .store_received(&next, "w", "log".into(), None, None, 3)
+            .expect("the next report");
+
+        assert_eq!(
+            store.status(&delivered, 4).expect("still answers"),
+            AttachStatus::Done
+        );
+    }
+
+    #[test]
     fn a_done_session_no_longer_holds_log_bytes() {
         let store = AttachStore::default();
         let mut sids = Vec::new();
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, "u", "log".into(), None, None, i)
+                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
                 .expect("fill");
             sids.push(sid);
         }
@@ -1207,7 +1348,7 @@ mod tests {
             .expect("complete frees a slot");
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
             .expect("free slot");
         assert_eq!(
             store.status(&sids[1], 501).expect("no eviction needed"),
@@ -1224,7 +1365,7 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, "u", "log".into(), None, None, i)
+                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
                 .expect("fill");
             sids.push(sid);
         }
@@ -1233,7 +1374,7 @@ mod tests {
         store.cancel(&sids[5], "not_author", 400);
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
             .expect("free slot");
         assert_eq!(
             store
