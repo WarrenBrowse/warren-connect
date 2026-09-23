@@ -41,6 +41,8 @@ struct StubState {
     other_authors: Mutex<std::collections::HashMap<u64, String>>,
     /// How long the topic endpoint takes to answer, so requests overlap.
     topic_delay: Mutex<Option<std::time::Duration>>,
+    /// How long the upload takes, so a request can land mid-delivery.
+    upload_delay: Mutex<Option<std::time::Duration>>,
     upload_ok: bool,
     /// Tags the topic already carries, echoed back by the topic endpoint.
     existing_tags: Vec<String>,
@@ -105,6 +107,10 @@ async fn stub_upload(
     State(s): State<Arc<StubState>>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let delay = *s.upload_delay.lock().expect("stub mutex");
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     if !s.upload_ok {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -167,6 +173,7 @@ async fn spawn_stub_with_tag_shape(
         author: author.to_owned(),
         other_authors: Mutex::new(std::collections::HashMap::new()),
         topic_delay: Mutex::new(None),
+        upload_delay: Mutex::new(None),
         upload_ok,
         existing_tags,
         tags_as_objects,
@@ -1046,6 +1053,154 @@ async fn cancel_marks_the_session_cancelled() {
     assert_eq!(
         body_json(response).await,
         serde_json::json!({"status": "cancelled", "reason": "user_cancelled"})
+    );
+}
+
+fn cancel_request(sid: &str) -> Request<Body> {
+    Request::post(format!("/v1/attach/{sid}/cancel"))
+        .body(Body::empty())
+        .expect("request")
+}
+
+#[tokio::test]
+async fn a_cancel_after_the_app_delivered_leaves_the_report_to_its_bind() {
+    // The cancel is the app's decline, sent before it uploads anything. Past
+    // the upload it would only let whoever holds the sid drop a report the
+    // user already sent.
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = new_pre_sid(state.clone()).await;
+    assert_answer(
+        &upload(state.clone(), &key, &sid, 0, REPORT, [13; 16]).await,
+        &v.responses.attach.get("received"),
+        "the app delivered",
+    );
+
+    let response = router(state.clone())
+        .oneshot(cancel_request(&sid))
+        .await
+        .expect("infallible");
+
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"status": "cancelled"}),
+        "the cancel answers as it always did"
+    );
+    assert_answer(
+        &read_status(state.clone(), &sid).await,
+        &v.responses.attach_status.get("received"),
+        "the report is still parked",
+    );
+    let response = router(state)
+        .oneshot(bind_request(&sid, 42))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"status": "attached"}),
+        "and the forum still binds it"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_delivery_never_turns_delivered_logs_into_an_error() {
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    *stub.upload_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_millis(1000));
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+    let delivery = tokio::spawn({
+        let (state, key, sid) = (state.clone(), key.clone(), sid.clone());
+        async move { upload(state, &key, &sid, 42, REPORT, [14; 16]).await }
+    });
+    let mut in_flight = false;
+    for _ in 0..400 {
+        if read_status(state.clone(), &sid).await.body_utf8 == r#"{"status":"processing"}"# {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(in_flight, "the delivery reached Discourse");
+
+    router(state.clone())
+        .oneshot(cancel_request(&sid))
+        .await
+        .expect("infallible");
+
+    assert_answer(
+        &delivery.await.expect("the upload task"),
+        &v.responses.attach.get("attached"),
+        "the app is told its logs landed, because they did",
+    );
+    assert_answer(
+        &read_status(state, &sid).await,
+        &v.responses.attach_status.get("done"),
+        "and the page sees them done",
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_landing_before_the_delivery_starts_stops_it() {
+    // The decline and the upload race only when both are in flight, and the
+    // first one to reach the session wins: here the decline lands while the
+    // topic is still being fetched, so nothing is written.
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_millis(1000));
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+    let delivery = tokio::spawn({
+        let (state, key, sid) = (state.clone(), key.clone(), sid.clone());
+        async move { upload(state, &key, &sid, 42, REPORT, [15; 16]).await }
+    });
+    // Well inside the topic fetch. A cancel that beat the upload to the store
+    // altogether would end the same way.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    router(state.clone())
+        .oneshot(cancel_request(&sid))
+        .await
+        .expect("infallible");
+
+    assert_answer(
+        &delivery.await.expect("the upload task"),
+        &v.responses.attach.get("session_unknown"),
+        "the declined session takes no upload",
+    );
+    assert!(
+        stub.calls.lock().expect("stub mutex").is_empty(),
+        "nothing reached Discourse"
+    );
+    assert_answer(
+        &read_status(state, &sid).await,
+        &v.responses.attach_status.get("cancelled_user"),
+        "and the page shows the decline",
     );
 }
 

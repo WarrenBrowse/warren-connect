@@ -1381,7 +1381,15 @@ async fn forum_attach_logs(
     // re-attach that duplicates a staff PM is preferable to losing the logs.
     // Flagged only past the author check, and cleared if the writes fail: the
     // page shows progress exactly while there is progress to show.
-    state.attach.mark_processing(&req.sid);
+    state
+        .attach
+        .start_delivery(&req.sid, now_unix())
+        .inspect_err(|_| {
+            tracing::info!(
+                topic_id = req.topic_id,
+                "attach-logs refused: the session ended before the delivery started"
+            );
+        })?;
     if let Err(err) = deliver_to_staff(api, req.topic_id, &topic, log_text, meta, now).await {
         state.attach.clear_processing(&req.sid);
         return Err(err);
@@ -1860,14 +1868,16 @@ async fn attach_status(
     }))
 }
 
-/// App-initiated cancel. No signature for the same reason as
-/// [`session_cancel`]: the sid is an opaque 128-bit capability.
+/// The app's decline. No signature and no cookie, for the same reason as
+/// [`session_cancel`]: the app has neither, and a decline only ends a session
+/// that still waits for the app's upload (see `AttachStore::decline`).
+/// Answers the same for any id.
 async fn attach_cancel(
     State(state): State<Arc<AppState>>,
     Path(sid): Path<String>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     forum_api_enabled(&state)?;
-    state.attach.cancel(&sid, "user_cancelled", now_unix());
+    state.attach.decline(&sid, now_unix());
     Ok(Json(serde_json::json!({"status": "cancelled"})))
 }
 

@@ -33,7 +33,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 | `GET /v1/attach/:sid/meta` | Composer prefill poll: `pending`, then `received` + `version`/`os` parsed from the report |
 | `POST /v1/attach/:sid/bind` | Binds a received pre-topic session to a freshly created topic (author check + upload + staff PM + whisper); `409 no_log` before the app delivered |
 | `GET /v1/attach/:sid/status` | Browser poll: `pending` / `received` / `done` / `cancelled` |
-| `POST /v1/attach/:sid/cancel` | App-initiated cancel of an attach session |
+| `POST /v1/attach/:sid/cancel` | The app's decline of an attach session still waiting for its upload; a no-op once a report is parked or being delivered |
 | `POST /v1/help/intake` | Public unauthenticated guest help form: creates a PUBLIC Discourse topic as the intake bot, returns `{"topic_url","reference","code"}` (201) |
 | `POST /v1/help/reply` | Public guest follow-up: posts into the topic its `code` was issued for, returns `{"topic_url"}` (201) |
 | `GET /internal/by-pubkey/{ss58}` | Support lookup (bearer `INTERNAL_TOKEN`): recompute a wallet's handle + whether it registered |

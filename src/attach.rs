@@ -154,6 +154,12 @@ impl AttachSession {
     fn holds_log(&self) -> bool {
         self.received.as_ref().is_some_and(|r| r.log_text.is_some())
     }
+
+    /// Nothing from the app has reached this session yet: no upload being
+    /// delivered, no report parked, and not finished either way.
+    fn awaits_upload(&self) -> bool {
+        !self.done && self.cancelled.is_none() && !self.processing && self.received.is_none()
+    }
 }
 
 /// In-memory attach-session registry.
@@ -308,6 +314,22 @@ impl AttachStore {
         }
     }
 
+    /// The app's decline: ends a session that still waits for the app's
+    /// upload, and does nothing to one past it. The app declines before it
+    /// uploads anything; a later cancel would only let whoever holds the sid
+    /// drop a report the user already sent, or turn logs being delivered into
+    /// an answer that the session is gone. Idempotent; a no-op on an
+    /// unknown/expired session.
+    pub fn decline(&self, sid: &str, now_unix: u64) {
+        let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        if let Some(session) = sessions.get_mut(sid)
+            && !session.expired(now_unix)
+            && session.awaits_upload()
+        {
+            session.cancelled = Some("user_cancelled".to_owned());
+        }
+    }
+
     /// Checks that the session accepts the app's upload for `topic_id`,
     /// without transitioning it (the Discourse writes may still fail, in which
     /// case the session must stay retryable). A pre-topic session accepts only
@@ -331,23 +353,30 @@ impl AttachStore {
     }
 
     /// Flags a session as "the app approved, work in progress", so the polling
-    /// browser can swap its idle copy for a live progress indicator. Silent
-    /// when the session is gone: this is a display hint, never a gate.
-    pub fn mark_processing(&self, sid: &str) {
-        self.set_processing(sid, true);
+    /// browser can swap its idle copy for a live progress indicator, and from
+    /// then on [`Self::decline`] leaves it alone. [`Self::begin`] checked the
+    /// session before the topic fetch; this checks it again, so a decline that
+    /// landed during that fetch stops the delivery before any Discourse write.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] if unknown, expired, finished or cancelled.
+    pub fn start_delivery(&self, sid: &str, now_unix: u64) -> Result<(), AuthError> {
+        let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        let session = sessions.get_mut(sid).ok_or(AuthError::Session)?;
+        if session.expired(now_unix) || session.done || session.cancelled.is_some() {
+            return Err(AuthError::Session);
+        }
+        session.processing = true;
+        Ok(())
     }
 
     /// Clears the progress hint after a failed delivery, so a session that
     /// stays retryable also LOOKS retryable: leaving it set would spin the
     /// page forever on "sending your logs" while nothing is in flight.
     pub fn clear_processing(&self, sid: &str) {
-        self.set_processing(sid, false);
-    }
-
-    fn set_processing(&self, sid: &str, value: bool) {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         if let Some(session) = sessions.get_mut(sid) {
-            session.processing = value;
+            session.processing = false;
         }
     }
 
@@ -550,15 +579,15 @@ pub fn gunzip_capped(gz: &[u8]) -> Result<String, AuthError> {
 mod tests {
     #[test]
     fn processing_is_a_display_hint_that_can_be_taken_back() {
-        // Set when the app approves, cleared when the delivery fails, so the
-        // page never spins on work that is no longer happening.
+        // Set when the delivery starts, cleared when it fails, so the page
+        // never spins on work that is no longer happening.
         let store = AttachStore::default();
         let sid = store.create(42, &browser(), 100).expect("create");
         assert_eq!(
             store.status(&sid, 100).expect("status"),
             AttachStatus::Pending
         );
-        store.mark_processing(&sid);
+        store.start_delivery(&sid, 100).expect("start");
         assert_eq!(
             store.status(&sid, 100).expect("status"),
             AttachStatus::Processing
@@ -568,8 +597,65 @@ mod tests {
             store.status(&sid, 100).expect("status"),
             AttachStatus::Pending
         );
-        // Unknown sid is a no-op, never a panic: it is only a hint.
-        store.mark_processing("deadbeef");
+        // Clearing an unknown sid is a no-op, never a panic.
+        store.clear_processing("deadbeef");
+    }
+
+    #[test]
+    fn a_delivery_starts_only_on_a_session_still_live() {
+        let store = AttachStore::default();
+        let declined = store.create(42, &browser(), 0).expect("create");
+        store.begin(&declined, 42, 1).expect("begin");
+        store.decline(&declined, 2);
+        assert!(
+            matches!(store.start_delivery(&declined, 3), Err(AuthError::Session)),
+            "a decline that landed after the begin wins"
+        );
+        let done = store.create(43, &browser(), 0).expect("create");
+        store.complete(&done, 1).expect("complete");
+        assert!(store.start_delivery(&done, 2).is_err(), "finished");
+        let old = store.create(44, &browser(), 0).expect("create");
+        assert!(
+            store.start_delivery(&old, ATTACH_TTL_SECS).is_err(),
+            "expired"
+        );
+        assert!(store.start_delivery("deadbeef", 0).is_err(), "unknown");
+    }
+
+    #[test]
+    fn a_decline_ends_only_a_session_still_waiting_for_the_upload() {
+        let store = AttachStore::default();
+        let waiting = store.create(42, &browser(), 0).expect("create");
+        let delivering = store.create(43, &browser(), 0).expect("create");
+        store.start_delivery(&delivering, 0).expect("start");
+        let parked = store.create_pre(0).expect("create_pre");
+        received(&store, &parked, 0);
+        let done = store.create(44, &browser(), 0).expect("create");
+        store.complete(&done, 0).expect("complete");
+
+        for sid in [&waiting, &delivering, &parked, &done] {
+            store.decline(sid, 1);
+        }
+
+        assert_eq!(
+            store.status(&waiting, 2).expect("status"),
+            AttachStatus::Cancelled {
+                reason: "user_cancelled".into()
+            }
+        );
+        assert_eq!(
+            store.status(&delivering, 2).expect("status"),
+            AttachStatus::Processing
+        );
+        assert_eq!(
+            store.status(&parked, 2).expect("status"),
+            AttachStatus::Received
+        );
+        assert!(
+            store.claim_bind(&parked, 2).is_ok(),
+            "the parked report is still there to bind"
+        );
+        assert_eq!(store.status(&done, 2).expect("status"), AttachStatus::Done);
     }
 
     use super::*;
