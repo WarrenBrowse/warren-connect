@@ -2407,6 +2407,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "warren-contract",
+ "zeroize",
 ]
 
 [[package]]

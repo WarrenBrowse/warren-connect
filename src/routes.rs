@@ -21,7 +21,7 @@ use crate::error::AuthError;
 use crate::forum_api::{self, ForumApi};
 use crate::nonces::NonceStore;
 use crate::sessions::{
-    Approach, BrowserKey, BrowserSecret, CompletionCode, ConfirmOutcome, Consumed,
+    Approach, BrowserKey, BrowserSecret, CancelReason, CompletionCode, ConfirmOutcome, Consumed,
     SESSION_TTL_SECS, SessionStatus, SessionStore,
 };
 use crate::ticket::TicketKey;
@@ -641,7 +641,9 @@ async fn forum_login(
                 // the browser and the app, and the only power here is picking
                 // which of two benign messages that browser shows.
                 if let Ok(login) = serde_json::from_slice::<LoginBody>(&body) {
-                    state.sessions.cancel(&login.sid, "clock_skew", now);
+                    state
+                        .sessions
+                        .cancel(&login.sid, CancelReason::ClockSkew, now);
                 }
                 // The drift is a duration, not an identifier: logging it is
                 // what turns a 100%-failure day into a one-grep diagnosis
@@ -678,7 +680,7 @@ async fn forum_login(
         // predates this answer and shows a generic failure.
         state
             .sessions
-            .cancel(&primary_sid, "app_update_required", now);
+            .cancel(&primary_sid, CancelReason::AppUpdateRequired, now);
         tracing::info!(
             pubkey = %redact(&identity.pubkey_ss58),
             refusal = refusal.token(),
@@ -693,7 +695,7 @@ async fn forum_login(
             // Tell the browser so its approval page stops polling and explains why.
             state
                 .sessions
-                .cancel(&login.sid, "subscription_required", now);
+                .cancel(&login.sid, CancelReason::SubscriptionRequired, now);
             return Err(AuthError::SubscriptionRequired);
         }
         Err(AdmitError::Store) => return Err(AuthError::Session),
@@ -1062,7 +1064,9 @@ async fn session_cancel(
     State(state): State<Arc<AppState>>,
     Path(sid): Path<String>,
 ) -> Json<serde_json::Value> {
-    state.sessions.cancel(&sid, "user_cancelled", now_unix());
+    state
+        .sessions
+        .cancel(&sid, CancelReason::UserCancelled, now_unix());
     Json(serde_json::json!({"status": "cancelled"}))
 }
 
@@ -1074,7 +1078,7 @@ fn status_body(status: &SessionStatus) -> serde_json::Value {
         SessionStatus::Approved => serde_json::json!({ "status": "approved" }),
         SessionStatus::Completed => serde_json::json!({ "status": "completed" }),
         SessionStatus::Cancelled { reason } => {
-            serde_json::json!({ "status": "cancelled", "reason": reason })
+            serde_json::json!({ "status": "cancelled", "reason": reason.token() })
         }
     }
 }
@@ -1132,6 +1136,9 @@ async fn session_confirm(
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
+    if !CompletionCode::well_formed(&typed) {
+        return Err(AuthError::Payload);
+    }
     Ok(
         match state.sessions.confirm(&sid, &browser, &typed, now_unix())? {
             ConfirmOutcome::Confirmed => {
@@ -1151,7 +1158,7 @@ async fn session_confirm(
                 (
                     StatusCode::CONFLICT,
                     Json(status_body(&SessionStatus::Cancelled {
-                        reason: "code_attempts_exhausted".to_owned(),
+                        reason: CancelReason::CodeAttemptsExhausted,
                     })),
                 )
                     .into_response()

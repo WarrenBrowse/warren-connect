@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use rand::{Rng as _, RngCore as _};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
+use zeroize::Zeroizing;
 
 use crate::discourse::SsoUser;
 use crate::error::AuthError;
@@ -28,7 +29,7 @@ use crate::error::AuthError;
 /// How long a login may take from the approval page to the completion,
 /// confirm step included. Kept short: it bounds how long a relayed approval
 /// link is worth anything (see the threat note in warren-core doc 55).
-pub const SESSION_TTL_SECS: u64 = 300;
+pub(crate) const SESSION_TTL_SECS: u64 = 300;
 
 /// Hard cap on concurrent sessions (fail closed).
 const MAX_SESSIONS: usize = 10_000;
@@ -36,7 +37,7 @@ const MAX_SESSIONS: usize = 10_000;
 /// Wrong codes a browser may type before its login is cancelled. The code is
 /// six digits, so the holder of a cookie and a relayed approval wins with
 /// probability 5 in a million per approval they manage to obtain.
-pub const CODE_ATTEMPTS: u8 = 5;
+const CODE_ATTEMPTS: u8 = 5;
 
 /// Digits in a completion code: short enough to type from a phone screen.
 const CODE_DIGITS: usize = 6;
@@ -46,15 +47,15 @@ const BROWSER_SECRET_BYTES: usize = 32;
 
 /// The login cookie value: 32 bytes of OS entropy as 64 lowercase hex chars.
 /// Lives in the browser only (an `HttpOnly` cookie); the store keeps its hash.
-pub struct BrowserSecret(String);
+pub struct BrowserSecret(Zeroizing<String>);
 
 impl BrowserSecret {
     /// A fresh secret for a browser that presented none.
     #[must_use]
     pub fn generate() -> Self {
-        let mut raw = [0u8; BROWSER_SECRET_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
-        Self(hex::encode(raw))
+        let mut raw = Zeroizing::new([0u8; BROWSER_SECRET_BYTES]);
+        rand::rngs::OsRng.fill_bytes(raw.as_mut());
+        Self(Zeroizing::new(hex::encode(raw.as_ref())))
     }
 
     /// The secret a browser presented, when it has the exact shape this
@@ -65,7 +66,7 @@ impl BrowserSecret {
             && raw
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        well_formed.then(|| Self(raw.to_owned()))
+        well_formed.then(|| Self(Zeroizing::new(raw.to_owned())))
     }
 
     /// The cookie value, for the `Set-Cookie` header and nothing else.
@@ -105,13 +106,20 @@ impl std::fmt::Debug for BrowserKey {
 
 /// The one-time code an approval returns to the signing wallet, six digits
 /// from the OS RNG. Never rendered by any page and never logged.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CompletionCode(String);
+#[derive(Clone)]
+pub struct CompletionCode(Zeroizing<String>);
 
 impl CompletionCode {
     fn generate() -> Self {
         let n: u32 = rand::rngs::OsRng.gen_range(0..1_000_000);
-        Self(format!("{n:0width$}", width = CODE_DIGITS))
+        Self(Zeroizing::new(format!("{n:0width$}", width = CODE_DIGITS)))
+    }
+
+    /// Whether `typed` has the shape of a code at all. A string that cannot
+    /// be one costs no attempt: it cannot be a guess at this one.
+    #[must_use]
+    pub fn well_formed(typed: &str) -> bool {
+        typed.len() == CODE_DIGITS && typed.bytes().all(|b| b.is_ascii_digit())
     }
 
     /// The code, for the approving app's answer and nothing else.
@@ -133,8 +141,38 @@ impl std::fmt::Debug for CompletionCode {
     }
 }
 
+/// Why a login ended without completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The app's user declined the sign-in.
+    UserCancelled,
+    /// The wallet has never subscribed.
+    SubscriptionRequired,
+    /// The approving device's clock is outside the signature window.
+    ClockSkew,
+    /// The approval came in the form that predates the completion code and
+    /// was refused.
+    AppUpdateRequired,
+    /// The browser typed the last allowed wrong code.
+    CodeAttemptsExhausted,
+}
+
+impl CancelReason {
+    /// The token the pages and the vector name it by.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::UserCancelled => "user_cancelled",
+            Self::SubscriptionRequired => "subscription_required",
+            Self::ClockSkew => "clock_skew",
+            Self::AppUpdateRequired => "app_update_required",
+            Self::CodeAttemptsExhausted => "code_attempts_exhausted",
+        }
+    }
+}
+
 /// Session state as the browser that started it sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     /// Waiting for the app's signed approval.
     Pending,
@@ -144,12 +182,10 @@ pub enum SessionStatus {
     Approved,
     /// This browser already completed the login (another of its tabs did).
     Completed,
-    /// The login ended without one. `reason` is a short machine token for
-    /// the page: `user_cancelled`, `subscription_required`, `clock_skew`,
-    /// `app_update_required`, `code_attempts_exhausted`.
+    /// The login ended without one.
     Cancelled {
-        /// Short reason token.
-        reason: String,
+        /// Why, for the page to explain.
+        reason: CancelReason,
     },
 }
 
@@ -230,7 +266,7 @@ enum State {
     },
     Completed,
     Cancelled {
-        reason: String,
+        reason: CancelReason,
     },
 }
 
@@ -241,9 +277,7 @@ impl State {
             State::AwaitingCode { .. } => SessionStatus::AwaitingCode,
             State::Approved { .. } => SessionStatus::Approved,
             State::Completed => SessionStatus::Completed,
-            State::Cancelled { reason } => SessionStatus::Cancelled {
-                reason: reason.clone(),
-            },
+            State::Cancelled { reason } => SessionStatus::Cancelled { reason: *reason },
         }
     }
 }
@@ -263,25 +297,25 @@ impl Session {
     }
 }
 
-impl std::fmt::Debug for Session {
-    /// The state name only: the code, the identity and the browser key stay
-    /// out of any rendering.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("created_unix", &self.created_unix)
-            .field("status", &self.state.status())
-            .finish_non_exhaustive()
-    }
-}
-
 /// In-memory session registry.
 ///
 /// Keyed on the same-device sid. `by_qr` maps the QR's id onto it, so the two
 /// ids address one session and only one of them ever says "another device".
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     by_qr: Mutex<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for SessionStore {
+    /// A count only: the keys are session ids, and nothing else in a session
+    /// is fit to print either.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live = self.sessions.lock().map_or(0, |sessions| sessions.len());
+        f.debug_struct("SessionStore")
+            .field("sessions", &live)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 16 bytes of OS entropy as 32 hex chars: the shape every client validates.
@@ -398,7 +432,7 @@ impl SessionStore {
     /// or the approval was refused), with a short reason token. Accepts
     /// either id. A no-op on anything else: past the approval the browser
     /// alone decides, so an id, which anybody may hold, cannot end it.
-    pub fn cancel(&self, sid: &str, reason: &str, now_unix: u64) {
+    pub fn cancel(&self, sid: &str, reason: CancelReason, now_unix: u64) {
         let Ok((primary, _)) = self.resolve(sid, now_unix) else {
             return;
         };
@@ -406,9 +440,7 @@ impl SessionStore {
         if let Some(session) = sessions.get_mut(&primary)
             && matches!(session.state, State::Pending)
         {
-            session.state = State::Cancelled {
-                reason: reason.to_owned(),
-            };
+            session.state = State::Cancelled { reason };
         }
     }
 
@@ -492,33 +524,34 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
         owned(&sessions, sid, browser, now_unix)?;
         let session = sessions.get_mut(sid).ok_or(AuthError::BrowserMismatch)?;
+        let state = std::mem::replace(&mut session.state, State::Pending);
         let State::AwaitingCode {
+            user,
             code,
             attempts_left,
-            ..
-        } = &mut session.state
+        } = state
         else {
-            return Ok(ConfirmOutcome::NotAwaitingCode(session.state.status()));
+            let status = state.status();
+            session.state = state;
+            return Ok(ConfirmOutcome::NotAwaitingCode(status));
         };
         if code.matches(typed) {
-            let State::AwaitingCode { user, .. } =
-                std::mem::replace(&mut session.state, State::Pending)
-            else {
-                unreachable!("matched as AwaitingCode just above");
-            };
             session.state = State::Approved { user };
             return Ok(ConfirmOutcome::Confirmed);
         }
-        *attempts_left = attempts_left.saturating_sub(1);
-        if *attempts_left == 0 {
+        let attempts_left = attempts_left.saturating_sub(1);
+        if attempts_left == 0 {
             session.state = State::Cancelled {
-                reason: "code_attempts_exhausted".to_owned(),
+                reason: CancelReason::CodeAttemptsExhausted,
             };
             return Ok(ConfirmOutcome::Exhausted);
         }
-        Ok(ConfirmOutcome::Wrong {
-            attempts_left: *attempts_left,
-        })
+        session.state = State::AwaitingCode {
+            user,
+            code,
+            attempts_left,
+        };
+        Ok(ConfirmOutcome::Wrong { attempts_left })
     }
 
     /// Completes a ready login for the browser that started it (single use).
@@ -536,14 +569,14 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
         owned(&sessions, sid, browser, now_unix)?;
         let session = sessions.get_mut(sid).ok_or(AuthError::BrowserMismatch)?;
-        match session.state {
-            State::Approved { .. } => {}
+        let user = match std::mem::replace(&mut session.state, State::Completed) {
+            State::Approved { user } => user,
             State::Completed => return Ok(Consumed::AlreadyCompleted),
-            _ => return Ok(Consumed::NotReady(session.state.status())),
-        }
-        let State::Approved { user } = std::mem::replace(&mut session.state, State::Completed)
-        else {
-            unreachable!("matched as Approved just above");
+            other => {
+                let status = other.status();
+                session.state = other;
+                return Ok(Consumed::NotReady(status));
+            }
         };
         self.by_qr
             .lock()
@@ -735,13 +768,13 @@ mod tests {
         assert_eq!(
             store.status(&ids.sid, &b, 3),
             Ok(SessionStatus::Cancelled {
-                reason: "code_attempts_exhausted".into()
+                reason: CancelReason::CodeAttemptsExhausted
             })
         );
         assert_eq!(
             store.confirm(&ids.sid, &b, code.as_str(), 4),
             Ok(ConfirmOutcome::NotAwaitingCode(SessionStatus::Cancelled {
-                reason: "code_attempts_exhausted".into()
+                reason: CancelReason::CodeAttemptsExhausted
             })),
             "the right code after the budget opens nothing"
         );
@@ -849,12 +882,12 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store.cancel(&ids.qr_sid, "user_cancelled", 1);
+        store.cancel(&ids.qr_sid, CancelReason::UserCancelled, 1);
 
         assert_eq!(
             store.status(&ids.sid, &b, 2),
             Ok(SessionStatus::Cancelled {
-                reason: "user_cancelled".into()
+                reason: CancelReason::UserCancelled
             }),
             "either id cancels, and the browser polling its own sees it"
         );
@@ -868,7 +901,7 @@ mod tests {
         let ids = open(&store, "n", &b);
         store.approve_bound(&ids.sid, user(), 1).expect("approve");
 
-        store.cancel(&ids.sid, "user_cancelled", 2);
+        store.cancel(&ids.sid, CancelReason::UserCancelled, 2);
 
         assert_eq!(
             store.status(&ids.sid, &b, 3),
@@ -969,7 +1002,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let first = open(&store, "n", &b);
-        store.cancel(&first.sid, "clock_skew", 1);
+        store.cancel(&first.sid, CancelReason::ClockSkew, 1);
 
         let second = open(&store, "n", &b);
 
@@ -978,6 +1011,38 @@ mod tests {
         assert!(
             store.resolve(&first.qr_sid, 2).is_err(),
             "the replaced login's QR must die with it"
+        );
+    }
+
+    #[test]
+    fn only_six_digits_have_the_shape_of_a_code() {
+        assert!(CompletionCode::well_formed("042917"));
+        for hostile in ["", "42917", "0429170", "04291a", "04 917", "\u{661}42917"] {
+            assert!(!CompletionCode::well_formed(hostile), "{hostile:?}");
+        }
+    }
+
+    #[test]
+    fn every_cancel_reason_has_the_token_the_pages_read() {
+        let tokens: Vec<&str> = [
+            CancelReason::UserCancelled,
+            CancelReason::SubscriptionRequired,
+            CancelReason::ClockSkew,
+            CancelReason::AppUpdateRequired,
+            CancelReason::CodeAttemptsExhausted,
+        ]
+        .into_iter()
+        .map(CancelReason::token)
+        .collect();
+        assert_eq!(
+            tokens,
+            [
+                "user_cancelled",
+                "subscription_required",
+                "clock_skew",
+                "app_update_required",
+                "code_attempts_exhausted"
+            ]
         );
     }
 
@@ -1006,9 +1071,7 @@ mod tests {
         assert_eq!(format!("{code:?}"), "CompletionCode(redacted)");
 
         let rendered = format!("{store:?}");
-        assert!(rendered.contains("AwaitingCode"), "{rendered}");
-        for leak in ["external_id", "CompletionCode(\"", "BrowserKey(["] {
-            assert!(!rendered.contains(leak), "{leak} in {rendered}");
-        }
+        assert_eq!(rendered, "SessionStore { sessions: 1, .. }");
+        assert!(!rendered.contains(&ids.sid) && !rendered.contains(&ids.qr_sid));
     }
 }

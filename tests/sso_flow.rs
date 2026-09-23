@@ -2013,3 +2013,30 @@ async fn a_linked_wallet_whose_forum_account_is_not_under_its_handle_counts_as_s
     assert_eq!(answer.status, 400);
     assert_eq!(answer.body_utf8, r#"{"error":"app_update_required"}"#);
 }
+
+#[tokio::test]
+async fn a_code_of_the_wrong_shape_is_refused_without_spending_an_attempt() {
+    let app = router(paid_state());
+    let browser = open_sso(&app, "n-shape", None).await;
+    let (key, _) = paid_signer();
+    let approval = send(&app, signed_bound_login(&key, &browser.sid(), [0x52; 16])).await;
+    let wrong = other_code(&completion_code(&approval));
+
+    for shape in ["12345", "1234567", "12a456", ""] {
+        let answer = send(
+            &app,
+            confirm_request(&browser.sid(), Some(&browser.cookie()), shape),
+        )
+        .await;
+        assert_eq!(answer.status, 400, "{shape:?}");
+    }
+    let answer = send(
+        &app,
+        confirm_request(&browser.sid(), Some(&browser.cookie()), &wrong),
+    )
+    .await;
+    assert_eq!(
+        answer.body_utf8, r#"{"attempts_left":4,"error":"code_invalid"}"#,
+        "the malformed codes cost nothing"
+    );
+}
