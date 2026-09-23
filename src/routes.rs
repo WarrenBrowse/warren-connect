@@ -19,6 +19,7 @@ use crate::attach::{self, AttachKind, AttachStatus, AttachStore};
 use crate::discourse::{self, SsoUser};
 use crate::error::AuthError;
 use crate::forum_api::{self, ForumApi};
+use crate::gate::GateBusy;
 use crate::nonces::NonceStore;
 use crate::sessions::{
     Approach, BrowserKey, BrowserSecret, CancelReason, CompletionCode, ConfirmOutcome, Consumed,
@@ -69,6 +70,8 @@ pub struct AppState {
     pub legacy_approval: LegacyApproval,
     /// Anti-replay registry.
     pub nonces: NonceStore,
+    /// Bounds on the reads the signed routes make before they decide.
+    pub gates: crate::gate::Gates,
     /// Pending attach-logs sessions.
     pub attach: AttachStore,
     /// Discourse admin API client; `None` disables the attach-logs feature.
@@ -588,14 +591,18 @@ async fn legacy_admission(
     if state.legacy_approval == LegacyApproval::Deny {
         return Err(LegacyGate::Refused(LegacyRefusal::Disabled));
     }
-    match is_forum_staff(state, identity).await {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(LegacyGate::Refused(LegacyRefusal::Staff)),
-        Err(err) => {
+    match state.gates.login.run(is_forum_staff(state, identity)).await {
+        Ok(Ok(false)) => Ok(()),
+        Ok(Ok(true)) => Err(LegacyGate::Refused(LegacyRefusal::Staff)),
+        Ok(Err(err)) => {
             tracing::warn!(
                 kind = sqlx_error_kind(&err),
                 "forum staff status unreadable"
             );
+            Err(LegacyGate::Unread)
+        }
+        Err(GateBusy) => {
+            tracing::debug!("forum login gate saturated");
             Err(LegacyGate::Unread)
         }
     }
@@ -727,7 +734,10 @@ async fn forum_login(
     // signed body names without taking a nonce: once ended, that session no
     // longer awaits an approval, so a replay stops at the check above, and
     // whoever holds the sid can end it anyway through the unsigned cancel.
-    let admitted = match admit_forum_identity(&state, &request).await {
+    let door = Door::Login {
+        session: &primary_sid,
+    };
+    let admitted = match admit_forum_identity(&state, &request, door).await {
         Ok(admitted) => admitted,
         Err(AdmitError::NeverPaid) => {
             // Tell the browser so its approval page stops polling and explains why.
@@ -743,6 +753,7 @@ async fn forum_login(
             );
             return Err(AuthError::Nonce);
         }
+        Err(AdmitError::SessionEnded) => return Err(AuthError::Session),
         // Retryable, and the session keeps waiting for its approval: the
         // apps show a transient failure and sign again.
         Err(AdmitError::Unavailable) => return Err(AuthError::Forum),
@@ -807,9 +818,126 @@ enum AdmitError {
     /// Past the paywall, the nonce was not admitted: a replay, or the replay
     /// store refused it.
     Nonce,
-    /// A database the admission reads or writes failed. It says nothing about
-    /// the wallet, so it ends no session and a retry can succeed.
+    /// A database the admission reads or writes failed, or its gate is
+    /// saturated. It says nothing about the wallet, so it ends no session and
+    /// a retry can succeed.
     Unavailable,
+    /// The login's session stopped waiting for an approval while this one
+    /// waited for the gate.
+    SessionEnded,
+}
+
+/// The route a paywall read comes through, which decides its bulkhead and
+/// whether a recent "never paid" is answered from memory.
+#[derive(Clone, Copy)]
+enum Door<'a> {
+    /// The browser login approving `session`.
+    Login {
+        /// Either id of the session the signed body names.
+        session: &'a str,
+    },
+    /// The in-app report, which any signature can reach.
+    Report,
+}
+
+/// The wallet's subscription standing, read through the bulkhead of `door`.
+async fn paywall_standing(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+    door: Door<'_>,
+) -> Result<store::SubscriptionStatus, AdmitError> {
+    let read = async || {
+        state
+            .identity
+            .subscription_status(&identity.pubkey_ss58)
+            .await
+            .map_err(|e| {
+                // Log the sqlx error KIND only, never `%e` (a Postgres error
+                // detail on the identity columns could echo a pubkey).
+                tracing::error!(kind = ?sqlx_error_kind(&e), "subscription lookup failed");
+                AdmitError::Unavailable
+            })
+    };
+    let gate_busy = |gate: &'static str| {
+        tracing::debug!(gate, "paywall gate saturated");
+        AdmitError::Unavailable
+    };
+    match door {
+        Door::Login { session } => state
+            .gates
+            .login
+            .run(async {
+                // Approvals of one session sent together queue here, and the
+                // first "never paid" ends it: the rest read nothing.
+                if !state.sessions.awaits_approval(session, now_unix()) {
+                    return Err(AdmitError::SessionEnded);
+                }
+                read().await
+            })
+            .await
+            .map_err(|GateBusy| gate_busy("login"))?,
+        Door::Report => {
+            let now = now_unix();
+            if state.gates.never_paid.holds(&identity.pubkey, now) {
+                return Ok(store::SubscriptionStatus::default());
+            }
+            let started = state.gates.never_paid.start_read();
+            let status = state
+                .gates
+                .open
+                .run(read())
+                .await
+                .map_err(|GateBusy| gate_busy("open"))??;
+            if !status.ever_paid {
+                state
+                    .gates
+                    .never_paid
+                    .record(identity.pubkey, started, now_unix());
+            }
+            Ok(status)
+        }
+    }
+}
+
+/// Whether the signer has a forum link, read in the open bulkhead, a recent
+/// "no" answered from memory.
+///
+/// # Errors
+/// [`AuthError::Forum`] when the link cannot be read or the gate is
+/// saturated: retryable, and nothing about the wallet is known.
+async fn forum_link(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+    forum: &handle::ForumHandle,
+) -> Result<bool, AuthError> {
+    if state.gates.unlinked.holds(&identity.pubkey, now_unix()) {
+        return Ok(false);
+    }
+    let started = state.gates.unlinked.start_read();
+    match state
+        .gates
+        .open
+        .run(state.identity.is_linked(&forum.external_id))
+        .await
+    {
+        Ok(Ok(linked)) => {
+            if !linked {
+                state
+                    .gates
+                    .unlinked
+                    .record(identity.pubkey, started, now_unix());
+            }
+            Ok(linked)
+        }
+        Ok(Err(err)) => {
+            tracing::error!(kind = sqlx_error_kind(&err), "forum link lookup failed");
+            Err(AuthError::Forum)
+        }
+        Err(GateBusy) => {
+            tracing::debug!("forum link gate saturated");
+            Err(AuthError::Forum)
+        }
+    }
 }
 
 /// The one admission path of a wallet-signed forum identity, shared by the
@@ -819,6 +947,7 @@ enum AdmitError {
 async fn admit_forum_identity(
     state: &AppState,
     request: &VerifiedRequest,
+    door: Door<'_>,
 ) -> Result<AdmittedIdentity, AdmitError> {
     let identity = &request.identity;
     // Staff is an allowlist, independent of payment: admins are operators and
@@ -831,16 +960,7 @@ async fn admit_forum_identity(
     // nothing and refuses nothing: read as "never paid", a flood that loads
     // the database would turn every paying user's sign-in into a
     // subscription refusal.
-    let status = state
-        .identity
-        .subscription_status(&identity.pubkey_ss58)
-        .await
-        .map_err(|e| {
-            // Log the sqlx error KIND only, never `%e` (a Postgres error detail
-            // on the identity columns could echo a pubkey; no-log policy).
-            tracing::error!(kind = ?sqlx_error_kind(&e), "subscription lookup failed");
-            AdmitError::Unavailable
-        })?;
+    let status = paywall_standing(state, identity, door).await?;
     if !login_allowed(status.ever_paid, admin) {
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);
@@ -861,6 +981,9 @@ async fn admit_forum_identity(
             tracing::error!(kind = ?sqlx_error_kind(&e), pubkey = %redact(&identity.pubkey_ss58), "link upsert failed");
             AdmitError::Unavailable
         })?;
+    // Called only once the link is written: a link read that started before
+    // it is then kept from recording the stale "no".
+    state.gates.unlinked.forget(&identity.pubkey);
 
     // Best effort: an admission that cannot get a digest slot is still an
     // admission. The device simply shows no forum badge until the next one.
@@ -958,15 +1081,7 @@ async fn forum_notifications(
         .ok_or(AuthError::FeatureDisabled)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-    let linked = state
-        .identity
-        .is_linked(&forum.external_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(kind = ?sqlx_error_kind(&e), "notifications: link lookup failed");
-            AuthError::Forum
-        })?;
-    if !linked {
+    if !forum_link(&state, identity, &forum).await? {
         return Ok(Json(serde_json::json!({ "notifications": [] })).into_response());
     }
     request.admit(&state.nonces, now_unix())?;
@@ -1037,15 +1152,7 @@ async fn forum_notifications_seen(
     let seen_pool = state.seen_pool.as_ref().ok_or(AuthError::FeatureDisabled)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-    let linked = state
-        .identity
-        .is_linked(&forum.external_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(kind = ?sqlx_error_kind(&e), "seen: link lookup failed");
-            AuthError::Forum
-        })?;
-    if !linked {
+    if !forum_link(&state, identity, &forum).await? {
         // A wallet that never logged in to the forum has no list to mark, and
         // Discourse is not touched at all.
         return Ok(Json(serde_json::json!({ "seen": false })).into_response());
@@ -1374,7 +1481,7 @@ async fn forum_attach_logs(
     // Pre-topic session: no topic exists yet, so the report is parked in the
     // session (with the signer's handle for the author check at bind time).
     if kind == AttachKind::PreTopic {
-        admit_pre_topic_signer(&state, identity, &forum).await?;
+        admit_linked_signer(&state, identity, &forum).await?;
         request.admit(&state.nonces, now_unix()).inspect_err(|_| {
             tracing::info!(
                 pubkey = %redact(&identity.pubkey_ss58),
@@ -1406,8 +1513,30 @@ async fn forum_attach_logs(
 
     // Only the topic author may attach logs to it: the wallet proves itself
     // via the signature, the topic proves its author via Discourse, and the
-    // deterministic handle bridges the two.
-    let topic = api.topic(req.topic_id).await?;
+    // deterministic handle bridges the two. The author has a forum account,
+    // so a forum link: a wallet without one is refused before the fetch.
+    admit_linked_signer(&state, identity, &forum).await?;
+    let fetch = async {
+        // Charged once the gate lets the fetch run, so a saturated gate
+        // spends none of the session's fetches.
+        state
+            .attach
+            .charge_topic_fetch(&req.sid, now)
+            .inspect_err(|_| {
+                tracing::info!(
+                    topic_id = req.topic_id,
+                    "attach-logs refused: the session has no topic fetch left"
+                );
+            })?;
+        Ok::<_, AuthError>(api.topic(req.topic_id).await?)
+    };
+    let topic = match state.gates.topic.run(fetch).await {
+        Ok(fetched) => fetched?,
+        Err(GateBusy) => {
+            tracing::debug!("attach topic gate saturated");
+            return Err(AuthError::Forum);
+        }
+    };
     if !topic.author_username.eq_ignore_ascii_case(&forum.username) {
         // The topic alone: it is public, so a wallet next to it, even
         // redacted, is the link the pairwise handle exists to break.
@@ -1458,37 +1587,32 @@ async fn forum_attach_logs(
         .into_response())
 }
 
-/// The gate of a pre-topic upload: the signer must have a forum link. A parked
-/// report holds one of [`attach::MAX_LOG_SESSIONS`] slots until its bind and a
-/// wallet costs nothing to mint, so a signature alone would let anybody fill
-/// the store and evict the reports of users still writing their topic. The
-/// composer that mints the session is open only to a signed-in forum user,
-/// and signing in records the link. The one reporter without it is one whose
-/// forum session outlived [`crate::FORUM_LINK_RETENTION_DAYS`] since their
-/// last sign-in, and signing in again restores it. Checked before the gunzip,
-/// the costly step.
-async fn admit_pre_topic_signer(
+/// The first gate of an upload: the signer must have a forum link.
+///
+/// A pre-topic upload parks a report in one of [`attach::MAX_LOG_SESSIONS`]
+/// slots until its bind, and a wallet costs nothing to mint, so a signature
+/// alone would let anybody fill the store and evict the reports of users
+/// still writing their topic. A topic upload fetches the topic from Discourse
+/// for its author check, on a session anybody can open for any topic. The
+/// composer that mints a pre-topic session is open only to a signed-in forum
+/// user, a topic's author has signed in, and signing in records the link.
+/// The one reporter without it is one whose forum session outlived
+/// [`crate::FORUM_LINK_RETENTION_DAYS`] since their last sign-in, and signing
+/// in again restores it. Checked before the gunzip and the fetch.
+async fn admit_linked_signer(
     state: &AppState,
     identity: &crate::verify::VerifiedIdentity,
     forum: &handle::ForumHandle,
 ) -> Result<(), AuthError> {
-    match state.identity.is_linked(&forum.external_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            tracing::info!(
-                pubkey = %redact(&identity.pubkey_ss58),
-                "attach-logs refused: pre-topic upload from a wallet with no forum link"
-            );
-            Err(AuthError::NotAuthor)
-        }
-        Err(err) => {
-            tracing::error!(
-                kind = sqlx_error_kind(&err),
-                "attach-logs refused: forum link unreadable"
-            );
-            Err(AuthError::Forum)
-        }
+    if forum_link(state, identity, forum).await? {
+        return Ok(());
     }
+    // The wallet alone: it wrote no topic, so it is tied to none.
+    tracing::info!(
+        pubkey = %redact(&identity.pubkey_ss58),
+        "attach-logs refused: upload from a wallet with no forum link"
+    );
+    Err(AuthError::NotAuthor)
 }
 
 /// The Discourse writes shared by the topic-mode upload and the pre-topic
@@ -1728,7 +1852,7 @@ async fn forum_report(
     })?;
     crate::report::validate(&req)?;
 
-    let admitted = admit_forum_identity(&state, &request)
+    let admitted = admit_forum_identity(&state, &request, Door::Report)
         .await
         .map_err(|err| match err {
             AdmitError::NeverPaid => AuthError::SubscriptionRequired,
@@ -1739,7 +1863,7 @@ async fn forum_report(
                 );
                 AuthError::Nonce
             }
-            AdmitError::Unavailable => AuthError::Forum,
+            AdmitError::Unavailable | AdmitError::SessionEnded => AuthError::Forum,
         })?;
     // Charged after the signature and the gate: a forged or never-paid
     // request must not burn a member's budget. After the nonce too: the

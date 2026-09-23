@@ -13,8 +13,10 @@ use tower::ServiceExt as _;
 
 use warren_connect::admins::Allowlist;
 use warren_connect::attach::AttachStore;
+use warren_connect::forum_api::ForumApi;
+use warren_connect::intake::RateLimiter;
 use warren_connect::nonces::NonceStore;
-use warren_connect::routes::{AppState, LOGIN_COOKIE, LegacyApproval, router};
+use warren_connect::routes::{AppState, LOGIN_COOKIE, LegacyApproval, ReportState, router};
 use warren_connect::sessions::{BrowserSecret, SessionStore};
 use warren_connect::store::{IdentityStore, MemoryIdentity, SubscriptionStatus};
 
@@ -60,6 +62,9 @@ struct Setup<'a> {
     /// Build the Postgres form of the identity store over databases that
     /// never answer, instead of the in-memory one.
     unreachable_identity: bool,
+    /// Enable the in-app report, against a forum nobody listens on: the
+    /// suite only drives it as far as its gate.
+    report: bool,
 }
 
 impl Default for Setup<'_> {
@@ -74,6 +79,7 @@ impl Default for Setup<'_> {
             nonce_cap: None,
             discourse_wired: false,
             unreachable_identity: false,
+            report: false,
         }
     }
 }
@@ -126,10 +132,25 @@ fn build_state(setup: Setup<'_>) -> Arc<AppState> {
             .nonce_cap
             .map_or_else(NonceStore::default, NonceStore::with_max_entries),
         attach: AttachStore::default(),
-        forum_api: None,
+        gates: Default::default(),
+        forum_api: setup.report.then(unreachable_forum),
         intake: None,
-        report: None,
+        report: setup.report.then(|| ReportState {
+            topic_api: unreachable_forum(),
+            category_id: 13,
+            limiter: RateLimiter::new(3, 20, 3_600),
+            decode_failures: RateLimiter::new(3, 20, 3_600),
+        }),
     })
+}
+
+fn unreachable_forum() -> ForumApi {
+    ForumApi::new(
+        "http://127.0.0.1:1",
+        "unused".into(),
+        "system".into(),
+        "staff".into(),
+    )
 }
 
 fn signed_sso(payload: &str) -> (String, String) {
@@ -2515,4 +2536,323 @@ async fn the_notification_routes_answer_a_retryable_error_when_the_forum_links_c
         assert_eq!(answer.status, 502, "{path}: {}", answer.body_utf8);
     }
     assert_eq!(state.nonces.held(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Gate reads are bounded: each kind runs in its own bulkhead and refuses at
+// once past a short queue, and a recent "no" is answered from memory, so a
+// flood of free wallets cannot hold the databases a paying user's sign-in
+// needs.
+// ---------------------------------------------------------------------------
+
+fn report_body() -> String {
+    serde_json::json!({
+        "platform": "android",
+        "area": "other",
+        "frequency": "always",
+        "what_happened": "The forum sign-in button in Firefox does nothing at all.",
+        "steps": "Open the forum\nTap Log in\nTap the button",
+    })
+    .to_string()
+}
+
+/// Sends every request at once and returns the tasks answering them.
+fn flood(
+    app: &axum::Router,
+    requests: Vec<Request<Body>>,
+) -> Vec<tokio::task::JoinHandle<forum_vector::Answer>> {
+    requests
+        .into_iter()
+        .map(|request| {
+            let app = app.clone();
+            tokio::spawn(async move { send(&app, request).await })
+        })
+        .collect()
+}
+
+/// Lets every task spawned so far run up to the point where it waits.
+async fn settle() {
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn statuses(tasks: Vec<tokio::task::JoinHandle<forum_vector::Answer>>) -> Vec<u16> {
+    let mut statuses = Vec::new();
+    for task in tasks {
+        statuses.push(task.await.expect("task").status);
+    }
+    statuses
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flood_of_free_wallet_reports_holding_the_warren_pool_does_not_reach_a_paid_login() {
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        paid_ss58: Some(&ss58),
+        report: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let page = open_sso(&app, "n-report-flood", None).await;
+    // Sixty reads of two seconds on three connections keep a read that waits
+    // behind them past the 30 s acquire timeout.
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(2));
+    let reports = (0..60u8)
+        .map(|i| {
+            signed_post(
+                &free_key(0x20 + i),
+                "/v1/forum/report",
+                &report_body(),
+                unix_now(),
+                [i; 16],
+            )
+        })
+        .collect();
+    let reports = flood(&app, reports);
+    settle().await;
+
+    let paid = send(&app, signed_bound_login(&key, &page.sid(), [0xb0; 16])).await;
+
+    assert_eq!(paid.status, 200, "{}", paid.body_utf8);
+    let answered = statuses(reports).await;
+    assert!(
+        answered.iter().all(|s| *s == 403 || *s == 502),
+        "each free wallet is refused or turned away: {answered:?}"
+    );
+    assert!(
+        memory(&state).warren_db.queries() < 20,
+        "one report read at a time and a short queue reach the database, not sixty: {}",
+        memory(&state).warren_db.queries()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flood_of_free_wallet_logins_reaches_the_warren_database_a_bounded_number_of_times() {
+    let state = build_state(Setup::default());
+    let app = router(state.clone());
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(1));
+    let mut logins = Vec::new();
+    for i in 0..40u8 {
+        let page = open_sso(&app, &format!("n-login-flood-{i}"), None).await;
+        logins.push(signed_bound_login(
+            &free_key(0x20 + i),
+            &page.sid(),
+            [i; 16],
+        ));
+    }
+
+    let answered = statuses(flood(&app, logins)).await;
+
+    assert!(
+        answered.iter().all(|s| *s == 403 || *s == 502),
+        "{answered:?}"
+    );
+    assert!(
+        answered.iter().filter(|s| **s == 502).count() > 20,
+        "most are turned away at once: {answered:?}"
+    );
+    assert!(
+        memory(&state).warren_db.queries() < 20,
+        "{}",
+        memory(&state).warren_db.queries()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn approvals_of_one_login_sent_together_read_the_subscriptions_at_most_twice() {
+    // The first "never paid" ends the session, and an approval that waited
+    // for the gate meanwhile finds it ended rather than reading again.
+    let state = build_state(Setup::default());
+    let app = router(state.clone());
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(1));
+    let page = open_sso(&app, "n-one-session", None).await;
+    let approvals = (0..8u8)
+        .map(|i| signed_bound_login(&free_key(0x20 + i), &page.sid(), [i; 16]))
+        .collect();
+
+    let answered = statuses(flood(&app, approvals)).await;
+
+    assert_eq!(
+        answered.iter().filter(|s| **s == 403).count(),
+        memory(&state).warren_db.queries(),
+        "one refusal per read: {answered:?}"
+    );
+    assert!(
+        memory(&state).warren_db.queries() <= 2,
+        "{}",
+        memory(&state).warren_db.queries()
+    );
+    assert!(
+        answered.iter().all(|s| *s == 403 || *s == 404),
+        "the others find the session ended: {answered:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flood_of_notification_calls_from_unlinked_wallets_leaves_the_forum_pool_to_a_paid_login()
+{
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        paid_ss58: Some(&ss58),
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let page = open_sso(&app, "n-notif-flood", None).await;
+    memory(&state)
+        .forum_db
+        .set_query_time(std::time::Duration::from_secs(3));
+    let calls = (0..60u8)
+        .map(|i| {
+            signed_post(
+                &free_key(0x20 + i),
+                "/v1/forum/notifications",
+                "{}",
+                unix_now(),
+                [i; 16],
+            )
+        })
+        .collect();
+    let calls = flood(&app, calls);
+    settle().await;
+
+    let paid = send(&app, signed_bound_login(&key, &page.sid(), [0xb1; 16])).await;
+
+    assert_eq!(paid.status, 200, "{}", paid.body_utf8);
+    let answered = statuses(calls).await;
+    assert!(
+        answered.iter().all(|s| *s == 200 || *s == 502),
+        "{answered:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_never_paid_wallet_repeating_its_report_is_answered_from_memory() {
+    let state = build_state(Setup {
+        report: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let key = free_key(0x30);
+
+    let first = send(
+        &app,
+        signed_post(
+            &key,
+            "/v1/forum/report",
+            &report_body(),
+            unix_now(),
+            [1; 16],
+        ),
+    )
+    .await;
+    let again = send(
+        &app,
+        signed_post(
+            &key,
+            "/v1/forum/report",
+            &report_body(),
+            unix_now(),
+            [2; 16],
+        ),
+    )
+    .await;
+
+    assert_eq!((first.status, again.status), (403, 403));
+    assert_eq!(
+        memory(&state).warren_db.queries(),
+        1,
+        "the second refusal reads nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_wallet_that_pays_after_a_refused_report_signs_in_at_once() {
+    // The report remembers the "never paid"; the login, where a wallet that
+    // just paid comes back, always reads.
+    let state = build_state(Setup {
+        report: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let key = free_key(0x31);
+    let refused = send(
+        &app,
+        signed_post(
+            &key,
+            "/v1/forum/report",
+            &report_body(),
+            unix_now(),
+            [1; 16],
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, 403);
+    mark_paid(&state, &key);
+    let page = open_sso(&app, "n-paid-later", None).await;
+
+    let login = send(&app, signed_bound_login(&key, &page.sid(), [2; 16])).await;
+
+    assert_eq!(login.status, 200, "{}", login.body_utf8);
+}
+
+#[tokio::test]
+async fn an_unlinked_wallet_repeating_a_notification_call_is_answered_from_memory() {
+    let state = build_state(Setup {
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let key = free_key(0x32);
+
+    for nonce in [[1; 16], [2; 16]] {
+        let answer = send(
+            &app,
+            signed_post(&key, "/v1/forum/notifications", "{}", unix_now(), nonce),
+        )
+        .await;
+        assert_eq!(answer.body_utf8, r#"{"notifications":[]}"#);
+    }
+
+    assert_eq!(memory(&state).forum_db.queries(), 1);
+}
+
+#[tokio::test]
+async fn signing_in_forgets_that_the_wallet_had_no_forum_link() {
+    let state = build_state(Setup {
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    mark_paid(&state, &key);
+    let before = send(
+        &app,
+        signed_post(&key, "/v1/forum/notifications", "{}", unix_now(), [1; 16]),
+    )
+    .await;
+    assert_eq!(before.body_utf8, r#"{"notifications":[]}"#);
+    let page = open_sso(&app, "n-first-link", None).await;
+    let login = send(&app, signed_bound_login(&key, &page.sid(), [2; 16])).await;
+    assert_eq!(login.status, 200, "{}", login.body_utf8);
+
+    let after = send(
+        &app,
+        signed_post(&key, "/v1/forum/notifications", "{}", unix_now(), [3; 16]),
+    )
+    .await;
+
+    assert_eq!(
+        after.status, 404,
+        "the link is read again and the call admitted, then Discourse, which this suite cannot \
+         reach, fails: {}",
+        after.body_utf8
+    );
 }

@@ -67,12 +67,16 @@ struct StubState {
     /// slug}` objects, rather than as the bare names older releases sent.
     tags_as_objects: bool,
     calls: Mutex<Vec<StubCall>>,
+    /// Topic fetches that reached the stub.
+    topic_fetches: std::sync::atomic::AtomicUsize,
 }
 
 async fn stub_topic(
     State(s): State<Arc<StubState>>,
     axum::extract::Path(topic_json): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    s.topic_fetches
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let delay = *s.topic_delay.lock().expect("stub mutex");
     if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
@@ -200,6 +204,7 @@ async fn spawn_stub_with_tag_shape(
         existing_tags,
         tags_as_objects,
         calls: Mutex::new(Vec::new()),
+        topic_fetches: std::sync::atomic::AtomicUsize::new(0),
     });
     let app = axum::Router::new()
         .route("/t/{topic_json}", get(stub_topic))
@@ -259,6 +264,7 @@ fn build_state(
         legacy_approval: Default::default(),
         nonces,
         attach: AttachStore::default(),
+        gates: Default::default(),
         forum_api,
         intake: None,
         report: None,
@@ -459,6 +465,7 @@ async fn another_browser_opening_the_same_topic_gets_nothing_of_the_authors_sess
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let author = visit_attach_page(state.clone(), 42, None).await;
 
     let stranger = visit_attach_page(state.clone(), 42, None).await;
@@ -829,6 +836,7 @@ async fn attach_logs_happy_path_uploads_pms_and_whispers() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -1029,6 +1037,7 @@ async fn a_malformed_payload_is_400_and_never_reaches_discourse() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
 
     let bad_gzip = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
@@ -1191,6 +1200,7 @@ async fn a_cancel_during_the_delivery_never_turns_delivered_logs_into_an_error()
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -1240,6 +1250,7 @@ async fn a_cancel_landing_before_the_delivery_starts_stops_it() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -1976,6 +1987,7 @@ async fn a_discourse_write_failure_leaves_the_session_retryable() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2018,6 +2030,7 @@ async fn attach_with_metadata_posts_a_public_note_after_the_whisper() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2065,6 +2078,7 @@ async fn attach_without_metadata_posts_no_public_note() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2109,6 +2123,7 @@ async fn tagging_preserves_the_tags_the_topic_already_carries() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2150,6 +2165,7 @@ async fn a_forum_that_still_sends_bare_tag_names_attaches_too() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2183,6 +2199,7 @@ async fn a_second_log_version_does_not_rewrite_the_tags() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2223,6 +2240,7 @@ async fn the_reporter_gets_a_private_receipt_naming_their_topic() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2266,6 +2284,7 @@ async fn the_staff_pm_subject_carries_the_topic_title_unescaped() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2308,6 +2327,7 @@ async fn a_report_far_larger_than_the_old_ceiling_is_accepted() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2518,6 +2538,7 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
 
     // A topic-bound session: pending, its meta names the topic, then attached.
     let bound = state
@@ -2676,6 +2697,7 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         "system".into(),
         "staff".into(),
     )));
+    link(&other, &key).await;
     let theirs = other
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2692,6 +2714,7 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         "system".into(),
         "staff".into(),
     )));
+    link(&down, &key).await;
     let mine = down
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2828,6 +2851,7 @@ async fn a_replayed_topic_upload_is_refused_while_its_session_stays_retryable() 
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = state
         .attach
         .create(42, &a_browser(), now_unix())
@@ -2850,5 +2874,114 @@ async fn a_replayed_topic_upload_is_refused_while_its_session_stays_retryable() 
     assert_eq!(
         retry.status, 502,
         "a freshly signed retry is still admitted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The topic fetch is the one gate read that reaches Discourse, on a session
+// anybody can open for any topic. It is bounded three ways: only a wallet with
+// a forum link reaches it, a session pays for a few, and a bulkhead caps how
+// many run at once.
+// ---------------------------------------------------------------------------
+
+fn topic_fetches(stub: &StubState) -> usize {
+    stub.topic_fetches.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn stub_api(url: &str) -> ForumApi {
+    ForumApi::new(url, "k".into(), "system".into(), "staff".into())
+}
+
+#[tokio::test]
+async fn a_topic_upload_from_a_wallet_with_no_forum_link_never_reaches_discourse() {
+    // The topic author has a forum account, and so a forum link: a wallet
+    // without one cannot be the author, whatever the topic says.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(stub_api(&url)));
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+
+    let answer = send(
+        &state,
+        signed_attach_request(&key, &upload_body(&sid, 42), [1; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.status, 403, "{}", answer.body_utf8);
+    assert_eq!(answer.body_utf8, r#"{"error":"not_author"}"#);
+    assert_eq!(topic_fetches(&stub), 0);
+    assert_eq!(state.nonces.held(), 0);
+}
+
+#[tokio::test]
+async fn a_topic_session_pays_for_a_bounded_number_of_topic_fetches() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub("someone-else", true).await;
+    let state = test_state(Some(stub_api(&url)));
+    link(&state, &key).await;
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+
+    let mut answers = Vec::new();
+    for i in 0..6u8 {
+        let request = signed_attach_request(&key, &upload_body(&sid, 42), [i; 16]);
+        answers.push(send(&state, request).await.status);
+    }
+
+    assert_eq!(answers, [403, 403, 403, 403, 404, 404]);
+    assert_eq!(topic_fetches(&stub), 4, "the session paid for four");
+    assert_eq!(
+        read_status(state.clone(), &sid).await.body_utf8,
+        r#"{"reason":"attempts_exhausted","status":"cancelled"}"#,
+        "the page stops waiting, and its next visit opens a fresh session"
+    );
+}
+
+#[tokio::test]
+async fn a_topic_fetch_past_a_full_topic_gate_is_refused_at_once() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub("someone-else", true).await;
+    *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_secs(3));
+    let state = test_state(Some(stub_api(&url)));
+    link(&state, &key).await;
+    let upload = |i: u8| {
+        let sid = state
+            .attach
+            .create(42, &a_browser(), now_unix())
+            .expect("create");
+        signed_attach_request(&key, &upload_body(&sid, 42), [i; 16])
+    };
+    let in_flight: Vec<_> = (0..10u8)
+        .map(|i| {
+            let (state, request) = (state.clone(), upload(i));
+            tokio::spawn(async move { send(&state, request).await })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while state.gates.topic.queued() < 8 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let started = std::time::Instant::now();
+
+    let turned_away = send(&state, upload(0x10)).await;
+
+    assert_eq!(turned_away.status, 502, "{}", turned_away.body_utf8);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "refused without waiting for a fetch: {:?}",
+        started.elapsed()
+    );
+    for task in in_flight {
+        task.await.expect("task");
+    }
+    assert_eq!(
+        topic_fetches(&stub),
+        2,
+        "two fetches ran; the eight queued behind them gave up after two seconds"
     );
 }

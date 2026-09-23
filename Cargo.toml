@@ -54,6 +54,7 @@ hex = "0.4"
 hmac = "0.12"
 http-body-util = "0.1"
 sha2 = "0.10"
+tokio = { version = "1", features = ["test-util"] }
 tower = "0.5"
 urlencoding = "2"
 

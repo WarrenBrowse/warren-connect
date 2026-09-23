@@ -32,6 +32,7 @@ pub mod digest;
 pub mod discourse;
 pub mod error;
 pub mod forum_api;
+pub mod gate;
 pub mod handle;
 pub mod i18n;
 pub mod intake;

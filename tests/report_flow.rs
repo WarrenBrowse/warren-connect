@@ -257,6 +257,7 @@ fn state_with_nonces(
         legacy_approval: Default::default(),
         nonces,
         attach: AttachStore::default(),
+        gates: Default::default(),
         forum_api,
         intake: None,
         report,

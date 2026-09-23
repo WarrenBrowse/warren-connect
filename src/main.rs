@@ -270,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         sessions: SessionStore::default(),
         legacy_approval,
         nonces: NonceStore::default(),
+        gates: warren_connect::gate::Gates::default(),
         attach: AttachStore::default(),
         forum_api,
         intake,

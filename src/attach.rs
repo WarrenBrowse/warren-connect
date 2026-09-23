@@ -35,6 +35,14 @@ pub(crate) const ATTACH_TTL_SECS: u64 = 1_800;
 /// Pre-topic sessions span composing a whole report form, so they live longer.
 const ATTACH_PRE_TTL_SECS: u64 = 1_800;
 
+/// Discourse topic fetches one topic-bound session pays for: the app's
+/// upload, and a few retries after Discourse failed. Anybody opens such a
+/// session for any topic, so it must not buy a forum read per signed upload.
+const MAX_TOPIC_FETCHES: u8 = 4;
+
+/// Cancel reason of a topic-bound session that used up its topic fetches.
+const FETCHES_EXHAUSTED: &str = "attempts_exhausted";
+
 /// Hard cap on concurrent attach sessions. At the cap a new session displaces
 /// the oldest one that holds no report and is not being delivered, and is
 /// refused only when every session does one or the other (see `insert`).
@@ -145,6 +153,8 @@ struct AttachSession {
     binding: bool,
     cancelled: Option<String>,
     received: Option<ReceivedLog>,
+    /// Topic fetches charged so far (topic-bound sessions only).
+    topic_fetches: u8,
 }
 
 impl AttachSession {
@@ -276,6 +286,7 @@ impl AttachStore {
                 binding: false,
                 cancelled: None,
                 received: None,
+                topic_fetches: 0,
             },
         );
         Ok(sid)
@@ -373,6 +384,34 @@ impl AttachStore {
             Some(bound) if bound == topic_id && topic_id != 0 => Ok(AttachKind::Topic(bound)),
             _ => Err(AuthError::Session),
         }
+    }
+
+    /// Charges one Discourse topic fetch to a topic-bound session, before the
+    /// fetch.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] if unknown, expired, finished, cancelled,
+    /// pre-topic, or out of fetches. A session that runs out while it still
+    /// waits for the app's upload is cancelled, so its page stops waiting and
+    /// the browser's next visit opens a fresh session.
+    pub fn charge_topic_fetch(&self, sid: &str, now_unix: u64) -> Result<(), AuthError> {
+        let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        let session = sessions.get_mut(sid).ok_or(AuthError::Session)?;
+        if session.expired(now_unix)
+            || session.done
+            || session.cancelled.is_some()
+            || session.topic_id.is_none()
+        {
+            return Err(AuthError::Session);
+        }
+        if session.topic_fetches >= MAX_TOPIC_FETCHES {
+            if session.awaits_upload() {
+                session.cancelled = Some(FETCHES_EXHAUSTED.to_owned());
+            }
+            return Err(AuthError::Session);
+        }
+        session.topic_fetches += 1;
+        Ok(())
     }
 
     /// Flags a session as "the app approved, work in progress", so the polling
@@ -636,6 +675,52 @@ mod tests {
     /// The one browser most of these tests open their pages in.
     fn browser() -> BrowserKey {
         BrowserSecret::parse(&"a".repeat(64)).expect("shape").key()
+    }
+
+    #[test]
+    fn a_topic_session_pays_for_four_fetches_then_ends_while_it_waits_for_the_app() {
+        let store = AttachStore::default();
+        let sid = store.create(42, &browser(), 100).expect("create");
+        for fetch in 0..MAX_TOPIC_FETCHES {
+            store
+                .charge_topic_fetch(&sid, 100)
+                .unwrap_or_else(|err| panic!("fetch {fetch} is paid for: {err}"));
+        }
+
+        assert_eq!(store.charge_topic_fetch(&sid, 100), Err(AuthError::Session));
+        assert_eq!(
+            store.status(&sid, 100),
+            Ok(AttachStatus::Cancelled {
+                reason: FETCHES_EXHAUSTED.to_owned()
+            })
+        );
+        assert_ne!(
+            store.create(42, &browser(), 100).expect("create"),
+            sid,
+            "the browser's next visit opens a fresh session"
+        );
+    }
+
+    #[test]
+    fn a_session_being_delivered_is_not_cancelled_by_running_out_of_fetches() {
+        let store = AttachStore::default();
+        let sid = store.create(42, &browser(), 100).expect("create");
+        for _ in 0..MAX_TOPIC_FETCHES {
+            store.charge_topic_fetch(&sid, 100).expect("paid for");
+        }
+        store.start_delivery(&sid, 100).expect("delivery");
+
+        assert_eq!(store.charge_topic_fetch(&sid, 100), Err(AuthError::Session));
+        assert_eq!(store.status(&sid, 100), Ok(AttachStatus::Processing));
+    }
+
+    #[test]
+    fn a_pre_topic_session_has_no_topic_fetch_to_charge() {
+        let store = AttachStore::default();
+        let sid = store.create_pre(100).expect("create");
+
+        assert_eq!(store.charge_topic_fetch(&sid, 100), Err(AuthError::Session));
+        assert_eq!(store.status(&sid, 100), Ok(AttachStatus::Pending));
     }
 
     #[test]

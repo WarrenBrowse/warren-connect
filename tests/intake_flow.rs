@@ -147,6 +147,7 @@ fn test_state(intake: Option<IntakeState>) -> Arc<AppState> {
         legacy_approval: Default::default(),
         nonces: NonceStore::default(),
         attach: AttachStore::default(),
+        gates: Default::default(),
         forum_api: None,
         intake,
         report: None,
