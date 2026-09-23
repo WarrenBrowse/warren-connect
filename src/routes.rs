@@ -591,6 +591,11 @@ async fn legacy_admission(
     if state.legacy_approval == LegacyApproval::Deny {
         return Err(LegacyGate::Refused(LegacyRefusal::Disabled));
     }
+    // Read before the gate: the allowlist is memory, and a full gate must not
+    // turn a final refusal into a retryable one.
+    if state.admins.is_admin(&identity.pubkey_ss58) {
+        return Err(LegacyGate::Refused(LegacyRefusal::Staff));
+    }
     match state.gates.login.run(is_forum_staff(state, identity)).await {
         Ok(Ok(false)) => Ok(()),
         Ok(Ok(true)) => Err(LegacyGate::Refused(LegacyRefusal::Staff)),
@@ -618,10 +623,11 @@ enum LegacyGate {
     Unread,
 }
 
-/// Staff for the legacy gate: on the allowlist, or admin or moderator of the
-/// wallet's forum account. Discourse keeps the grant of an account that is
-/// already staff whatever the login asserts, so the allowlist alone would
-/// miss every operator promoted from the admin UI.
+/// Staff for the legacy gate beyond the allowlist, which the caller reads
+/// first: admin or moderator of the wallet's forum account. Discourse keeps
+/// the grant of an account that is already staff whatever the login asserts,
+/// so the allowlist alone would miss every operator promoted from the admin
+/// UI.
 ///
 /// A deployment with no Discourse database counts as staff: nobody's
 /// standing can be read there, and a retry would not change that.
@@ -633,9 +639,6 @@ async fn is_forum_staff(
     state: &AppState,
     identity: &crate::verify::VerifiedIdentity,
 ) -> Result<bool, sqlx::Error> {
-    if state.admins.is_admin(&identity.pubkey_ss58) {
-        return Ok(true);
-    }
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
     match state.identity.forum_staff(&forum.username).await {
         Ok(Some(staff)) => Ok(staff),
@@ -892,9 +895,19 @@ async fn paywall_standing(
             let status = state
                 .gates
                 .open
-                .run(read())
+                .run(async {
+                    // A repeat that waited behind the read answering it
+                    // reads nothing.
+                    if state.gates.never_paid.holds(&identity.pubkey, now_unix()) {
+                        return Ok(None);
+                    }
+                    read().await.map(Some)
+                })
                 .await
                 .map_err(|GateBusy| gate_busy("open"))??;
+            let Some(status) = status else {
+                return Ok(store::SubscriptionStatus::default());
+            };
             if !status.ever_paid {
                 state
                     .gates
@@ -921,13 +934,16 @@ async fn forum_link(
         return Ok(false);
     }
     let started = state.gates.unlinked.start_read();
-    match state
-        .gates
-        .open
-        .run(state.identity.is_linked(&forum.external_id))
-        .await
-    {
-        Ok(Ok(linked)) => {
+    let read = async {
+        // A repeat that waited behind the read answering it reads nothing.
+        if state.gates.unlinked.holds(&identity.pubkey, now_unix()) {
+            return Ok(None);
+        }
+        state.identity.is_linked(&forum.external_id).await.map(Some)
+    };
+    match state.gates.open.run(read).await {
+        Ok(Ok(None)) => Ok(false),
+        Ok(Ok(Some(linked))) => {
             if !linked {
                 state
                     .gates

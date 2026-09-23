@@ -2874,3 +2874,95 @@ async fn signing_in_forgets_that_the_wallet_had_no_forum_link() {
         after.body_utf8
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn reports_one_never_paid_wallet_sends_together_read_its_standing_once() {
+    let state = build_state(Setup {
+        report: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(1));
+    let key = free_key(0x33);
+    let reports = (0..8u8)
+        .map(|i| {
+            signed_post(
+                &key,
+                "/v1/forum/report",
+                &report_body(),
+                unix_now(),
+                [i; 16],
+            )
+        })
+        .collect();
+
+    let answered = statuses(flood(&app, reports)).await;
+
+    assert!(
+        answered.iter().all(|s| *s == 403 || *s == 502),
+        "{answered:?}"
+    );
+    assert_eq!(memory(&state).warren_db.queries(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn notification_calls_one_unlinked_wallet_sends_together_read_its_link_once() {
+    let state = build_state(Setup {
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    memory(&state)
+        .forum_db
+        .set_query_time(std::time::Duration::from_secs(1));
+    let key = free_key(0x34);
+    let calls = (0..8u8)
+        .map(|i| signed_post(&key, "/v1/forum/notifications", "{}", unix_now(), [i; 16]))
+        .collect();
+
+    let answered = statuses(flood(&app, calls)).await;
+
+    assert!(
+        answered.iter().all(|s| *s == 200 || *s == 502),
+        "{answered:?}"
+    );
+    assert_eq!(memory(&state).forum_db.queries(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_legacy_approval_from_an_allowlisted_wallet_is_refused_at_once_even_while_the_login_gate_is_full()
+ {
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        legacy: LegacyApproval::Allow,
+        admins: &ss58,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(10));
+    let mut logins = Vec::new();
+    for i in 0..10u8 {
+        let page = open_sso(&app, &format!("n-full-login-{i}"), None).await;
+        logins.push(signed_bound_login(
+            &free_key(0x20 + i),
+            &page.sid(),
+            [i; 16],
+        ));
+    }
+    let logins = flood(&app, logins);
+    settle().await;
+    let browser = open_sso(&app, "n-legacy-staff-full", None).await;
+
+    let answer = send(
+        &app,
+        signed_login_request(&key, &browser.sid(), unix_now(), [0xaa; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.body_utf8, r#"{"error":"app_update_required"}"#);
+    statuses(logins).await;
+}
