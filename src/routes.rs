@@ -1744,6 +1744,13 @@ async fn attach_bind(
 
     let topic = api.topic(bind.topic_id).await?;
     if !topic.author_username.eq_ignore_ascii_case(&data.username) {
+        // One guess per session. The bind is unauthenticated (the sid is the
+        // capability, and a relayed attach link hands it out), and a success
+        // says the report's signer wrote this topic: a session that stayed
+        // bindable would let its holder walk the forum until it named the
+        // signer's account. The forum theme binds the topic its own user just
+        // created, so a refusal never has a second, better answer.
+        state.attach.cancel(&sid, "not_author", now);
         tracing::info!(
             topic_id = bind.topic_id,
             "bind refused: not the topic author"

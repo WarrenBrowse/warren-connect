@@ -272,7 +272,9 @@ impl AttachStore {
         })
     }
 
-    /// Marks a pending session cancelled. Idempotent; a no-op on an
+    /// Marks a session that is not done cancelled, and drops a report it
+    /// parked: a cancelled session can never be bound, so the bytes would only
+    /// hold a log slot until the TTL. Idempotent; a no-op on an
     /// unknown/expired session. Never overrides a completed session.
     pub fn cancel(&self, sid: &str, reason: &str, now_unix: u64) {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
@@ -281,6 +283,9 @@ impl AttachStore {
             && !session.done
         {
             session.cancelled = Some(reason.to_owned());
+            if let Some(received) = session.received.as_mut() {
+                received.log_text = None;
+            }
         }
     }
 
@@ -940,6 +945,38 @@ mod tests {
         assert_eq!(
             store.status(&sids[1], 501).expect("no eviction needed"),
             AttachStatus::Received
+        );
+    }
+
+    #[test]
+    fn a_cancelled_session_no_longer_holds_log_bytes() {
+        // A cancelled session can never be bound, so its report must give its
+        // log slot back rather than evict somebody else's.
+        let store = AttachStore::default();
+        let mut sids = Vec::new();
+        for i in 0..MAX_LOG_SESSIONS as u64 {
+            let sid = store.create_pre(0).expect("create_pre");
+            store
+                .store_received(&sid, "u", "log".into(), None, None, i)
+                .expect("fill");
+            sids.push(sid);
+        }
+        // Not the oldest: the eviction would otherwise pick it and hide the
+        // slot it still held.
+        store.cancel(&sids[5], "not_author", 400);
+        let extra = store.create_pre(0).expect("one more");
+        store
+            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .expect("free slot");
+        assert_eq!(
+            store
+                .status(&sids[0], 501)
+                .expect("the oldest report is not evicted"),
+            AttachStatus::Received
+        );
+        assert!(
+            matches!(store.bind_data(&sids[5], 501), Err(AuthError::Session)),
+            "and the cancelled one binds nothing"
         );
     }
 

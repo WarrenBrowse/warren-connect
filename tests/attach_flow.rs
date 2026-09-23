@@ -37,6 +37,8 @@ struct StubCall {
 
 struct StubState {
     author: String,
+    /// Topics authored by somebody other than `author`.
+    other_authors: Mutex<std::collections::HashMap<u64, String>>,
     upload_ok: bool,
     /// Tags the topic already carries, echoed back by the topic endpoint.
     existing_tags: Vec<String>,
@@ -46,7 +48,21 @@ struct StubState {
     calls: Mutex<Vec<StubCall>>,
 }
 
-async fn stub_topic(State(s): State<Arc<StubState>>) -> Json<serde_json::Value> {
+async fn stub_topic(
+    State(s): State<Arc<StubState>>,
+    axum::extract::Path(topic_json): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let topic: u64 = topic_json
+        .trim_end_matches(".json")
+        .parse()
+        .unwrap_or_default();
+    let author = s
+        .other_authors
+        .lock()
+        .expect("stub mutex")
+        .get(&topic)
+        .cloned()
+        .unwrap_or_else(|| s.author.clone());
     let tags = if s.tags_as_objects {
         s.existing_tags
             .iter()
@@ -61,8 +77,8 @@ async fn stub_topic(State(s): State<Arc<StubState>>) -> Json<serde_json::Value> 
     };
     Json(serde_json::json!({
         "title": "[macOS] Connection: cannot connect after update #a1b2c3",
-        "details": { "created_by": { "username": s.author } },
-        "post_stream": { "posts": [ { "username": s.author } ] },
+        "details": { "created_by": { "username": author } },
+        "post_stream": { "posts": [ { "username": author } ] },
         "tags": tags,
     }))
 }
@@ -143,6 +159,7 @@ async fn spawn_stub_with_tag_shape(
 ) -> (String, Arc<StubState>) {
     let state = Arc::new(StubState {
         author: author.to_owned(),
+        other_authors: Mutex::new(std::collections::HashMap::new()),
         upload_ok,
         existing_tags,
         tags_as_objects,
@@ -1038,9 +1055,17 @@ async fn bind_before_the_app_delivered_is_409_no_log() {
 }
 
 #[tokio::test]
-async fn bind_by_a_non_author_is_403_and_stays_received() {
+async fn a_bind_refused_for_its_author_spends_the_session_so_it_probes_no_other_topic() {
+    // Anybody holding a pre-topic sid can call bind, and a success says the
+    // report's signer wrote that topic. Relay the attach link to somebody,
+    // let them approve, then bind topic after topic: without a one-shot
+    // bind that walks the forum until it names their pseudonymous account.
     let key = SigningKey::from_bytes(&[7u8; 32]);
-    let (url, stub) = spawn_stub("someone-else", true).await;
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    stub.other_authors
+        .lock()
+        .expect("stub mutex")
+        .insert(42, "someone-else".to_owned());
     let state = test_state(Some(ForumApi::new(
         &url,
         "k".into(),
@@ -1048,7 +1073,6 @@ async fn bind_by_a_non_author_is_403_and_stays_received() {
         "staff".into(),
     )));
     let sid = new_pre_sid(state.clone()).await;
-
     let body = serde_json::json!({
         "sid": sid,
         "topic_id": 0,
@@ -1070,15 +1094,20 @@ async fn bind_by_a_non_author_is_403_and_stays_received() {
         body_json(response).await,
         serde_json::json!({"error": "not_author"})
     );
-    let writes: Vec<String> = stub
-        .calls
-        .lock()
-        .expect("stub mutex")
-        .iter()
-        .map(|c| c.op.clone())
-        .collect();
-    assert!(writes.is_empty(), "author check precedes every write");
 
+    let response = router(state.clone())
+        .oneshot(bind_request(&sid, 43))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the signer's own topic must not answer after a refused guess"
+    );
+    assert!(
+        stub.calls.lock().expect("stub mutex").is_empty(),
+        "nothing was written for either bind"
+    );
     let response = router(state)
         .oneshot(
             Request::get(format!("/v1/attach/{sid}/status"))
@@ -1089,7 +1118,7 @@ async fn bind_by_a_non_author_is_403_and_stays_received() {
         .expect("infallible");
     assert_eq!(
         body_json(response).await,
-        serde_json::json!({"status": "received"})
+        serde_json::json!({"reason": "not_author", "status": "cancelled"})
     );
 }
 
