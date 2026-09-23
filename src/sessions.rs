@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::discourse::SsoUser;
 use crate::error::AuthError;
+use crate::verify::Admitted;
 
 /// How long a login may take from the approval page to the completion,
 /// confirm step included. Kept short: it bounds how long a relayed approval
@@ -454,6 +455,7 @@ impl SessionStore {
     /// waiting for an approval: a second approval never replaces the first.
     pub fn approve_bound(
         &self,
+        _admitted: &Admitted,
         sid: &str,
         user: SsoUser,
         now_unix: u64,
@@ -476,7 +478,13 @@ impl SessionStore {
     ///
     /// # Errors
     /// As [`Self::approve_bound`].
-    pub fn approve_legacy(&self, sid: &str, user: SsoUser, now_unix: u64) -> Result<(), AuthError> {
+    pub fn approve_legacy(
+        &self,
+        _admitted: &Admitted,
+        sid: &str,
+        user: SsoUser,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
         self.approve(sid, State::Approved { user }, now_unix)
     }
 
@@ -636,7 +644,9 @@ mod tests {
         let ids = open(&store, "n", &b);
 
         assert_eq!(store.status(&ids.sid, &b, 1), Ok(SessionStatus::Pending));
-        let code = store.approve_bound(&ids.sid, user(), 2).expect("approve");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 2)
+            .expect("approve");
         assert_eq!(
             store.status(&ids.sid, &b, 3),
             Ok(SessionStatus::AwaitingCode)
@@ -662,7 +672,9 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
 
         assert!(matches!(
             store.consume(&ids.sid, &b, 2),
@@ -678,7 +690,7 @@ mod tests {
             .map(|i| {
                 let ids = open(&store, &format!("n{i}"), &b);
                 store
-                    .approve_bound(&ids.sid, user(), 1)
+                    .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
                     .expect("approve")
                     .as_str()
                     .to_owned()
@@ -703,7 +715,9 @@ mod tests {
         let owner = browser();
         let stranger = browser();
         let ids = open(&store, "n", &owner);
-        let code = store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
 
         assert_eq!(
             store.status(&ids.sid, &stranger, 2),
@@ -747,7 +761,9 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        let code = store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
         let wrong = if code.as_str() == "000000" {
             "000001"
         } else {
@@ -786,7 +802,9 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        let code = store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
         store
             .confirm(&ids.sid, &b, code.as_str(), 2)
             .expect("first");
@@ -802,7 +820,9 @@ mod tests {
         let store = SessionStore::default();
         let owner = browser();
         let ids = open(&store, "n", &owner);
-        store.approve_legacy(&ids.sid, user(), 1).expect("approve");
+        store
+            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
 
         assert_eq!(
             store.status(&ids.sid, &owner, 2),
@@ -825,14 +845,18 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store.approve_bound(&ids.sid, user(), 1).expect("first");
+        store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("first");
 
         assert_eq!(
-            store.approve_bound(&ids.qr_sid, user(), 2).map(|_| ()),
+            store
+                .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 2)
+                .map(|_| ()),
             Err(AuthError::Session)
         );
         assert_eq!(
-            store.approve_legacy(&ids.sid, user(), 2),
+            store.approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 2),
             Err(AuthError::Session)
         );
     }
@@ -842,7 +866,9 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store.approve_legacy(&ids.sid, user(), 1).expect("approve");
+        store
+            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
         assert!(matches!(
             store.consume(&ids.sid, &b, 2),
             Ok(Consumed::Login(_))
@@ -872,7 +898,7 @@ mod tests {
         );
         assert!(
             store
-                .approve_bound(&ids.sid, user(), SESSION_TTL_SECS)
+                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), SESSION_TTL_SECS)
                 .is_err()
         );
         assert!(store.resolve(&ids.qr_sid, SESSION_TTL_SECS).is_err());
@@ -892,7 +918,11 @@ mod tests {
             }),
             "either id cancels, and the browser polling its own sees it"
         );
-        assert!(store.approve_bound(&ids.sid, user(), 3).is_err());
+        assert!(
+            store
+                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 3)
+                .is_err()
+        );
     }
 
     #[test]
@@ -900,7 +930,9 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
 
         store.cancel(&ids.sid, CancelReason::UserCancelled, 2);
 
@@ -920,7 +952,7 @@ mod tests {
         assert!(!store.awaits_approval("deadbeef", 1));
 
         store
-            .approve_bound(&ids.qr_sid, user(), 2)
+            .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 2)
             .expect("approve");
 
         assert!(!store.awaits_approval(&ids.sid, 3));
@@ -951,7 +983,9 @@ mod tests {
         let b = browser();
         let ids = open(&store, "n", &b);
 
-        let code = store.approve_bound(&ids.qr_sid, user(), 1).expect("phone");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 1)
+            .expect("phone");
 
         assert_eq!(
             store.status(&ids.sid, &b, 2),
@@ -987,7 +1021,9 @@ mod tests {
         let store = SessionStore::default();
         let owner = browser();
         let ids = open(&store, "n", &owner);
-        store.approve_legacy(&ids.sid, user(), 1).expect("approve");
+        store
+            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
         store.consume(&ids.sid, &owner, 2).expect("complete");
 
         assert_eq!(
@@ -1068,7 +1104,9 @@ mod tests {
         assert_eq!(format!("{:?}", secret.key()), "BrowserKey(redacted)");
         let store = SessionStore::default();
         let ids = open(&store, "n", &secret.key());
-        let code = store.approve_bound(&ids.sid, user(), 1).expect("approve");
+        let code = store
+            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
+            .expect("approve");
         assert_eq!(format!("{code:?}"), "CompletionCode(redacted)");
 
         let rendered = format!("{store:?}");

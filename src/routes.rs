@@ -27,7 +27,7 @@ use crate::sessions::{
 };
 use crate::store::StaffLookupError;
 use crate::ticket::TicketKey;
-use crate::verify::{SignedHeaders, VerifiedRequest, verify_signed_request};
+use crate::verify::{Admitted, SignedHeaders, VerifiedRequest, verify_signed_request};
 use crate::{handle, pages, store};
 
 /// Shared application state.
@@ -772,7 +772,10 @@ async fn forum_login(
     };
     let body = match form {
         LoginForm::Bound => {
-            let code = state.sessions.approve_bound(&primary_sid, user, now)?;
+            let code =
+                state
+                    .sessions
+                    .approve_bound(&admitted.admission, &primary_sid, user, now)?;
             let handoff = (approach == Approach::SameDevice)
                 .then(|| handoff_url(&state.public_host, &primary_sid, &code));
             bound_approved_body(
@@ -783,7 +786,9 @@ async fn forum_login(
             )
         }
         LoginForm::Legacy => {
-            state.sessions.approve_legacy(&primary_sid, user, now)?;
+            state
+                .sessions
+                .approve_legacy(&admitted.admission, &primary_sid, user, now)?;
             login_approved_body(&handle_for_client, admitted.notify_slot)
         }
     };
@@ -800,6 +805,8 @@ async fn forum_login(
 /// A wallet that passed the forum gate, with everything the two admitting
 /// routes need afterwards.
 struct AdmittedIdentity {
+    /// The admission itself, which the writes past it ask for.
+    admission: Admitted,
     /// The derived pairwise forum identity.
     forum: handle::ForumHandle,
     /// Subscription standing, which decides the Discourse groups.
@@ -965,14 +972,14 @@ async fn admit_forum_identity(
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);
     }
-    request
+    let admission = request
         .admit(&state.nonces, now_unix())
         .map_err(|_| AdmitError::Nonce)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
     state
         .identity
-        .upsert_link(&forum.external_id, &forum.username)
+        .upsert_link(&admission, &forum.external_id, &forum.username)
         .await
         .map_err(|e| {
             // Never `%e` here: a unique-constraint violation puts the offending
@@ -987,7 +994,11 @@ async fn admit_forum_identity(
 
     // Best effort: an admission that cannot get a digest slot is still an
     // admission. The device simply shows no forum badge until the next one.
-    let notify_slot = match state.identity.assign_notify_slot(&forum.external_id).await {
+    let notify_slot = match state
+        .identity
+        .assign_notify_slot(&admission, &forum.external_id)
+        .await
+    {
         Ok(slot) => slot,
         Err(e) => {
             tracing::error!(kind = ?sqlx_error_kind(&e), "notify slot assignment failed");
@@ -996,6 +1007,7 @@ async fn admit_forum_identity(
     };
 
     Ok(AdmittedIdentity {
+        admission,
         forum,
         status,
         admin,
@@ -1084,10 +1096,11 @@ async fn forum_notifications(
     if !forum_link(&state, identity, &forum).await? {
         return Ok(Json(serde_json::json!({ "notifications": [] })).into_response());
     }
-    request.admit(&state.nonces, now_unix())?;
+    let admission = request.admit(&state.nonces, now_unix())?;
 
     let rows = store::notifications_for_username(
         discourse_pool,
+        &admission,
         &forum.username,
         crate::digest::MAX_UNREAD_AGE_DAYS,
         crate::notifications::MAX_NOTIFICATIONS,
@@ -1157,9 +1170,9 @@ async fn forum_notifications_seen(
         // Discourse is not touched at all.
         return Ok(Json(serde_json::json!({ "seen": false })).into_response());
     }
-    request.admit(&state.nonces, now_unix())?;
+    let admission = request.admit(&state.nonces, now_unix())?;
 
-    store::mark_seen_for_username(seen_pool, &forum.username)
+    store::mark_seen_for_username(seen_pool, &admission, &forum.username)
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "seen: update failed");
@@ -1482,17 +1495,16 @@ async fn forum_attach_logs(
     // session (with the signer's handle for the author check at bind time).
     if kind == AttachKind::PreTopic {
         admit_linked_signer(&state, identity, &forum).await?;
-        request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+        let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
             tracing::info!(
                 pubkey = %redact(&identity.pubkey_ss58),
                 "attach-logs refused: nonce not admitted"
             );
         })?;
-        let (log_text, (version, os)) =
-            decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
+        let (log_text, meta) = decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
         state
             .attach
-            .store_received(&req.sid, &forum.username, log_text, version, os, now)
+            .store_received(&admission, &req.sid, &forum.username, log_text, meta, now)
             .inspect_err(|err| {
                 tracing::info!(
                     pubkey = %redact(&identity.pubkey_ss58),
@@ -1546,7 +1558,7 @@ async fn forum_attach_logs(
         );
         return Err(AuthError::NotAuthor);
     }
-    request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+    let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
         tracing::info!(
             topic_id = req.topic_id,
             "attach-logs refused: nonce not admitted"
@@ -1564,7 +1576,7 @@ async fn forum_attach_logs(
     // page shows progress exactly while there is progress to show.
     state
         .attach
-        .start_delivery(&req.sid, now_unix())
+        .start_delivery(&admission, &req.sid, now_unix())
         .inspect_err(|_| {
             tracing::info!(
                 topic_id = req.topic_id,
@@ -2542,6 +2554,7 @@ mod tests {
             .expect("create");
         let code = store
             .approve_bound(
+                &crate::verify::Admitted::for_tests(),
                 &ids.sid,
                 SsoUser {
                     external_id: "e".into(),

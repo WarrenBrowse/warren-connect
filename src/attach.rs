@@ -16,6 +16,7 @@ use rand::RngCore as _;
 
 use crate::error::AuthError;
 use crate::sessions::BrowserKey;
+use crate::verify::Admitted;
 
 /// How long the user has to approve the consent popup in the app (and maybe
 /// read the report first). Longer than the login TTL on purpose.
@@ -426,7 +427,12 @@ impl AttachStore {
     /// # Errors
     /// [`AuthError::Session`] if unknown, expired, finished, cancelled or
     /// already being delivered.
-    pub fn start_delivery(&self, sid: &str, now_unix: u64) -> Result<(), AuthError> {
+    pub fn start_delivery(
+        &self,
+        _admitted: &Admitted,
+        sid: &str,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         let session = sessions.get_mut(sid).ok_or(AuthError::Session)?;
         if session.expired(now_unix)
@@ -466,11 +472,11 @@ impl AttachStore {
     /// [`AuthError::NotAuthor`] if it holds another wallet's report.
     pub fn store_received(
         &self,
+        _admitted: &Admitted,
         sid: &str,
         username: &str,
         log_text: String,
-        version: Option<String>,
-        os: Option<String>,
+        (version, os): ReportMeta,
         now_unix: u64,
     ) -> Result<(), AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
@@ -708,7 +714,9 @@ mod tests {
         for _ in 0..MAX_TOPIC_FETCHES {
             store.charge_topic_fetch(&sid, 100).expect("paid for");
         }
-        store.start_delivery(&sid, 100).expect("delivery");
+        store
+            .start_delivery(&Admitted::for_tests(), &sid, 100)
+            .expect("delivery");
 
         assert_eq!(store.charge_topic_fetch(&sid, 100), Err(AuthError::Session));
         assert_eq!(store.status(&sid, 100), Ok(AttachStatus::Processing));
@@ -733,7 +741,9 @@ mod tests {
             store.status(&sid, 100).expect("status"),
             AttachStatus::Pending
         );
-        store.start_delivery(&sid, 100).expect("start");
+        store
+            .start_delivery(&Admitted::for_tests(), &sid, 100)
+            .expect("start");
         assert_eq!(
             store.status(&sid, 100).expect("status"),
             AttachStatus::Processing
@@ -754,18 +764,33 @@ mod tests {
         store.begin(&declined, 42, 1).expect("begin");
         store.decline(&declined, 2);
         assert!(
-            matches!(store.start_delivery(&declined, 3), Err(AuthError::Session)),
+            matches!(
+                store.start_delivery(&Admitted::for_tests(), &declined, 3),
+                Err(AuthError::Session)
+            ),
             "a decline that landed after the begin wins"
         );
         let done = store.create(43, &browser(), 0).expect("create");
         store.complete(&done, 1).expect("complete");
-        assert!(store.start_delivery(&done, 2).is_err(), "finished");
+        assert!(
+            store
+                .start_delivery(&Admitted::for_tests(), &done, 2)
+                .is_err(),
+            "finished"
+        );
         let old = store.create(44, &browser(), 0).expect("create");
         assert!(
-            store.start_delivery(&old, ATTACH_TTL_SECS).is_err(),
+            store
+                .start_delivery(&Admitted::for_tests(), &old, ATTACH_TTL_SECS)
+                .is_err(),
             "expired"
         );
-        assert!(store.start_delivery("deadbeef", 0).is_err(), "unknown");
+        assert!(
+            store
+                .start_delivery(&Admitted::for_tests(), "deadbeef", 0)
+                .is_err(),
+            "unknown"
+        );
     }
 
     #[test]
@@ -773,10 +798,14 @@ mod tests {
         let store = AttachStore::default();
         let waiting = store.create(42, &browser(), 0).expect("create");
         let failed = store.create(45, &browser(), 0).expect("create");
-        store.start_delivery(&failed, 0).expect("start");
+        store
+            .start_delivery(&Admitted::for_tests(), &failed, 0)
+            .expect("start");
         store.clear_processing(&failed);
         let delivering = store.create(43, &browser(), 0).expect("create");
-        store.start_delivery(&delivering, 0).expect("start");
+        store
+            .start_delivery(&Admitted::for_tests(), &delivering, 0)
+            .expect("start");
         let parked = store.create_pre(0).expect("create_pre");
         received(&store, &parked, 0);
         let done = store.create(44, &browser(), 0).expect("create");
@@ -981,7 +1010,14 @@ mod tests {
         let store = AttachStore::default();
         let holder = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&holder, "u", "log".into(), None, None, 0)
+            .store_received(
+                &Admitted::for_tests(),
+                &holder,
+                "u",
+                "log".into(),
+                (None, None),
+                0,
+            )
             .expect("report delivered");
         // The holder is the OLDEST session, so only the log filter can save it.
         for topic in 1..MAX_SESSIONS as u64 {
@@ -1006,7 +1042,9 @@ mod tests {
         // app that the session is gone after the logs landed.
         let store = AttachStore::default();
         let delivering = store.create(1, &browser(), 0).expect("create");
-        store.start_delivery(&delivering, 0).expect("start");
+        store
+            .start_delivery(&Admitted::for_tests(), &delivering, 0)
+            .expect("start");
         // The OLDEST session, so only the delivery can save it.
         for topic in 2..=MAX_SESSIONS as u64 {
             store.create(topic, &browser(), 1).expect("fill");
@@ -1029,15 +1067,22 @@ mod tests {
         // the second, reopening the session to a decline mid-delivery.
         let store = AttachStore::default();
         let sid = store.create(42, &browser(), 0).expect("create");
-        store.start_delivery(&sid, 1).expect("first delivery");
+        store
+            .start_delivery(&Admitted::for_tests(), &sid, 1)
+            .expect("first delivery");
 
         assert!(
-            matches!(store.start_delivery(&sid, 2), Err(AuthError::Session)),
+            matches!(
+                store.start_delivery(&Admitted::for_tests(), &sid, 2),
+                Err(AuthError::Session)
+            ),
             "a second delivery is refused while the first runs"
         );
         store.clear_processing(&sid);
         assert!(
-            store.start_delivery(&sid, 3).is_ok(),
+            store
+                .start_delivery(&Admitted::for_tests(), &sid, 3)
+                .is_ok(),
             "a failed delivery leaves the session to a retry"
         );
     }
@@ -1091,11 +1136,11 @@ mod tests {
     fn received(store: &AttachStore, sid: &str, now: u64) {
         store
             .store_received(
+                &Admitted::for_tests(),
                 sid,
                 "lusab-babad-dovok",
                 "log body".into(),
-                Some("2026.5".into()),
-                Some("macOS 15".into()),
+                (Some("2026.5".into()), Some("macOS 15".into())),
                 now,
             )
             .expect("store received");
@@ -1194,7 +1239,14 @@ mod tests {
         let sid = store.create(42, &browser(), 0).expect("create");
         assert!(
             store
-                .store_received(&sid, "u", "log".into(), None, None, 1)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    "u",
+                    "log".into(),
+                    (None, None),
+                    1
+                )
                 .is_err()
         );
     }
@@ -1255,13 +1307,27 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    &format!("u{i}"),
+                    "log".into(),
+                    (None, None),
+                    i,
+                )
                 .expect("fill");
             sids.push(sid);
         }
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
+            .store_received(
+                &Admitted::for_tests(),
+                &extra,
+                "newcomer",
+                "log".into(),
+                (None, None),
+                500,
+            )
             .expect("101st log evicts the oldest holder");
         assert!(
             store.status(&sids[0], 501).is_err(),
@@ -1286,7 +1352,14 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    &format!("u{i}"),
+                    "log".into(),
+                    (None, None),
+                    i,
+                )
                 .expect("fill");
             sids.push(sid);
         }
@@ -1294,7 +1367,14 @@ mod tests {
 
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
+            .store_received(
+                &Admitted::for_tests(),
+                &extra,
+                "newcomer",
+                "log".into(),
+                (None, None),
+                500,
+            )
             .expect("the next oldest makes room");
 
         assert_eq!(
@@ -1316,22 +1396,50 @@ mod tests {
         let store = AttachStore::default();
         let oldest = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&oldest, "a", "log".into(), None, None, 0)
+            .store_received(
+                &Admitted::for_tests(),
+                &oldest,
+                "a",
+                "log".into(),
+                (None, None),
+                0,
+            )
             .expect("the oldest report");
         let earlier = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&earlier, "w", "log".into(), None, None, 1)
+            .store_received(
+                &Admitted::for_tests(),
+                &earlier,
+                "w",
+                "log".into(),
+                (None, None),
+                1,
+            )
             .expect("the wallet's first report");
         for i in 2..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    &format!("u{i}"),
+                    "log".into(),
+                    (None, None),
+                    i,
+                )
                 .expect("fill");
         }
 
         let again = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&again, "w", "log".into(), None, None, 500)
+            .store_received(
+                &Admitted::for_tests(),
+                &again,
+                "w",
+                "log".into(),
+                (None, None),
+                500,
+            )
             .expect("the wallet's second report");
 
         assert!(
@@ -1359,15 +1467,36 @@ mod tests {
         let store = AttachStore::default();
         let sid = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&sid, "w", "first".into(), None, None, 1)
+            .store_received(
+                &Admitted::for_tests(),
+                &sid,
+                "w",
+                "first".into(),
+                (None, None),
+                1,
+            )
             .expect("the reporter parks");
 
         assert!(matches!(
-            store.store_received(&sid, "x", "other".into(), None, None, 2),
+            store.store_received(
+                &Admitted::for_tests(),
+                &sid,
+                "x",
+                "other".into(),
+                (None, None),
+                2
+            ),
             Err(AuthError::NotAuthor)
         ));
         store
-            .store_received(&sid, "w", "second".into(), None, None, 3)
+            .store_received(
+                &Admitted::for_tests(),
+                &sid,
+                "w",
+                "second".into(),
+                (None, None),
+                3,
+            )
             .expect("its own wallet may send it again");
 
         let data = store.claim_bind(&sid, 4).expect("bind data");
@@ -1384,13 +1513,27 @@ mod tests {
         let store = AttachStore::default();
         let binding = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&binding, "w", "log".into(), None, None, 1)
+            .store_received(
+                &Admitted::for_tests(),
+                &binding,
+                "w",
+                "log".into(),
+                (None, None),
+                1,
+            )
             .expect("the first report");
         store.claim_bind(&binding, 2).expect("bind in flight");
 
         let next = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&next, "w", "log".into(), None, None, 3)
+            .store_received(
+                &Admitted::for_tests(),
+                &next,
+                "w",
+                "log".into(),
+                (None, None),
+                3,
+            )
             .expect("the second report");
 
         assert!(
@@ -1406,13 +1549,27 @@ mod tests {
         let store = AttachStore::default();
         let delivered = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&delivered, "w", "log".into(), None, None, 1)
+            .store_received(
+                &Admitted::for_tests(),
+                &delivered,
+                "w",
+                "log".into(),
+                (None, None),
+                1,
+            )
             .expect("the first report");
         store.complete(&delivered, 2).expect("bound and delivered");
 
         let next = store.create_pre(0).expect("create_pre");
         store
-            .store_received(&next, "w", "log".into(), None, None, 3)
+            .store_received(
+                &Admitted::for_tests(),
+                &next,
+                "w",
+                "log".into(),
+                (None, None),
+                3,
+            )
             .expect("the next report");
 
         assert_eq!(
@@ -1428,7 +1585,14 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    &format!("u{i}"),
+                    "log".into(),
+                    (None, None),
+                    i,
+                )
                 .expect("fill");
             sids.push(sid);
         }
@@ -1437,7 +1601,14 @@ mod tests {
             .expect("complete frees a slot");
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
+            .store_received(
+                &Admitted::for_tests(),
+                &extra,
+                "newcomer",
+                "log".into(),
+                (None, None),
+                500,
+            )
             .expect("free slot");
         assert_eq!(
             store.status(&sids[1], 501).expect("no eviction needed"),
@@ -1454,7 +1625,14 @@ mod tests {
         for i in 0..MAX_LOG_SESSIONS as u64 {
             let sid = store.create_pre(0).expect("create_pre");
             store
-                .store_received(&sid, &format!("u{i}"), "log".into(), None, None, i)
+                .store_received(
+                    &Admitted::for_tests(),
+                    &sid,
+                    &format!("u{i}"),
+                    "log".into(),
+                    (None, None),
+                    i,
+                )
                 .expect("fill");
             sids.push(sid);
         }
@@ -1463,7 +1641,14 @@ mod tests {
         store.cancel(&sids[5], "not_author", 400);
         let extra = store.create_pre(0).expect("one more");
         store
-            .store_received(&extra, "newcomer", "log".into(), None, None, 500)
+            .store_received(
+                &Admitted::for_tests(),
+                &extra,
+                "newcomer",
+                "log".into(),
+                (None, None),
+                500,
+            )
             .expect("free slot");
         assert_eq!(
             store

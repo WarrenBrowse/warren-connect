@@ -6,7 +6,9 @@
 //! (warren-core). The nonce is spent in a step of its own,
 //! [`VerifiedRequest::admit`], which only a proven signature can reach, so a
 //! garbage signature cannot burn a victim's nonce, and which each route takes
-//! only once it has decided to act on the request.
+//! only once it has decided to act on the request. It hands back the
+//! [`Admitted`] witness every store call a signed route acts through asks
+//! for, so a route that skips it does not compile.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -62,10 +64,10 @@ pub struct VerifiedRequest {
 }
 
 impl VerifiedRequest {
-    /// Spends the request's nonce. A route calls it once it has decided to act
-    /// on the request, past its own gate (paywall, forum link, topic author)
-    /// and before its first side effect, so each signed request is acted on at
-    /// most once. A request the gate refuses spends nothing, and the wallets no
+    /// Spends the request's nonce and hands back the [`Admitted`] witness. A
+    /// route calls it once it has decided to act on the request, past its own
+    /// gate (paywall, forum link, topic author) and before its first side
+    /// effect, so each signed request is acted on at most once. A request the gate refuses spends nothing, and the wallets no
     /// gate admits, which cost nothing to mint, never reach the store. A
     /// refusal whose cause changes while the signature is still valid (a read
     /// that failed recovers, the wallet pays or gains its forum link) leaves
@@ -76,17 +78,63 @@ impl VerifiedRequest {
     /// # Errors
     /// [`AuthError::Nonce`] on a replay, past [`ADMISSION_HORIZON_SECS`], when
     /// the wallet is over its budget, or when the store is full.
-    pub fn admit(&self, nonces: &NonceStore, now_unix: u64) -> Result<(), AuthError> {
+    pub fn admit(&self, nonces: &NonceStore, now_unix: u64) -> Result<Admitted, AuthError> {
         if nonces.check_and_store(
             &self.identity.pubkey_ss58,
             &self.nonce_hex,
             self.timestamp,
             now_unix,
         ) {
-            Ok(())
+            Ok(Admitted {
+                identity: self.identity.clone(),
+            })
         } else {
             Err(AuthError::Nonce)
         }
+    }
+}
+
+/// Proof that a wallet-signed request passed its route's gate and spent its
+/// nonce. Only [`VerifiedRequest::admit`] makes one, and the store calls a
+/// signed route acts through (a login approval, a forum link write, a parked
+/// or delivered report, a notification read or write) each take one: a
+/// route that forgets its admission does not compile, where a forgotten call
+/// would otherwise leave that route replayable and open to wallets its gate
+/// was meant to refuse.
+pub struct Admitted {
+    identity: VerifiedIdentity,
+}
+
+impl Admitted {
+    /// The wallet the admitted request was signed by.
+    #[must_use]
+    pub fn identity(&self) -> &VerifiedIdentity {
+        &self.identity
+    }
+
+    /// A witness for the unit tests of the stores, which exercise the calls
+    /// that take one without a signed request.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let pubkey = [0x42; 32];
+        Self {
+            identity: VerifiedIdentity {
+                pubkey,
+                pubkey_ss58: warren_contract::ss58::encode(&pubkey),
+            },
+        }
+    }
+}
+
+/// The signer redacted, as [`VerifiedRequest`] renders it.
+impl std::fmt::Debug for Admitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admitted")
+            .field(
+                "signer",
+                &warren_contract::redact(&self.identity.pubkey_ss58),
+            )
+            .finish()
     }
 }
 
@@ -293,6 +341,25 @@ mod tests {
         assert!(
             rendered.contains(&warren_contract::redact(&h.pubkey_ss58)),
             "the redacted signer is what an incident needs: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_admission_names_its_signer_and_renders_it_redacted() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let h = signed(&key, "POST", "/p", b"", 1_000, [0xcd; 16]);
+        let request = verify_signed_request(&h, "POST", "/p", b"", 1_000).expect("verifies");
+
+        let admitted = request
+            .admit(&NonceStore::default(), 1_000)
+            .expect("admitted");
+
+        assert_eq!(admitted.identity(), &request.identity);
+        let rendered = format!("{admitted:?}");
+        assert!(!rendered.contains(&h.pubkey_ss58), "{rendered}");
+        assert!(
+            rendered.contains(&warren_contract::redact(&h.pubkey_ss58)),
+            "{rendered}"
         );
     }
 

@@ -327,11 +327,14 @@ fn author_username(key: &SigningKey) -> String {
 /// so a real pre-topic reporter holds one.
 async fn link(state: &AppState, key: &SigningKey) {
     let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
-    state
-        .identity
-        .upsert_link(&forum.external_id, &forum.username)
-        .await
-        .expect("the in-memory link store never fails");
+    let IdentityStore::Memory(memory) = &state.identity else {
+        unreachable!("the suite never builds the Postgres form")
+    };
+    memory
+        .links
+        .lock()
+        .expect("mutex")
+        .insert(forum.external_id, (forum.username, None));
 }
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {

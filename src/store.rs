@@ -20,6 +20,8 @@ use std::time::Duration;
 use sqlx::PgPool;
 use sqlx::Row as _;
 
+use crate::verify::Admitted;
+
 /// Connections of the Warren API database pool (read-only role), which the
 /// subscription standing is read through.
 pub const WARREN_POOL_CONNECTIONS: u32 = 3;
@@ -57,14 +59,12 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
 }
 
 /// Records (or refreshes) the pubkey <-> handle link at login time.
+/// Reached through [`IdentityStore::upsert_link`], which asks for the
+/// admission.
 ///
 /// # Errors
 /// Propagates sqlx errors (logged upstream, redacted).
-pub async fn upsert_link(
-    pool: &PgPool,
-    external_id: &str,
-    username: &str,
-) -> Result<(), sqlx::Error> {
+async fn upsert_link(pool: &PgPool, external_id: &str, username: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO forum_links (external_id, username, created_at, last_login_at)
          VALUES ($1, $2, now(), now())
@@ -115,12 +115,12 @@ pub async fn notify_slot_for_external_id(
 /// every attempt, which leaves the account without a badge until its next
 /// login rather than failing that login.
 ///
+/// Reached through [`IdentityStore::assign_notify_slot`], which asks for the
+/// admission.
+///
 /// # Errors
 /// Propagates sqlx errors other than the unique-violation retry.
-pub async fn assign_notify_slot(
-    pool: &PgPool,
-    external_id: &str,
-) -> Result<Option<i32>, sqlx::Error> {
+async fn assign_notify_slot(pool: &PgPool, external_id: &str) -> Result<Option<i32>, sqlx::Error> {
     if let Some(slot) = notify_slot_for_external_id(pool, external_id).await? {
         return Ok(Some(slot));
     }
@@ -292,6 +292,7 @@ pub struct NotificationRow {
 /// Propagates sqlx errors.
 pub async fn notifications_for_username(
     discourse_pool: &PgPool,
+    _admitted: &Admitted,
     username: &str,
     max_age_days: i32,
     limit: i64,
@@ -375,6 +376,7 @@ pub async fn notifications_for_username(
 /// Propagates sqlx errors.
 pub async fn mark_seen_for_username(
     discourse_pool: &PgPool,
+    _admitted: &Admitted,
     username: &str,
 ) -> Result<i64, sqlx::Error> {
     // Same visibility rule as the count: a bookmark must not land on a
@@ -721,7 +723,12 @@ impl IdentityStore {
     ///
     /// # Errors
     /// Propagates sqlx errors from the Postgres form.
-    pub async fn upsert_link(&self, external_id: &str, username: &str) -> Result<(), sqlx::Error> {
+    pub async fn upsert_link(
+        &self,
+        _admitted: &Admitted,
+        external_id: &str,
+        username: &str,
+    ) -> Result<(), sqlx::Error> {
         match self {
             IdentityStore::Postgres { forum, .. } => {
                 upsert_link(forum, external_id, username).await
@@ -793,7 +800,11 @@ impl IdentityStore {
     ///
     /// # Errors
     /// Propagates sqlx errors from the Postgres form.
-    pub async fn assign_notify_slot(&self, external_id: &str) -> Result<Option<i32>, sqlx::Error> {
+    pub async fn assign_notify_slot(
+        &self,
+        _admitted: &Admitted,
+        external_id: &str,
+    ) -> Result<Option<i32>, sqlx::Error> {
         match self {
             IdentityStore::Postgres { forum, .. } => assign_notify_slot(forum, external_id).await,
             IdentityStore::Memory(m) => {
@@ -1186,9 +1197,10 @@ laisse passer ?', NULL),
         .expect("badge");
 
         let counts = unread_by_username(&pool, 90).await.expect("count");
-        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
-            .await
-            .expect("list");
+        let rows =
+            notifications_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok", 90, 50)
+                .await
+                .expect("list");
 
         assert_eq!(
             counts,
@@ -1217,9 +1229,10 @@ laisse passer ?', NULL),
         .expect("admin problem");
 
         let counts = unread_by_username(&pool, 90).await.expect("count");
-        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
-            .await
-            .expect("list");
+        let rows =
+            notifications_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok", 90, 50)
+                .await
+                .expect("list");
 
         assert_eq!(
             counts,
@@ -1246,9 +1259,10 @@ laisse passer ?', NULL),
         .await
         .expect("group summary");
 
-        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
-            .await
-            .expect("list");
+        let rows =
+            notifications_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok", 90, 50)
+                .await
+                .expect("list");
         let summary = rows
             .iter()
             .find(|r| r.notification_type == 16)
@@ -1284,7 +1298,7 @@ laisse passer ?', NULL),
             vec![("lusab-babad-dovok".to_owned(), 2)]
         );
 
-        let seen = mark_seen_for_username(&pool, "lusab-babad-dovok")
+        let seen = mark_seen_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok")
             .await
             .expect("mark seen");
 
@@ -1323,7 +1337,8 @@ laisse passer ?', NULL),
             .await
             .expect("newest");
 
-        let reported = mark_seen_for_username(&pool, "lusab-babad-dovok").await;
+        let reported =
+            mark_seen_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok").await;
 
         let stored: i64 = sqlx::query_scalar(
             "SELECT seen_notification_id FROM users WHERE username = 'lusab-babad-dovok'",
@@ -1348,7 +1363,7 @@ laisse passer ?', NULL),
         // replay, a race or a stale client can only ever fail to advance it,
         // never resurrect notifications the reader has already dealt with.
         seed_fake_discourse(&pool).await;
-        let first = mark_seen_for_username(&pool, "lusab-babad-dovok")
+        let first = mark_seen_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok")
             .await
             .expect("first");
         sqlx::query("UPDATE users SET seen_notification_id = $1 WHERE username = $2")
@@ -1358,7 +1373,7 @@ laisse passer ?', NULL),
             .await
             .expect("jump ahead");
 
-        let second = mark_seen_for_username(&pool, "lusab-babad-dovok")
+        let second = mark_seen_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok")
             .await
             .expect("second");
 
@@ -1377,7 +1392,7 @@ laisse passer ?', NULL),
             .await
             .expect("reset");
 
-        mark_seen_for_username(&pool, "lusab-babad-dovok")
+        mark_seen_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok")
             .await
             .expect("mark seen");
 
@@ -1394,7 +1409,7 @@ laisse passer ?', NULL),
     async fn marking_seen_for_an_unknown_account_changes_nothing(pool: PgPool) {
         seed_fake_discourse(&pool).await;
 
-        let seen = mark_seen_for_username(&pool, "nobod-yhere-atall")
+        let seen = mark_seen_for_username(&pool, &Admitted::for_tests(), "nobod-yhere-atall")
             .await
             .expect("no error");
 
@@ -1405,9 +1420,10 @@ laisse passer ?', NULL),
     async fn the_panel_reads_only_the_callers_own_recent_notifications(pool: PgPool) {
         seed_fake_discourse(&pool).await;
 
-        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
-            .await
-            .expect("query");
+        let rows =
+            notifications_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok", 90, 50)
+                .await
+                .expect("query");
 
         assert_eq!(
             rows.len(),
@@ -1445,9 +1461,10 @@ laisse passer ?', NULL),
             .await
             .expect("delete post");
 
-        let rows = notifications_for_username(&pool, "lusab-babad-dovok", 90, 50)
-            .await
-            .expect("query");
+        let rows =
+            notifications_for_username(&pool, &Admitted::for_tests(), "lusab-babad-dovok", 90, 50)
+                .await
+                .expect("query");
 
         assert_eq!(
             rows[0].raw, None,
