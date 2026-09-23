@@ -386,8 +386,8 @@ pub async fn mark_seen_for_username(
     Ok(seen.unwrap_or(0))
 }
 
-/// Whether the Discourse account `username` is staff (admin or moderator).
-/// An account the forum does not have is not staff.
+/// Whether the Discourse account `username` is staff (admin or moderator),
+/// `None` when the forum has no account under that name.
 ///
 /// Read through the SELECT-only Discourse role, like the notification reads.
 /// `username_lower` is the column Discourse indexes and keeps unique, so a
@@ -399,14 +399,11 @@ pub async fn mark_seen_for_username(
 pub async fn forum_staff_for_username(
     discourse_pool: &PgPool,
     username: &str,
-) -> Result<bool, sqlx::Error> {
-    let staff: Option<bool> = sqlx::query_scalar(
-        "SELECT (admin OR moderator) FROM users WHERE username_lower = lower($1)",
-    )
-    .bind(username)
-    .fetch_optional(discourse_pool)
-    .await?;
-    Ok(staff.unwrap_or(false))
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar("SELECT (admin OR moderator) FROM users WHERE username_lower = lower($1)")
+        .bind(username)
+        .fetch_optional(discourse_pool)
+        .await
 }
 
 /// Why a forum account's staff status could not be established.
@@ -641,12 +638,12 @@ impl IdentityStore {
     }
 
     /// Whether the forum account `username` is admin or moderator on the
-    /// forum; an account the forum does not have is not.
+    /// forum, `None` when the forum has no account under that name.
     ///
     /// # Errors
     /// [`StaffLookupError`] when the status cannot be established: no
     /// Discourse database wired, or the query failed.
-    pub async fn forum_staff(&self, username: &str) -> Result<bool, StaffLookupError> {
+    pub async fn forum_staff(&self, username: &str) -> Result<Option<bool>, StaffLookupError> {
         match self {
             IdentityStore::Postgres { discourse, .. } => {
                 let pool = discourse.as_ref().ok_or(StaffLookupError::NotWired)?;
@@ -659,8 +656,28 @@ impl IdentityStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .map(|staff| staff.get(username).copied().unwrap_or(false))
+                .map(|staff| staff.get(username).copied())
                 .ok_or(StaffLookupError::NotWired),
+        }
+    }
+
+    /// Whether this service has a forum link for the wallet, which means a
+    /// forum account was created for it.
+    ///
+    /// # Errors
+    /// Propagates sqlx errors from the Postgres form.
+    pub async fn is_linked(&self, external_id: &str) -> Result<bool, sqlx::Error> {
+        match self {
+            IdentityStore::Postgres { forum, .. } => {
+                Ok(username_for_external_id(forum, external_id)
+                    .await?
+                    .is_some())
+            }
+            IdentityStore::Memory(m) => Ok(m
+                .links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(external_id)),
         }
     }
 
@@ -924,7 +941,9 @@ laisse passer ?', NULL),
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn staff_is_read_off_the_forum_account_and_an_unknown_account_is_not_staff(pool: PgPool) {
+    async fn staff_is_read_off_the_forum_account_and_an_unknown_account_is_told_apart(
+        pool: PgPool,
+    ) {
         seed_fake_discourse(&pool).await;
         sqlx::query(
             "INSERT INTO users (id, username, username_lower, admin) \
@@ -934,27 +953,32 @@ laisse passer ?', NULL),
         .await
         .expect("admin row");
 
-        assert!(
+        assert_eq!(
             forum_staff_for_username(&pool, "rudop-tijub-sozom")
                 .await
                 .expect("moderator"),
+            Some(true),
             "a moderator is staff"
         );
-        assert!(
+        assert_eq!(
             forum_staff_for_username(&pool, "kobal-nisop-tadir")
                 .await
                 .expect("admin"),
+            Some(true),
             "an admin is staff, whatever the case the forum stored the name in"
         );
-        assert!(
-            !forum_staff_for_username(&pool, "lusab-babad-dovok")
+        assert_eq!(
+            forum_staff_for_username(&pool, "lusab-babad-dovok")
                 .await
-                .expect("member")
+                .expect("member"),
+            Some(false)
         );
-        assert!(
-            !forum_staff_for_username(&pool, "nobod-yhere-atall")
+        assert_eq!(
+            forum_staff_for_username(&pool, "nobod-yhere-atall")
                 .await
-                .expect("absent")
+                .expect("absent"),
+            None,
+            "no account is told apart from a member"
         );
     }
 

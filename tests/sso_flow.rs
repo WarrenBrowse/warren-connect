@@ -1976,3 +1976,40 @@ async fn the_bound_login_vector_pins_the_provider_answer_per_outcome() {
     assert_eq!(pinned.notify_slot, 1);
     assert_ne!(pinned.qr_sid, req.sid, "the vector's two ids differ");
 }
+
+#[tokio::test]
+async fn a_linked_wallet_whose_forum_account_is_not_under_its_handle_counts_as_staff() {
+    // Discourse can hold the account under another name (renamed from the
+    // admin UI, or suffixed at creation), and staff status is read by the
+    // derived handle. A wallet that has signed in before and whose handle
+    // names no account is one whose standing cannot be read: refused. A
+    // wallet that never signed in has no account at all, and is let through.
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        paid_ss58: Some(&ss58),
+        legacy: LegacyApproval::Allow,
+        forum_staff: Some(&[]),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let first = open_sso(&app, "n-first-sign-in", None).await;
+    let answer = send(
+        &app,
+        signed_login_request(&key, &first.sid(), unix_now(), [0x50; 16]),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "a first sign-in has no account to be staff on"
+    );
+
+    let again = open_sso(&app, "n-renamed", None).await;
+    let answer = send(
+        &app,
+        signed_login_request(&key, &again.sid(), unix_now(), [0x51; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.status, 400);
+    assert_eq!(answer.body_utf8, r#"{"error":"app_update_required"}"#);
+}

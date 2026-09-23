@@ -584,7 +584,20 @@ async fn is_forum_staff(state: &AppState, identity: &crate::verify::VerifiedIden
     }
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
     match state.identity.forum_staff(&forum.username).await {
-        Ok(staff) => staff,
+        Ok(Some(staff)) => staff,
+        // No account under the derived handle. A wallet that never signed in
+        // has none; one that did has an account under another name (renamed,
+        // or suffixed at creation), whose standing this read cannot see.
+        Ok(None) => match state.identity.is_linked(&forum.external_id).await {
+            Ok(linked) => linked,
+            Err(err) => {
+                tracing::warn!(
+                    kind = sqlx_error_kind(&err),
+                    "forum link unreadable: treated as staff"
+                );
+                true
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 kind = err.kind(),
