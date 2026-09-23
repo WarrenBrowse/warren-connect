@@ -35,7 +35,9 @@ pub(crate) const ATTACH_TTL_SECS: u64 = 1_800;
 /// Pre-topic sessions span composing a whole report form, so they live longer.
 const ATTACH_PRE_TTL_SECS: u64 = 1_800;
 
-/// Hard cap on concurrent attach sessions (fail closed).
+/// Hard cap on concurrent attach sessions. At the cap a new session displaces
+/// the oldest one that holds no report and is not being delivered, and is
+/// refused only when every session does one or the other (see `insert`).
 const MAX_SESSIONS: usize = 10_000;
 
 /// Cap on sessions parking decompressed log bytes (up to [`MAX_LOG_BYTES`]
@@ -193,7 +195,8 @@ impl AttachStore {
     /// the topic id, which is public, must never fetch somebody else's.
     ///
     /// # Errors
-    /// [`AuthError::Session`] when the store is at capacity.
+    /// [`AuthError::Session`] when the store is at capacity and no session
+    /// can be displaced.
     pub fn create(
         &self,
         topic_id: u64,
@@ -220,7 +223,8 @@ impl AttachStore {
     /// Never idempotent: there is no topic to key reuse on.
     ///
     /// # Errors
-    /// [`AuthError::Session`] when the store is at capacity.
+    /// [`AuthError::Session`] when the store is at capacity and no session
+    /// can be displaced.
     pub fn create_pre(&self, now_unix: u64) -> Result<String, AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         sessions.retain(|_, s| !s.expired(now_unix));
