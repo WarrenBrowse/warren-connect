@@ -35,6 +35,12 @@ pub(crate) const SESSION_TTL_SECS: u64 = 300;
 /// Hard cap on concurrent sessions (fail closed).
 const MAX_SESSIONS: usize = 10_000;
 
+/// Logins one DiscourseConnect payload opens while the last one lives. Each
+/// login buys a subscription read, and its owner reopens it without asking
+/// the forum for a new payload. Three cover the reloads a user makes after a
+/// refusal they can repair (a clock set right, a subscription just paid).
+const MAX_OPENS_PER_PAYLOAD: u8 = 3;
+
 /// Wrong codes a browser may type before its login is cancelled. The code is
 /// six digits, so the holder of a cookie and a relayed approval wins with
 /// probability 5 in a million per approval they manage to obtain.
@@ -291,6 +297,8 @@ struct Session {
     browser: BrowserKey,
     qr_sid: String,
     state: State,
+    /// Logins opened for this nonce, this one included.
+    opens: u8,
 }
 
 impl Session {
@@ -336,12 +344,13 @@ impl SessionStore {
     /// browser replaying it gets neither the pending session nor a fresh one.
     /// That also keeps one captured payload from minting sessions until the
     /// store is full. The owner reopening a cancelled or completed login gets
-    /// a fresh session in its place.
+    /// a fresh session in its place, up to [`MAX_OPENS_PER_PAYLOAD`] logins
+    /// while the latest one lives.
     ///
     /// # Errors
     /// [`AuthError::BrowserMismatch`] when the nonce's live session belongs
     /// to another browser, [`AuthError::Session`] when the store is at
-    /// capacity.
+    /// capacity or the payload has opened its last login.
     pub fn create(
         &self,
         nonce: String,
@@ -354,6 +363,7 @@ impl SessionStore {
         sessions.retain(|_, s| s.live(now_unix));
         by_qr.retain(|_, primary| sessions.contains_key(primary));
 
+        let mut opens = 1;
         if let Some(sid) = sessions
             .iter()
             .find(|(_, s)| s.nonce == nonce)
@@ -371,6 +381,12 @@ impl SessionStore {
                     });
                 }
                 State::Completed | State::Cancelled { .. } => {
+                    // Refused with the ended login left in place, so its
+                    // count lasts until it expires.
+                    if session.opens >= MAX_OPENS_PER_PAYLOAD {
+                        return Err(AuthError::Session);
+                    }
+                    opens = session.opens + 1;
                     by_qr.remove(&session.qr_sid);
                     sessions.remove(&sid);
                 }
@@ -392,6 +408,7 @@ impl SessionStore {
                 browser: *browser,
                 qr_sid: qr_sid.clone(),
                 state: State::Pending,
+                opens,
             },
         );
         Ok(SessionIds { sid, qr_sid })
@@ -1048,6 +1065,32 @@ mod tests {
         assert!(
             store.resolve(&first.qr_sid, 2).is_err(),
             "the replaced login's QR must die with it"
+        );
+    }
+
+    #[test]
+    fn one_payload_opens_three_logins_while_they_live_and_no_more() {
+        // Each login spends a subscription read, and a reopened one costs no
+        // new payload from the forum: without a bound one payload would buy
+        // reads for as many minted wallets as could sign.
+        let store = SessionStore::default();
+        let b = browser();
+        for at in 0..3 {
+            let ids = store
+                .create("n".into(), "r".into(), &b, at)
+                .unwrap_or_else(|err| panic!("open {at}: {err}"));
+            store.cancel(&ids.sid, CancelReason::SubscriptionRequired, at);
+        }
+
+        assert_eq!(
+            store.create("n".into(), "r".into(), &b, 3).map(|_| ()),
+            Err(AuthError::Session)
+        );
+        assert!(
+            store
+                .create("n".into(), "r".into(), &b, 2 + SESSION_TTL_SECS)
+                .is_ok(),
+            "once the last one has expired the payload opens again"
         );
     }
 
