@@ -62,6 +62,9 @@ pub enum AuthError {
     /// Bind requested before the app delivered the report to the session.
     #[error("no_log")]
     NoLog,
+    /// Another bind holds the pre-topic session.
+    #[error("bind_in_progress")]
+    BindInProgress,
     /// The Discourse-backed feature is not configured (no API key).
     #[error("feature disabled")]
     FeatureDisabled,
@@ -135,6 +138,13 @@ impl IntoResponse for AuthError {
             return (
                 StatusCode::CONFLICT,
                 axum::Json(serde_json::json!({"error": "no_log"})),
+            )
+                .into_response();
+        }
+        if matches!(self, AuthError::BindInProgress) {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({"error": "bind_in_progress"})),
             )
                 .into_response();
         }

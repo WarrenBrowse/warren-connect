@@ -127,6 +127,8 @@ struct AttachSession {
     done: bool,
     /// Set when the app's upload lands, before the Discourse round-trips.
     processing: bool,
+    /// A bind holds the session while it talks to Discourse.
+    binding: bool,
     cancelled: Option<String>,
     received: Option<ReceivedLog>,
 }
@@ -226,6 +228,7 @@ impl AttachStore {
                 created_unix: now_unix,
                 done: false,
                 processing: false,
+                binding: false,
                 cancelled: None,
                 received: None,
             },
@@ -414,15 +417,20 @@ impl AttachStore {
         Ok(session.topic_id)
     }
 
-    /// The stored handle + log of a received pre-topic session, for the bind.
-    /// Does not transition (a failed Discourse write must stay retryable).
+    /// Claims a received pre-topic session for one bind and returns what the
+    /// bind needs. The claim is what makes a bind one-shot: a second bind
+    /// arriving while this one talks to Discourse is refused, so a batch of
+    /// guesses sent at once gets one answer, not one per topic. The session
+    /// stays `Received`: [`Self::release_bind`] after a Discourse failure
+    /// leaves it retryable.
     ///
     /// # Errors
     /// [`AuthError::Session`] if unknown, expired, finished, or topic-bound;
-    /// [`AuthError::NoLog`] while the app has not delivered the report yet.
-    pub fn bind_data(&self, sid: &str, now_unix: u64) -> Result<BindData, AuthError> {
-        let sessions = self.sessions.lock().expect("attach mutex never poisoned");
-        let session = sessions.get(sid).ok_or(AuthError::Session)?;
+    /// [`AuthError::NoLog`] while the app has not delivered the report yet;
+    /// [`AuthError::BindInProgress`] while another bind holds it.
+    pub fn claim_bind(&self, sid: &str, now_unix: u64) -> Result<BindData, AuthError> {
+        let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        let session = sessions.get_mut(sid).ok_or(AuthError::Session)?;
         if session.expired(now_unix)
             || session.topic_id.is_some()
             || session.done
@@ -432,12 +440,26 @@ impl AttachStore {
         }
         let received = session.received.as_ref().ok_or(AuthError::NoLog)?;
         let log_text = received.log_text.clone().ok_or(AuthError::NoLog)?;
-        Ok(BindData {
+        if session.binding {
+            return Err(AuthError::BindInProgress);
+        }
+        let data = BindData {
             username: received.username.clone(),
             log_text,
             version: received.version.clone(),
             os: received.os.clone(),
-        })
+        };
+        session.binding = true;
+        Ok(data)
+    }
+
+    /// Gives a claimed session back after a bind that failed on Discourse's
+    /// side, so the forum theme can retry it. Silent when the session is gone.
+    pub fn release_bind(&self, sid: &str) {
+        let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
+        if let Some(session) = sessions.get_mut(sid) {
+            session.binding = false;
+        }
     }
 
     /// Transitions to Done, single use, and frees the parked log bytes
@@ -786,17 +808,17 @@ mod tests {
             AttachStatus::Received
         );
 
-        let data = store.bind_data(&sid, 5).expect("bind data");
+        let data = store.claim_bind(&sid, 5).expect("bind data");
         assert_eq!(data.username, "lusab-babad-dovok");
         assert_eq!(data.log_text, "log body");
         assert_eq!(
             store.status(&sid, 6).expect("status"),
             AttachStatus::Received,
-            "bind_data must not transition: Discourse writes can still fail"
+            "a claim does not transition: Discourse writes can still fail"
         );
         store.complete(&sid, 7).expect("complete");
         assert_eq!(store.status(&sid, 8).expect("status"), AttachStatus::Done);
-        assert!(store.bind_data(&sid, 9).is_err(), "bind is single-use");
+        assert!(store.claim_bind(&sid, 9).is_err(), "bind is single-use");
     }
 
     #[test]
@@ -818,19 +840,37 @@ mod tests {
     }
 
     #[test]
-    fn bind_data_without_a_log_is_no_log() {
+    fn a_claim_without_a_log_is_no_log() {
         let store = AttachStore::default();
         let sid = store.create_pre(0).expect("create_pre");
-        let err = store.bind_data(&sid, 1).expect_err("no log yet");
+        let err = store.claim_bind(&sid, 1).expect_err("no log yet");
         assert!(matches!(err, AuthError::NoLog));
     }
 
     #[test]
-    fn bind_data_on_a_topic_session_is_an_error() {
+    fn a_session_holds_one_bind_at_a_time_and_a_release_gives_it_back() {
+        let store = AttachStore::default();
+        let sid = store.create_pre(0).expect("create_pre");
+        received(&store, &sid, 1);
+        store.claim_bind(&sid, 2).expect("first claim");
+
+        assert!(matches!(
+            store.claim_bind(&sid, 3),
+            Err(AuthError::BindInProgress)
+        ));
+        store.release_bind(&sid);
+        assert!(
+            store.claim_bind(&sid, 4).is_ok(),
+            "a bind that failed on Discourse leaves the session retryable"
+        );
+    }
+
+    #[test]
+    fn a_claim_on_a_topic_session_is_an_error() {
         let store = AttachStore::default();
         let sid = store.create(42, 0).expect("create");
         assert!(matches!(
-            store.bind_data(&sid, 1).expect_err("topic-bound"),
+            store.claim_bind(&sid, 1).expect_err("topic-bound"),
             AuthError::Session
         ));
     }
@@ -973,10 +1013,6 @@ mod tests {
                 .status(&sids[0], 501)
                 .expect("the oldest report is not evicted"),
             AttachStatus::Received
-        );
-        assert!(
-            matches!(store.bind_data(&sids[5], 501), Err(AuthError::Session)),
-            "and the cancelled one binds nothing"
         );
     }
 

@@ -39,6 +39,8 @@ struct StubState {
     author: String,
     /// Topics authored by somebody other than `author`.
     other_authors: Mutex<std::collections::HashMap<u64, String>>,
+    /// How long the topic endpoint takes to answer, so requests overlap.
+    topic_delay: Mutex<Option<std::time::Duration>>,
     upload_ok: bool,
     /// Tags the topic already carries, echoed back by the topic endpoint.
     existing_tags: Vec<String>,
@@ -52,6 +54,10 @@ async fn stub_topic(
     State(s): State<Arc<StubState>>,
     axum::extract::Path(topic_json): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    let delay = *s.topic_delay.lock().expect("stub mutex");
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let topic: u64 = topic_json
         .trim_end_matches(".json")
         .parse()
@@ -160,6 +166,7 @@ async fn spawn_stub_with_tag_shape(
     let state = Arc::new(StubState {
         author: author.to_owned(),
         other_authors: Mutex::new(std::collections::HashMap::new()),
+        topic_delay: Mutex::new(None),
         upload_ok,
         existing_tags,
         tags_as_objects,
@@ -1055,7 +1062,7 @@ async fn bind_before_the_app_delivered_is_409_no_log() {
 }
 
 #[tokio::test]
-async fn a_bind_refused_for_its_author_spends_the_session_so_it_probes_no_other_topic() {
+async fn a_refused_bind_spends_the_session_so_no_second_topic_answers() {
     // Anybody holding a pre-topic sid can call bind, and a success says the
     // report's signer wrote that topic. Relay the attach link to somebody,
     // let them approve, then bind topic after topic: without a one-shot
@@ -1123,6 +1130,53 @@ async fn a_bind_refused_for_its_author_spends_the_session_so_it_probes_no_other_
 }
 
 #[tokio::test]
+async fn binds_in_flight_together_get_one_answer_between_them() {
+    // The one-shot bind has to hold for binds sent at once, or a batch of
+    // guesses all pass the session check before the first refusal lands.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    stub.other_authors
+        .lock()
+        .expect("stub mutex")
+        .insert(42, "someone-else".to_owned());
+    *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_millis(300));
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = new_pre_sid(state.clone()).await;
+    let body = serde_json::json!({
+        "sid": sid,
+        "topic_id": 0,
+        "log_gz_b64": gz_b64(REPORT),
+    })
+    .to_string();
+    router(state.clone())
+        .oneshot(signed_attach_request(&key, &body, [12; 16]))
+        .await
+        .expect("infallible");
+
+    let (wrong, right) = tokio::join!(
+        router(state.clone()).oneshot(bind_request(&sid, 42)),
+        router(state.clone()).oneshot(bind_request(&sid, 43)),
+    );
+    let right = observe(right.expect("infallible")).await;
+
+    assert_eq!(wrong.expect("infallible").status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        (right.status, right.body_utf8.as_str()),
+        (409, r#"{"error":"bind_in_progress"}"#),
+        "the second bind in flight is turned away"
+    );
+    assert!(
+        stub.calls.lock().expect("stub mutex").is_empty(),
+        "the signer's topic got nothing"
+    );
+}
+
+#[tokio::test]
 async fn bind_discourse_failure_is_502_and_stays_received() {
     let key = SigningKey::from_bytes(&[7u8; 32]);
     let (url, _stub) = spawn_stub(&author_username(&key), false).await;
@@ -1152,7 +1206,7 @@ async fn bind_discourse_failure_is_502_and_stays_received() {
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
-    let response = router(state)
+    let response = router(state.clone())
         .oneshot(
             Request::get(format!("/v1/attach/{sid}/status"))
                 .body(Body::empty())
@@ -1164,6 +1218,15 @@ async fn bind_discourse_failure_is_502_and_stays_received() {
         body_json(response).await,
         serde_json::json!({"status": "received"}),
         "a failed bind must stay retryable"
+    );
+    let retry = router(state)
+        .oneshot(bind_request(&sid, 42))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        retry.status(),
+        StatusCode::BAD_GATEWAY,
+        "the retry reaches Discourse again: the failed bind gave its claim back"
     );
 }
 

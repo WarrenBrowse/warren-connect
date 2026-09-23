@@ -1740,9 +1740,15 @@ async fn attach_bind(
         return Err(AuthError::Payload);
     }
     let now = now_unix();
-    let data = state.attach.bind_data(&sid, now)?;
+    let data = state.attach.claim_bind(&sid, now)?;
 
-    let topic = api.topic(bind.topic_id).await?;
+    let topic = match api.topic(bind.topic_id).await {
+        Ok(topic) => topic,
+        Err(err) => {
+            state.attach.release_bind(&sid);
+            return Err(err.into());
+        }
+    };
     if !topic.author_username.eq_ignore_ascii_case(&data.username) {
         // One guess per session. The bind is unauthenticated (the sid is the
         // capability, and a relayed attach link hands it out), and a success
@@ -1760,7 +1766,10 @@ async fn attach_bind(
 
     // On failure the session stays Received (log still parked), retryable.
     let meta = (data.version, data.os);
-    deliver_to_staff(api, bind.topic_id, &topic, data.log_text, meta, now).await?;
+    if let Err(err) = deliver_to_staff(api, bind.topic_id, &topic, data.log_text, meta, now).await {
+        state.attach.release_bind(&sid);
+        return Err(err);
+    }
 
     state.attach.complete(&sid, now_unix())?;
     tracing::info!(
