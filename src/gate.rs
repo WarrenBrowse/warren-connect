@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -82,9 +82,9 @@ pub struct Gates {
 impl Default for Gates {
     fn default() -> Self {
         Self {
-            login: GateLimiter::new(LOGIN_PERMITS, MAX_QUEUED, MAX_WAIT),
-            open: GateLimiter::new(OPEN_PERMITS, MAX_QUEUED, MAX_WAIT),
-            topic: GateLimiter::new(TOPIC_PERMITS, MAX_QUEUED, MAX_WAIT),
+            login: GateLimiter::new("login", LOGIN_PERMITS, MAX_QUEUED, MAX_WAIT),
+            open: GateLimiter::new("open", OPEN_PERMITS, MAX_QUEUED, MAX_WAIT),
+            topic: GateLimiter::new("topic", TOPIC_PERMITS, MAX_QUEUED, MAX_WAIT),
             never_paid: NegativeCache::new(NEGATIVE_TTL_SECS, NEGATIVE_MAX_ENTRIES),
             unlinked: NegativeCache::new(NEGATIVE_TTL_SECS, NEGATIVE_MAX_ENTRIES),
             author_misses: RateLimiter::new(AUTHOR_MISSES_PER_HOUR, usize::MAX, 3_600),
@@ -95,10 +95,15 @@ impl Default for Gates {
 /// Bulkhead over one kind of gate read.
 #[derive(Debug)]
 pub struct GateLimiter {
+    name: &'static str,
     permits: Semaphore,
     queued: AtomicUsize,
     max_queued: usize,
     max_wait: Duration,
+    /// Refusals since the last saturation line.
+    refused: AtomicU64,
+    /// Unix second of the last saturation line.
+    reported_at: AtomicU64,
 }
 
 /// The gate is saturated: the read was refused without running.
@@ -107,16 +112,19 @@ pub struct GateLimiter {
 pub struct GateBusy;
 
 impl GateLimiter {
-    /// Runs at most `permits` reads at once. A read that finds none free
-    /// waits for one behind at most `max_queued` others, for at most
-    /// `max_wait`.
+    /// The gate `name` (the name its saturation is logged under), running at
+    /// most `permits` reads at once. A read that finds none free waits for
+    /// one behind at most `max_queued` others, for at most `max_wait`.
     #[must_use]
-    pub fn new(permits: usize, max_queued: usize, max_wait: Duration) -> Self {
+    pub fn new(name: &'static str, permits: usize, max_queued: usize, max_wait: Duration) -> Self {
         Self {
+            name,
             permits: Semaphore::new(permits),
             queued: AtomicUsize::new(0),
             max_queued,
             max_wait,
+            refused: AtomicU64::new(0),
+            reported_at: AtomicU64::new(0),
         }
     }
 
@@ -142,13 +150,44 @@ impl GateLimiter {
         if let Ok(permit) = self.permits.try_acquire() {
             return Ok(permit);
         }
-        let _place = QueuePlace::take(&self.queued, self.max_queued).ok_or(GateBusy)?;
+        let Some(_place) = QueuePlace::take(&self.queued, self.max_queued) else {
+            return Err(self.refuse());
+        };
         match tokio::time::timeout(self.max_wait, self.permits.acquire()).await {
             Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) | Err(_) => Err(GateBusy),
+            Ok(Err(_)) | Err(_) => Err(self.refuse()),
         }
     }
+
+    /// Counts a refusal, and says so at most once a minute: a line per
+    /// refused read would hand a flood the log as well, and none would leave
+    /// the operator only the 502s the clients saw.
+    fn refuse(&self) -> GateBusy {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Some(refused) = self.saturation_report(now) {
+            tracing::warn!(gate = self.name, refused, "gate saturated: reads refused");
+        }
+        GateBusy
+    }
+
+    /// Counts one refusal at `now_unix`. When a saturation line is due, hands
+    /// back the refusals since the last one.
+    fn saturation_report(&self, now_unix: u64) -> Option<u64> {
+        self.refused.fetch_add(1, Ordering::AcqRel);
+        let last = self.reported_at.load(Ordering::Acquire);
+        (now_unix >= last.saturating_add(SATURATION_REPORT_SECS)
+            && self
+                .reported_at
+                .compare_exchange(last, now_unix, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+        .then(|| self.refused.swap(0, Ordering::AcqRel))
+    }
 }
+
+/// Shortest interval between two saturation lines of one gate.
+const SATURATION_REPORT_SECS: u64 = 60;
 
 /// A place in a gate's queue, given back when dropped, whether the wait ended
 /// with a permit, a timeout or the caller going away.
@@ -278,7 +317,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_full_gate_refuses_at_once() {
-        let gate = Arc::new(GateLimiter::new(1, 1, Duration::from_secs(30)));
+        let gate = Arc::new(GateLimiter::new("test", 1, 1, Duration::from_secs(30)));
         let release = Arc::new(tokio::sync::Notify::new());
         let running = tokio::spawn({
             let gate = gate.clone();
@@ -307,7 +346,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_queued_read_gives_up_after_the_longest_wait() {
-        let gate = Arc::new(GateLimiter::new(1, 4, Duration::from_secs(2)));
+        let gate = Arc::new(GateLimiter::new("test", 1, 4, Duration::from_secs(2)));
         let release = Arc::new(tokio::sync::Notify::new());
         let running = tokio::spawn({
             let gate = gate.clone();
@@ -325,12 +364,22 @@ mod tests {
             Duration::from_secs(2),
             "it waited exactly the longest wait"
         );
+        assert_eq!(gate.queued(), 0, "and gave its place in the queue back");
         release.notify_one();
         assert_eq!(running.await.expect("task"), Ok(()));
+    }
+
+    #[test]
+    fn a_saturated_gate_reports_once_a_minute_with_what_it_refused_since() {
+        let gate = GateLimiter::new("open", 1, 0, Duration::from_secs(30));
+
+        assert_eq!(gate.saturation_report(1_000), Some(1), "the first refusal");
+        assert_eq!(gate.saturation_report(1_001), None);
+        assert_eq!(gate.saturation_report(1_059), None);
         assert_eq!(
-            gate.run(async { "ran" }).await,
-            Ok("ran"),
-            "and the queue it left is empty again"
+            gate.saturation_report(1_060),
+            Some(3),
+            "a minute later, the three refused since"
         );
     }
 

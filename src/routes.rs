@@ -606,10 +606,7 @@ async fn legacy_admission(
             );
             Err(LegacyGate::Unread)
         }
-        Err(GateBusy) => {
-            tracing::debug!("forum login gate saturated");
-            Err(LegacyGate::Unread)
-        }
+        Err(GateBusy) => Err(LegacyGate::Unread),
     }
 }
 
@@ -868,10 +865,6 @@ async fn paywall_standing(
                 AdmitError::Unavailable
             })
     };
-    let gate_busy = |gate: &'static str| {
-        tracing::debug!(gate, "paywall gate saturated");
-        AdmitError::Unavailable
-    };
     match door {
         Door::Login { session } => state
             .gates
@@ -885,7 +878,7 @@ async fn paywall_standing(
                 read().await
             })
             .await
-            .map_err(|GateBusy| gate_busy("login"))?,
+            .map_err(|GateBusy| AdmitError::Unavailable)?,
         Door::Report => {
             let now = now_unix();
             if state.gates.never_paid.holds(&identity.pubkey, now) {
@@ -904,7 +897,7 @@ async fn paywall_standing(
                     read().await.map(Some)
                 })
                 .await
-                .map_err(|GateBusy| gate_busy("open"))??;
+                .map_err(|GateBusy| AdmitError::Unavailable)??;
             let Some(status) = status else {
                 return Ok(store::SubscriptionStatus::default());
             };
@@ -956,10 +949,7 @@ async fn forum_link(
             tracing::error!(kind = sqlx_error_kind(&err), "forum link lookup failed");
             Err(AuthError::Forum)
         }
-        Err(GateBusy) => {
-            tracing::debug!("forum link gate saturated");
-            Err(AuthError::Forum)
-        }
+        Err(GateBusy) => Err(AuthError::Forum),
     }
 }
 
@@ -1594,7 +1584,6 @@ async fn forum_attach_logs(
             return Err(err);
         }
         Err(GateBusy) => {
-            tracing::debug!("attach topic gate saturated");
             state.gates.author_misses.release(signer);
             return Err(AuthError::Forum);
         }
@@ -2077,7 +2066,6 @@ async fn attach_bind(
             return Err(err.into());
         }
         Err(GateBusy) => {
-            tracing::debug!("attach topic gate saturated");
             state.attach.release_bind(&sid);
             return Err(AuthError::Forum);
         }
