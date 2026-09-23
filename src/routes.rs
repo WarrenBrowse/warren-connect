@@ -1342,11 +1342,19 @@ async fn forum_attach_logs(
     // Pre-topic session: no topic exists yet, so the report is parked in the
     // session (with the signer's handle for the author check at bind time).
     if kind == AttachKind::PreTopic {
+        admit_pre_topic_signer(&state, &identity, &forum).await?;
         let (log_text, (version, os)) =
             decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
         state
             .attach
-            .store_received(&req.sid, &forum.username, log_text, version, os, now)?;
+            .store_received(&req.sid, &forum.username, log_text, version, os, now)
+            .inspect_err(|err| {
+                tracing::info!(
+                    pubkey = %redact(&identity.pubkey_ss58),
+                    error = %err,
+                    "attach-logs refused: the pre-topic report was not parked"
+                );
+            })?;
         tracing::info!(
             pubkey = %redact(&identity.pubkey_ss58),
             "pre-topic report received"
@@ -1404,6 +1412,39 @@ async fn forum_attach_logs(
         Json(serde_json::json!({"status": "attached"})),
     )
         .into_response())
+}
+
+/// The gate of a pre-topic upload: the signer must have a forum link. A parked
+/// report holds one of [`attach::MAX_LOG_SESSIONS`] slots until its bind and a
+/// wallet costs nothing to mint, so a signature alone would let anybody fill
+/// the store and evict the reports of users still writing their topic. The
+/// composer that mints the session is open only to a signed-in forum user,
+/// and signing in records the link. The one reporter without it is one whose
+/// forum session outlived [`crate::FORUM_LINK_RETENTION_DAYS`] since their
+/// last sign-in, and signing in again restores it. Checked before the gunzip,
+/// the costly step.
+async fn admit_pre_topic_signer(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+    forum: &handle::ForumHandle,
+) -> Result<(), AuthError> {
+    match state.identity.is_linked(&forum.external_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::info!(
+                pubkey = %redact(&identity.pubkey_ss58),
+                "attach-logs refused: pre-topic upload from a wallet with no forum link"
+            );
+            Err(AuthError::NotAuthor)
+        }
+        Err(err) => {
+            tracing::error!(
+                kind = sqlx_error_kind(&err),
+                "attach-logs refused: forum link unreadable"
+            );
+            Err(AuthError::Forum)
+        }
+    }
 }
 
 /// The Discourse writes shared by the topic-mode upload and the pre-topic

@@ -221,10 +221,20 @@ async fn spawn_stub_with_tag_shape(
     (format!("http://{addr}"), state)
 }
 
-fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
-    let lazy = PgPoolOptions::new()
+/// A pool that never reaches a database, and gives up on it quickly.
+fn unreachable_pool() -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-        .expect("lazy pool never dials at build time");
+        .expect("lazy pool never dials at build time")
+}
+
+fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
+    test_state_with_identity(forum_api, IdentityStore::Memory(MemoryIdentity::default()))
+}
+
+fn test_state_with_identity(forum_api: Option<ForumApi>, identity: IdentityStore) -> Arc<AppState> {
+    let lazy = unreachable_pool();
     Arc::new(AppState {
         connect_secret: b"a-test-connect-secret-32-bytes!!".to_vec(),
         handle_secret: HANDLE_SECRET.to_vec(),
@@ -233,7 +243,7 @@ fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
-        identity: IdentityStore::Memory(MemoryIdentity::default()),
+        identity,
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),
@@ -287,6 +297,18 @@ fn signed_attach_request(key: &SigningKey, body: &str, nonce: [u8; 16]) -> Reque
 
 fn author_username(key: &SigningKey) -> String {
     handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username
+}
+
+/// Records the wallet's forum link the way its forum sign-in does. The
+/// composer that mints a pre-topic session is only open to a signed-in user,
+/// so a real pre-topic reporter holds one.
+async fn link(state: &AppState, key: &SigningKey) {
+    let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    state
+        .identity
+        .upsert_link(&forum.external_id, &forum.username)
+        .await
+        .expect("the in-memory link store never fails");
 }
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -1105,6 +1127,7 @@ async fn a_cancel_after_the_app_delivered_leaves_the_report_to_its_bind() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = new_pre_sid(state.clone()).await;
     assert_answer(
         &upload(state.clone(), &key, &sid, 0, REPORT, [13; 16]).await,
@@ -1270,6 +1293,7 @@ async fn pre_mode_happy_path_receives_then_binds() {
         "staff".into(),
     )));
 
+    link(&state, &key).await;
     let sid = new_pre_sid(state.clone()).await;
 
     // The pre-topic attach page reuses the session and deep-links topic 0.
@@ -1451,6 +1475,7 @@ async fn a_refused_bind_spends_the_session_so_no_second_topic_answers() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = new_pre_sid(state.clone()).await;
     let body = serde_json::json!({
         "sid": sid,
@@ -1518,6 +1543,7 @@ async fn binds_in_flight_together_get_one_answer_between_them() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = new_pre_sid(state.clone()).await;
     let body = serde_json::json!({
         "sid": sid,
@@ -1558,6 +1584,7 @@ async fn bind_discourse_failure_is_502_and_stays_received() {
         "system".into(),
         "staff".into(),
     )));
+    link(&state, &key).await;
     let sid = new_pre_sid(state.clone()).await;
 
     let body = serde_json::json!({
@@ -1650,6 +1677,121 @@ async fn a_pre_session_refuses_a_nonzero_topic_upload() {
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_pre_topic_upload_from_a_wallet_with_no_forum_link_is_refused_and_parks_nothing() {
+    // A wallet costs nothing to mint and a parked report holds one of the
+    // MAX_LOG_SESSIONS slots until its bind, so a signature alone must not
+    // buy one. The composer's own user always has the link: signing in to
+    // the forum is what records it.
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let sid = new_pre_sid(state.clone()).await;
+
+    let answer = upload(state.clone(), &key, &sid, 0, REPORT, [20; 16]).await;
+
+    assert_answer(
+        &answer,
+        &v.responses.attach.get("not_author"),
+        "refused with the answer the app already knows",
+    );
+    assert_answer(
+        &read_status(state, &sid).await,
+        &v.responses.attach_status.get("pending"),
+        "and nothing was parked",
+    );
+}
+
+#[tokio::test]
+async fn a_flood_of_unlinked_wallets_cannot_evict_a_linked_wallets_parked_report() {
+    // Throwaway keys cost nothing: sixteen mint-and-upload pairs would fill
+    // the log store, and the next would evict the oldest parked report, the
+    // one of a user still writing the topic it belongs to.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    link(&state, &key).await;
+    let sid = new_pre_sid(state.clone()).await;
+    let parked = upload(state.clone(), &key, &sid, 0, REPORT, [21; 16]).await;
+    assert_eq!(parked.status, 200, "the linked wallet parks its report");
+    // The store dates reports to the second: one second later the linked
+    // report is strictly the oldest, so no tie in the eviction order can
+    // spare it.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let mut flood = Vec::new();
+    for seed in 0..=warren_connect::attach::MAX_LOG_SESSIONS {
+        let seed = u8::try_from(100 + seed).expect("one key byte per throwaway wallet");
+        let throwaway = SigningKey::from_bytes(&[seed; 32]);
+        let flood_sid = new_pre_sid(state.clone()).await;
+        flood.push(upload(state.clone(), &throwaway, &flood_sid, 0, REPORT, [22; 16]).await);
+    }
+
+    let response = router(state)
+        .oneshot(bind_request(&sid, 42))
+        .await
+        .expect("infallible");
+    let bound = observe(response).await;
+    assert_eq!(
+        (bound.status, bound.body_utf8.as_str()),
+        (200, r#"{"status":"attached"}"#),
+        "the linked report outlived the flood and binds"
+    );
+    assert!(
+        flood
+            .iter()
+            .all(|a| (a.status, a.body_utf8.as_str()) == (403, r#"{"error":"not_author"}"#)),
+        "the forum-link gate is what turned the flood away"
+    );
+}
+
+#[tokio::test]
+async fn a_pre_topic_upload_is_refused_while_the_forum_links_cannot_be_read() {
+    // Fails closed, and as the forum being unavailable: the reporter is told
+    // to try again, where "not the author" would tell them to stop.
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state_with_identity(
+        Some(ForumApi::new(
+            &url,
+            "k".into(),
+            "system".into(),
+            "staff".into(),
+        )),
+        IdentityStore::Postgres {
+            forum: unreachable_pool(),
+            warren: unreachable_pool(),
+            discourse: None,
+        },
+    );
+    let sid = new_pre_sid(state.clone()).await;
+
+    let answer = upload(state.clone(), &key, &sid, 0, REPORT, [23; 16]).await;
+
+    assert_answer(
+        &answer,
+        &v.responses.attach.get("forum_unavailable"),
+        "refused as a transient failure",
+    );
+    assert_answer(
+        &read_status(state, &sid).await,
+        &v.responses.attach_status.get("pending"),
+        "and nothing was parked",
+    );
 }
 
 #[tokio::test]
@@ -2388,6 +2530,7 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
 
     // A pre-topic session: its meta has no topic, the upload parks the
     // report (received), and the meta then names what the app delivered.
+    link(&state, &key).await;
     let pre = new_pre_sid(state.clone()).await;
     assert_answer(
         &read_meta(state.clone(), &pre).await,
