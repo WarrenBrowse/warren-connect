@@ -2,9 +2,9 @@
 //! signed `POST /v1/forum/login` (the bound form by default), so a shell
 //! script can drive the full SSO flow with curl. The script then holds the
 //! `__Host-warren_login` cookie from `/sso` and confirms with the
-//! `completion.code` of the answer before it completes. Uses an ephemeral key by default (any valid Ed25519 key
-//! is accepted; subscription simply resolves to inactive) or a 32-byte seed
-//! from `SEED_HEX`.
+//! `completion.code` of the answer before it completes. Uses an ephemeral
+//! key by default (any valid Ed25519 key is accepted; subscription simply
+//! resolves to inactive) or a 32-byte seed from `SEED_HEX`.
 //!
 //! Args: <sid> [timestamp]. Env: SEED_HEX (optional).
 

@@ -18,7 +18,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 | Route | Purpose |
 |---|---|
 | `GET /sso` | DiscourseConnect entry (HMAC-verified): sets the `__Host-warren_login` cookie that binds the sign-in to this browser and renders the approval page |
-| `POST /v1/forum/login` | Wallet-signed approval from the Warren app. Body `{"login_version":2,"sid"}`; the answer carries the one-time completion code (and, for a same-device approval, the handoff URL). The form without `login_version` is refused unless `WARREN_CONNECT_LEGACY_APPROVAL=allow`, and always for staff |
+| `POST /v1/forum/login` | Wallet-signed approval from the Warren app. Body `{"login_version":2,"sid":"<sid>"}`; the answer carries the one-time completion code (and, for a same-device approval, the handoff URL). The form without `login_version` is refused unless `WARREN_CONNECT_LEGACY_APPROVAL=allow`, and always for staff |
 | `GET /v1/session/:sid/status` | Browser poll with the cookie: `pending` / `awaiting_code` / `approved` / `completed` / `cancelled`. Without it (the app's preflight): `pending` or 404 |
 | `POST /v1/session/:sid/confirm` | The browser presents the code the app received (cookie required, 5 attempts) |
 | `GET /v1/session/:sid/complete` | Redirect back into Discourse with the signed payload (cookie required, after the confirm) |
@@ -44,8 +44,9 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 
 Staff is an allowlist of Warren pubkeys configured in `WARREN_ADMIN_PUBKEYS`: a
 listed wallet is promoted to Discourse admin/moderator via the SSO payload on
-every bound login approved from the same device. The roster is deployment configuration rather than source, so this
-repository carries the mechanism without naming its operators. An entry that is
+every bound login approved from the same device. The roster is deployment
+configuration rather than source, so this repository carries the mechanism
+without naming its operators. An entry that is
 not a valid Warren address refuses startup, identified by position (the no-log
 rule forbids echoing the material). An empty roster leaves the forum with no
 staff wallet, logged as a warning at startup. `INTERNAL_TOKEN` (>= 32 bytes, or

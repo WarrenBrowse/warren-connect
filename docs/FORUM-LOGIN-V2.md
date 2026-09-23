@@ -101,14 +101,14 @@ for an approval and does nothing to one past it. Always answers
 
 ### Browser side (the provider's own pages)
 
-The app never calls these. They are listed so the client lot knows what the
-browser does after the app's part is over.
+The app never calls these. They are listed so client implementers know what
+the browser does after the app's part is over.
 
 | route | cookie | answers |
 |---|---|---|
 | `GET /sso?sso&sig` | sets `__Host-warren_login=<64 hex>; Max-Age=300; Path=/; Secure; HttpOnly; SameSite=Lax`, reusing the value the browser already holds | the approval page; a nonce whose live session belongs to another browser gets a 403 "started in another browser" page and no session |
 | `GET /v1/session/{sid}/status` | required (same-device id) | `{"status":"pending"}`, `{"status":"awaiting_code"}`, `{"status":"approved"}`, `{"status":"completed"}`, `{"reason":"<reason>","status":"cancelled"}`; 403 `{"error":"browser_mismatch"}` for another browser's cookie or an unknown id, identical in both cases |
-| `POST /v1/session/{sid}/confirm` | required, `Content-Type: application/json`, body `{"code":"<6 digits>"}` | 200 `{"status":"approved"}`; 422 `{"attempts_left":<n>,"error":"code_invalid"}`; 409 `{"reason":"code_attempts_exhausted","status":"cancelled"}` on the fifth wrong code; 409 with the state document when no code is awaited; 403 `browser_mismatch`; 400 without the JSON media type |
+| `POST /v1/session/{sid}/confirm` | required, `Content-Type: application/json`, body `{"code":"<6 digits>"}` | 200 `{"status":"approved"}`; 422 `{"attempts_left":<n>,"error":"code_invalid"}`; 409 `{"reason":"code_attempts_exhausted","status":"cancelled"}` on the fifth wrong code; 409 with the state document when no code is awaited; 403 `browser_mismatch`; 400 without the JSON media type or for a code that is not 6 digits (no attempt spent) |
 | `GET /v1/session/{sid}/complete` | required | 303 to Discourse with the signed payload when `approved`; 303 to the forum root when this browser already completed it (a second tab); 409 with the state document otherwise; 403 `browser_mismatch` |
 | `GET /handoff` | sent by the page's own fetch | the handoff page (below) |
 
@@ -132,7 +132,9 @@ cookie:
 - the browser that opened the sign-in completes it and lands in the forum;
 - any other browser shows: "This browser did not start this sign-in. [...] If
   someone sent you a link or a code to approve, they were trying to sign in to
-  the forum as you: do not send them anything." The code is never displayed.
+  the forum as you: do not send them anything." The code is never displayed;
+- a browser that reports cookies disabled is told it cannot finish the sign-in
+  and to type the code on the sign-in page instead, without any request.
 
 ## App behaviour
 
@@ -224,8 +226,15 @@ happen to a v2 client and maps to the generic failure.
 - A replayed `sso` payload from another browser gets no session.
 - Staff is asserted only on a v2 approval on the same-device id, which the
   browser completing it confirmed with the code.
-- Residuals: a victim who reads the code to an attacker (the same limit as
-  any one-time code; the app's warning and the handoff page are the answer);
-  the legacy transition window for non-staff wallets while the flag is
-  `allow`; an app-side cancel by anyone holding a sid, before the approval
-  only.
+- Residuals:
+  - a victim who reads the code to an attacker (the same limit as any
+    one-time code; the app's warning and the handoff page are the answer);
+  - a typed sign-in code resolves as the same-device id, so an allowlisted
+    wallet approving one typed from another device's screen still carries the
+    staff claim to whichever browser presents the code;
+  - once approved, a login can be ended only by its own browser: a victim who
+    notices a relayed approval cannot withdraw it, and the attacker keeps five
+    guesses until the TTL;
+  - the legacy transition window for non-staff wallets while the flag is
+    `allow`;
+  - an app-side cancel by anyone holding a sid, before the approval only.
