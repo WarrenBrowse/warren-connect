@@ -225,15 +225,17 @@ impl AttachStore {
             // budget to draw. Failing closed therefore let anyone take the
             // whole attach feature down for a TTL by minting sessions;
             // displacing means a flood only ever evicts its own idle
-            // sessions, since a real one is claimed within seconds.
+            // sessions, since a real one is claimed within seconds. A session
+            // being delivered is not idle: its Discourse writes are in flight.
             let oldest = sessions
                 .iter()
-                .filter(|(_, s)| !s.holds_log())
+                .filter(|(_, s)| !s.holds_log() && !s.processing)
                 .min_by_key(|(_, s)| s.created_unix)
                 .map(|(sid, _)| sid.clone());
-            // Every session holding a report is a user waiting on it, and
-            // MAX_LOG_SESSIONS caps how many those can be, so this is
-            // unreachable unless that cap is raised to the session cap.
+            // Every session holding a report or being delivered is a user
+            // waiting on it, and MAX_LOG_SESSIONS and the authors' own uploads
+            // cap how many those can be, so this is unreachable unless that
+            // cap is raised to the session cap.
             let Some(oldest) = oldest else {
                 return Err(AuthError::Session);
             };
@@ -357,13 +359,21 @@ impl AttachStore {
     /// then on [`Self::decline`] leaves it alone. [`Self::begin`] checked the
     /// session before the topic fetch; this checks it again, so a decline that
     /// landed during that fetch stops the delivery before any Discourse write.
+    /// One delivery at a time: a second upload while the first talks to
+    /// Discourse would post the report twice, and the first one's failure
+    /// would clear the flag under the second.
     ///
     /// # Errors
-    /// [`AuthError::Session`] if unknown, expired, finished or cancelled.
+    /// [`AuthError::Session`] if unknown, expired, finished, cancelled or
+    /// already being delivered.
     pub fn start_delivery(&self, sid: &str, now_unix: u64) -> Result<(), AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         let session = sessions.get_mut(sid).ok_or(AuthError::Session)?;
-        if session.expired(now_unix) || session.done || session.cancelled.is_some() {
+        if session.expired(now_unix)
+            || session.done
+            || session.cancelled.is_some()
+            || session.processing
+        {
             return Err(AuthError::Session);
         }
         session.processing = true;
@@ -403,16 +413,21 @@ impl AttachStore {
                 return Err(AuthError::Session);
             }
         }
-        let holding: Vec<(String, u64)> = sessions
+        let holding: Vec<(String, u64, bool)> = sessions
             .iter()
             .filter(|(other, s)| other.as_str() != sid && s.holds_log())
             .map(|(other, s)| {
                 let at = s.received.as_ref().map_or(u64::MAX, |r| r.received_unix);
-                (other.clone(), at)
+                (other.clone(), at, s.binding)
             })
             .collect();
+        // A report whose bind is writing to Discourse is spared: evicting it
+        // would fail that bind after the staff already received the report.
         if holding.len() >= MAX_LOG_SESSIONS
-            && let Some((oldest, _)) = holding.iter().min_by_key(|(_, at)| *at)
+            && let Some((oldest, _, _)) = holding
+                .iter()
+                .filter(|(_, _, binding)| !binding)
+                .min_by_key(|(_, at, _)| *at)
         {
             sessions.remove(oldest);
             tracing::warn!(
@@ -851,6 +866,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_session_being_delivered_is_never_displaced_by_the_flood() {
+        // Its Discourse writes are in flight: displacing it would answer the
+        // app that the session is gone after the logs landed.
+        let store = AttachStore::default();
+        let delivering = store.create(1, &browser(), 0).expect("create");
+        store.start_delivery(&delivering, 0).expect("start");
+        // The OLDEST session, so only the delivery can save it.
+        for topic in 2..=MAX_SESSIONS as u64 {
+            store.create(topic, &browser(), 1).expect("fill");
+        }
+
+        store
+            .create(u64::MAX, &browser(), 2)
+            .expect("still accepted");
+
+        assert_eq!(
+            store.status(&delivering, 2).expect("the delivery survives"),
+            AttachStatus::Processing
+        );
+    }
+
+    #[test]
+    fn a_session_carries_one_delivery_at_a_time() {
+        // Two uploads of one session at once would post the report to the
+        // staff twice, and the first one's failure would clear the flag under
+        // the second, reopening the session to a decline mid-delivery.
+        let store = AttachStore::default();
+        let sid = store.create(42, &browser(), 0).expect("create");
+        store.start_delivery(&sid, 1).expect("first delivery");
+
+        assert!(
+            matches!(store.start_delivery(&sid, 2), Err(AuthError::Session)),
+            "a second delivery is refused while the first runs"
+        );
+        store.clear_processing(&sid);
+        assert!(
+            store.start_delivery(&sid, 3).is_ok(),
+            "a failed delivery leaves the session to a retry"
+        );
+    }
+
     fn gz(data: &[u8]) -> Vec<u8> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(data).expect("gzip write");
@@ -1083,6 +1140,38 @@ mod tests {
         assert_eq!(
             store.status(&extra, 501).expect("newcomer holds its log"),
             AttachStatus::Received
+        );
+    }
+
+    #[test]
+    fn a_report_whose_bind_is_in_flight_is_never_evicted() {
+        // Its bind is writing to Discourse: evicting it would fail the bind
+        // after the staff already received the report.
+        let store = AttachStore::default();
+        let mut sids = Vec::new();
+        for i in 0..MAX_LOG_SESSIONS as u64 {
+            let sid = store.create_pre(0).expect("create_pre");
+            store
+                .store_received(&sid, "u", "log".into(), None, None, i)
+                .expect("fill");
+            sids.push(sid);
+        }
+        store.claim_bind(&sids[0], 400).expect("bind in flight");
+
+        let extra = store.create_pre(0).expect("one more");
+        store
+            .store_received(&extra, "u", "log".into(), None, None, 500)
+            .expect("the next oldest makes room");
+
+        assert_eq!(
+            store
+                .status(&sids[0], 501)
+                .expect("the binding report stays"),
+            AttachStatus::Received
+        );
+        assert!(
+            store.status(&sids[1], 501).is_err(),
+            "the oldest report nobody is binding is the one evicted"
         );
     }
 

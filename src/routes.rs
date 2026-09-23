@@ -1387,7 +1387,7 @@ async fn forum_attach_logs(
         .inspect_err(|_| {
             tracing::info!(
                 topic_id = req.topic_id,
-                "attach-logs refused: the session ended before the delivery started"
+                "attach-logs refused: the session ended or is already being delivered"
             );
         })?;
     if let Err(err) = deliver_to_staff(api, req.topic_id, &topic, log_text, meta, now).await {
