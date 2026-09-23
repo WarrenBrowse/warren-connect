@@ -120,17 +120,21 @@ pub struct LegacyApprovalError;
 /// host-only and `Path=/`, so no sibling subdomain can plant or overwrite it.
 pub const LOGIN_COOKIE: &str = "__Host-warren_login";
 
-/// What a request presented under [`LOGIN_COOKIE`].
+/// The cookie that binds a topic attach session to the browser that opened
+/// its page, under the same `__Host-` guarantee as [`LOGIN_COOKIE`].
+pub const ATTACH_COOKIE: &str = "__Host-warren_attach";
+
+/// What a request presented under one of the binding cookies.
 enum PresentedCookie {
-    /// No login cookie: the app, or a browser that never opened a login.
+    /// No such cookie: the app, or a browser that never opened such a page.
     Absent,
     /// A cookie of the shape this service mints.
     Secret(BrowserSecret),
-    /// A login cookie of any other shape, which binds nothing.
+    /// A cookie of that name and any other shape, which binds nothing.
     Malformed,
 }
 
-fn presented_cookie(headers: &HeaderMap) -> PresentedCookie {
+fn presented_cookie(headers: &HeaderMap, cookie: &str) -> PresentedCookie {
     let mut named = false;
     for value in headers.get_all(axum::http::header::COOKIE) {
         let Ok(value) = value.to_str() else {
@@ -140,7 +144,7 @@ fn presented_cookie(headers: &HeaderMap) -> PresentedCookie {
             let Some((name, raw)) = pair.trim().split_once('=') else {
                 continue;
             };
-            if name == LOGIN_COOKIE {
+            if name == cookie {
                 if let Some(secret) = BrowserSecret::parse(raw) {
                     return PresentedCookie::Secret(secret);
                 }
@@ -158,19 +162,33 @@ fn presented_cookie(headers: &HeaderMap) -> PresentedCookie {
 /// The browser a browser-side login call comes from. Anything short of a
 /// well-formed login cookie is refused the way a stranger's cookie is.
 fn browser_key(headers: &HeaderMap) -> Result<BrowserKey, AuthError> {
-    match presented_cookie(headers) {
+    match presented_cookie(headers, LOGIN_COOKIE) {
         PresentedCookie::Secret(secret) => Ok(secret.key()),
         PresentedCookie::Absent | PresentedCookie::Malformed => Err(AuthError::BrowserMismatch),
     }
 }
 
-/// `Set-Cookie` for the login cookie. `Lax` keeps it on the top-level
-/// navigation back from the forum and off every cross-site subrequest;
-/// `HttpOnly` keeps it away from any script, the page's own included. It
-/// lives as long as a login does.
-fn login_cookie_header(secret: &BrowserSecret) -> axum::http::HeaderValue {
+/// The secret a browser already holds under `cookie`, or a fresh one. A
+/// browser keeps one secret across the pages it opens, so a refresh and a
+/// second tab stay bound to the session they already have.
+fn held_or_fresh_secret(headers: &HeaderMap, cookie: &str) -> BrowserSecret {
+    match presented_cookie(headers, cookie) {
+        PresentedCookie::Secret(secret) => secret,
+        PresentedCookie::Absent | PresentedCookie::Malformed => BrowserSecret::generate(),
+    }
+}
+
+/// `Set-Cookie` for a binding cookie. `Lax` keeps it on the top-level
+/// navigation from the forum and off every cross-site subrequest; `HttpOnly`
+/// keeps it away from any script, the page's own included. It lives as long
+/// as the session it binds.
+fn binding_cookie_header(
+    cookie: &str,
+    secret: &BrowserSecret,
+    max_age_secs: u64,
+) -> axum::http::HeaderValue {
     format!(
-        "{LOGIN_COOKIE}={}; Max-Age={SESSION_TTL_SECS}; Path=/; Secure; HttpOnly; SameSite=Lax",
+        "{cookie}={}; Max-Age={max_age_secs}; Path=/; Secure; HttpOnly; SameSite=Lax",
         secret.as_str()
     )
     .parse()
@@ -450,12 +468,7 @@ async fn sso_entry(
         crate::FORUM_PUBLIC_URL,
     )?;
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    // A browser keeps one secret across the logins it opens, so a refresh and
-    // a second tab stay bound to the session they already have.
-    let secret = match presented_cookie(&headers) {
-        PresentedCookie::Secret(secret) => secret,
-        PresentedCookie::Absent | PresentedCookie::Malformed => BrowserSecret::generate(),
-    };
+    let secret = held_or_fresh_secret(&headers, LOGIN_COOKIE);
     let ids = match state.sessions.create(
         incoming.nonce,
         incoming.return_sso_url,
@@ -474,8 +487,10 @@ async fn sso_entry(
         |nonce| pages::approval_page(lang, &ids, &state.public_host, nonce),
         false,
     );
-    page.headers_mut()
-        .insert(axum::http::header::SET_COOKIE, login_cookie_header(&secret));
+    page.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        binding_cookie_header(LOGIN_COOKIE, &secret, SESSION_TTL_SECS),
+    );
     Ok(page)
 }
 
@@ -1094,7 +1109,7 @@ async fn session_status(
     Path(sid): Path<String>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     let now = now_unix();
-    match presented_cookie(&headers) {
+    match presented_cookie(&headers, LOGIN_COOKIE) {
         PresentedCookie::Absent => {
             if state.sessions.awaits_approval(&sid, now) {
                 Ok(Json(status_body(&SessionStatus::Pending)))
@@ -1243,13 +1258,20 @@ async fn attach_entry(
         params.reader.as_deref(),
     );
     match (params.topic, params.sid) {
-        // Topic mode: mints (or reuses) a session bound to an existing topic.
+        // Topic mode: mints a session bound to an existing topic and to this
+        // browser, or hands back the one this same browser already opened.
         (Some(topic), _) if topic >= 1 => {
-            let sid = state.attach.create(topic, now_unix())?;
-            Ok(html_page(
+            let secret = held_or_fresh_secret(&headers, ATTACH_COOKIE);
+            let sid = state.attach.create(topic, &secret.key(), now_unix())?;
+            let mut page = html_page(
                 |nonce| pages::attach_page(lang, &sid, topic, &state.public_host, reader, nonce),
                 false,
-            ))
+            );
+            page.headers_mut().insert(
+                axum::http::header::SET_COOKIE,
+                binding_cookie_header(ATTACH_COOKIE, &secret, attach::ATTACH_TTL_SECS),
+            );
+            Ok(page)
         }
         // Pre-topic mode: reuses the session minted by /v1/attach/new.
         (None, Some(sid)) => {
@@ -2171,9 +2193,9 @@ fn extract_signed_headers(headers: &HeaderMap) -> Result<SignedHeaders, AuthErro
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthError, HeaderMap, LOGIN_COOKIE, LegacyApproval, LegacyApprovalError, LoginForm,
-        PresentedCookie, SsoUser, bound_approved_body, browser_key, handoff_url, login_allowed,
-        login_approved_body, presented_cookie, staff_claim,
+        ATTACH_COOKIE, AuthError, HeaderMap, LOGIN_COOKIE, LegacyApproval, LegacyApprovalError,
+        LoginForm, PresentedCookie, SsoUser, bound_approved_body, browser_key, handoff_url,
+        login_allowed, login_approved_body, presented_cookie, staff_claim,
     };
 
     #[test]
@@ -2345,17 +2367,28 @@ mod tests {
     #[test]
     fn the_login_cookie_is_found_among_others_and_a_bad_one_is_told_from_none() {
         let secret = "0123456789abcdef".repeat(4);
-        let found = presented_cookie(&cookie_headers(&[
+        let headers = cookie_headers(&[
             "_forum_session=x",
             &format!("theme=dark; {LOGIN_COOKIE}={secret}"),
-        ]));
+        ]);
+        let found = presented_cookie(&headers, LOGIN_COOKIE);
         assert!(matches!(found, PresentedCookie::Secret(s) if s.as_str() == secret));
+        assert!(
+            matches!(
+                presented_cookie(&headers, ATTACH_COOKIE),
+                PresentedCookie::Absent
+            ),
+            "a login secret binds no attach session"
+        );
         assert!(matches!(
-            presented_cookie(&cookie_headers(&["theme=dark"])),
+            presented_cookie(&cookie_headers(&["theme=dark"]), LOGIN_COOKIE),
             PresentedCookie::Absent
         ));
         assert!(matches!(
-            presented_cookie(&cookie_headers(&[&format!("{LOGIN_COOKIE}=forged")])),
+            presented_cookie(
+                &cookie_headers(&[&format!("{LOGIN_COOKIE}=forged")]),
+                LOGIN_COOKIE
+            ),
             PresentedCookie::Malformed
         ));
         assert_eq!(

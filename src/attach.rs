@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use rand::RngCore as _;
 
 use crate::error::AuthError;
+use crate::sessions::BrowserKey;
 
 /// How long the user has to approve the consent popup in the app (and maybe
 /// read the report first). Longer than the login TTL on purpose.
@@ -26,7 +27,7 @@ use crate::error::AuthError;
 /// valid report, and got an expired session. A topic-bound session parks no
 /// report until that upload lands, so it costs a map entry and nothing else,
 /// and there is no reason for it to be shorter than the pre-topic one.
-const ATTACH_TTL_SECS: u64 = 1_800;
+pub const ATTACH_TTL_SECS: u64 = 1_800;
 
 /// Pre-topic sessions span composing a whole report form, so they live longer.
 const ATTACH_PRE_TTL_SECS: u64 = 1_800;
@@ -123,6 +124,10 @@ struct ReceivedLog {
 struct AttachSession {
     // None = pre-topic session.
     topic_id: Option<u64>,
+    /// The browser whose page opened a topic-bound session: a later visit
+    /// gets the session back only from that browser. `None` for a pre-topic
+    /// session, whose id is answered once, to the call that minted it.
+    owner: Option<BrowserKey>,
     created_unix: u64,
     done: bool,
     /// Set when the app's upload lands, before the Discourse round-trips.
@@ -158,25 +163,34 @@ pub struct AttachStore {
 }
 
 impl AttachStore {
-    /// Creates a pending session for a topic; returns its opaque id (32 hex
-    /// chars). Idempotent per topic while a pending session is live (a page
-    /// refresh must not mint a second deep link for the same topic).
+    /// Creates a pending session for a topic, owned by the browser `owner`;
+    /// returns its opaque id (32 hex chars). Idempotent per topic AND browser
+    /// while a pending session is live: a page refresh must not mint a second
+    /// deep link, and the id is all it takes to poll or cancel a session, so
+    /// the topic id, which is public, must never fetch somebody else's.
     ///
     /// # Errors
     /// [`AuthError::Session`] when the store is at capacity.
-    pub fn create(&self, topic_id: u64, now_unix: u64) -> Result<String, AuthError> {
+    pub fn create(
+        &self,
+        topic_id: u64,
+        owner: &BrowserKey,
+        now_unix: u64,
+    ) -> Result<String, AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         sessions.retain(|_, s| !s.expired(now_unix));
-        if let Some((sid, session)) = sessions
-            .iter_mut()
-            .find(|(_, s)| s.topic_id == Some(topic_id) && !s.done && s.cancelled.is_none())
-        {
+        if let Some((sid, session)) = sessions.iter_mut().find(|(_, s)| {
+            s.topic_id == Some(topic_id)
+                && s.owner.as_ref().is_some_and(|o| o.matches(owner))
+                && !s.done
+                && s.cancelled.is_none()
+        }) {
             // Returning to this page is the user starting over, so the
             // deadline starts over with them.
             session.created_unix = now_unix;
             return Ok(sid.clone());
         }
-        Self::insert(&mut sessions, Some(topic_id), now_unix)
+        Self::insert(&mut sessions, Some(topic_id), Some(*owner), now_unix)
     }
 
     /// Creates a pre-topic session (no topic bound yet); returns its sid.
@@ -187,12 +201,13 @@ impl AttachStore {
     pub fn create_pre(&self, now_unix: u64) -> Result<String, AuthError> {
         let mut sessions = self.sessions.lock().expect("attach mutex never poisoned");
         sessions.retain(|_, s| !s.expired(now_unix));
-        Self::insert(&mut sessions, None, now_unix)
+        Self::insert(&mut sessions, None, None, now_unix)
     }
 
     fn insert(
         sessions: &mut HashMap<String, AttachSession>,
         topic_id: Option<u64>,
+        owner: Option<BrowserKey>,
         now_unix: u64,
     ) -> Result<String, AuthError> {
         if sessions.len() >= MAX_SESSIONS {
@@ -225,6 +240,7 @@ impl AttachStore {
             sid.clone(),
             AttachSession {
                 topic_id,
+                owner,
                 created_unix: now_unix,
                 done: false,
                 processing: false,
@@ -537,7 +553,7 @@ mod tests {
         // Set when the app approves, cleared when the delivery fails, so the
         // page never spins on work that is no longer happening.
         let store = AttachStore::default();
-        let sid = store.create(42, 100).expect("create");
+        let sid = store.create(42, &browser(), 100).expect("create");
         assert_eq!(
             store.status(&sid, 100).expect("status"),
             AttachStatus::Pending
@@ -557,12 +573,18 @@ mod tests {
     }
 
     use super::*;
+    use crate::sessions::BrowserSecret;
     use std::io::Write as _;
+
+    /// The one browser most of these tests open their pages in.
+    fn browser() -> BrowserKey {
+        BrowserSecret::parse(&"a".repeat(64)).expect("shape").key()
+    }
 
     #[test]
     fn lifecycle_pending_begun_completed() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert_eq!(sid.len(), 32, "sid is 32 hex chars");
 
         assert_eq!(
@@ -582,7 +604,7 @@ mod tests {
     #[test]
     fn complete_is_single_use() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         store.complete(&sid, 1).expect("first complete");
         assert!(store.complete(&sid, 2).is_err(), "Done is terminal");
         assert!(store.begin(&sid, 42, 3).is_err(), "no re-upload after done");
@@ -591,7 +613,7 @@ mod tests {
     #[test]
     fn begin_rejects_a_topic_mismatch() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert!(store.begin(&sid, 43, 1).is_err());
         assert!(
             store
@@ -603,7 +625,7 @@ mod tests {
     #[test]
     fn sessions_expire() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert!(store.status(&sid, ATTACH_TTL_SECS).is_err(), "expired");
         assert!(store.begin(&sid, 42, ATTACH_TTL_SECS).is_err());
         assert!(store.complete(&sid, ATTACH_TTL_SECS).is_err());
@@ -618,7 +640,7 @@ mod tests {
     #[test]
     fn cancel_marks_the_session_and_blocks_completion() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         store.cancel(&sid, "user_cancelled", 1);
         assert_eq!(
             store.status(&sid, 2).expect("status"),
@@ -633,21 +655,33 @@ mod tests {
     #[test]
     fn cancel_does_not_override_done() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         store.complete(&sid, 1).expect("complete");
         store.cancel(&sid, "user_cancelled", 2);
         assert_eq!(store.status(&sid, 3).expect("status"), AttachStatus::Done);
     }
 
     #[test]
-    fn create_is_idempotent_per_topic_while_pending() {
+    fn create_is_idempotent_per_topic_and_browser_while_pending() {
         let store = AttachStore::default();
-        let a = store.create(42, 0).expect("first");
-        let b = store.create(42, 1).expect("refresh");
+        let a = store.create(42, &browser(), 0).expect("first");
+        let b = store.create(42, &browser(), 1).expect("refresh");
         assert_eq!(a, b, "a page refresh reuses the pending session");
 
-        let c = store.create(43, 2).expect("other topic");
+        let c = store.create(43, &browser(), 2).expect("other topic");
         assert_ne!(a, c);
+
+        let another = BrowserSecret::parse(&"b".repeat(64)).expect("shape").key();
+        let d = store.create(42, &another, 3).expect("another browser");
+        assert_ne!(
+            a, d,
+            "the topic id is public: it fetches no one else's session"
+        );
+        assert_eq!(
+            store.create(42, &browser(), 4).expect("back"),
+            a,
+            "and another browser's visit takes nothing from the first"
+        );
     }
 
     #[test]
@@ -658,9 +692,9 @@ mod tests {
         // to hand back a session with a full life, not the seconds left on the
         // one it reuses.
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("first");
+        let sid = store.create(42, &browser(), 0).expect("first");
         let late = ATTACH_TTL_SECS - 1;
-        assert_eq!(store.create(42, late).expect("refresh"), sid);
+        assert_eq!(store.create(42, &browser(), late).expect("refresh"), sid);
         assert!(
             store.begin(&sid, 42, late + ATTACH_TTL_SECS - 1).is_ok(),
             "the reused session lives a full TTL from the refresh"
@@ -670,9 +704,9 @@ mod tests {
     #[test]
     fn a_new_attach_after_completion_is_a_fresh_session() {
         let store = AttachStore::default();
-        let a = store.create(42, 0).expect("first");
+        let a = store.create(42, &browser(), 0).expect("first");
         store.complete(&a, 1).expect("complete");
-        let b = store.create(42, 2).expect("second");
+        let b = store.create(42, &browser(), 2).expect("second");
         assert_ne!(a, b, "a finished session is not reused");
     }
 
@@ -686,13 +720,13 @@ mod tests {
         // One session strictly older than the rest, so "the oldest" has a
         // single answer and the assertion cannot pass by luck. Every
         // timestamp stays well inside the TTL, so nothing here expires.
-        let oldest = store.create(1, 0).expect("oldest");
+        let oldest = store.create(1, &browser(), 0).expect("oldest");
         for topic in 2..=MAX_SESSIONS as u64 {
-            store.create(topic, 1).expect("fill");
+            store.create(topic, &browser(), 1).expect("fill");
         }
 
         let newcomer = store
-            .create(u64::MAX, 2)
+            .create(u64::MAX, &browser(), 2)
             .expect("a real user must still be able to start an attach");
 
         assert!(
@@ -716,10 +750,12 @@ mod tests {
             .expect("report delivered");
         // The holder is the OLDEST session, so only the log filter can save it.
         for topic in 1..MAX_SESSIONS as u64 {
-            store.create(topic, 1).expect("fill");
+            store.create(topic, &browser(), 1).expect("fill");
         }
 
-        store.create(u64::MAX, 2).expect("still accepted");
+        store
+            .create(u64::MAX, &browser(), 2)
+            .expect("still accepted");
 
         assert_eq!(
             store
@@ -831,7 +867,7 @@ mod tests {
     #[test]
     fn topic_begin_refuses_topic_zero() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert!(store.begin(&sid, 0, 1).is_err());
         assert_eq!(
             store.begin(&sid, 42, 1).expect("begin"),
@@ -868,7 +904,7 @@ mod tests {
     #[test]
     fn a_claim_on_a_topic_session_is_an_error() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert!(matches!(
             store.claim_bind(&sid, 1).expect_err("topic-bound"),
             AuthError::Session
@@ -878,7 +914,7 @@ mod tests {
     #[test]
     fn store_received_is_pre_only() {
         let store = AttachStore::default();
-        let sid = store.create(42, 0).expect("create");
+        let sid = store.create(42, &browser(), 0).expect("create");
         assert!(
             store
                 .store_received(&sid, "u", "log".into(), None, None, 1)
@@ -889,7 +925,7 @@ mod tests {
     #[test]
     fn both_kinds_of_session_live_half_an_hour() {
         let store = AttachStore::default();
-        let topic = store.create(42, 0).expect("create");
+        let topic = store.create(42, &browser(), 0).expect("create");
         let pre = store.create_pre(0).expect("create_pre");
         for sid in [&topic, &pre] {
             assert_eq!(
@@ -903,7 +939,7 @@ mod tests {
     #[test]
     fn topic_of_names_the_bound_topic_and_none_for_a_pre_topic_session() {
         let store = AttachStore::default();
-        let bound = store.create(42, 1).expect("create");
+        let bound = store.create(42, &browser(), 1).expect("create");
         assert_eq!(store.topic_of(&bound, 2).expect("topic"), Some(42));
         let pre = store.create_pre(1).expect("create pre");
         assert_eq!(store.topic_of(&pre, 2).expect("topic"), None);

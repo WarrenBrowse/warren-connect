@@ -42,11 +42,12 @@ const CODE_ATTEMPTS: u8 = 5;
 /// Digits in a completion code: short enough to type from a phone screen.
 const CODE_DIGITS: usize = 6;
 
-/// Bytes of entropy in the login cookie.
+/// Bytes of entropy in a binding cookie.
 const BROWSER_SECRET_BYTES: usize = 32;
 
-/// The login cookie value: 32 bytes of OS entropy as 64 lowercase hex chars.
-/// Lives in the browser only (an `HttpOnly` cookie); the store keeps its hash.
+/// A binding cookie value (the login cookie, the attach cookie): 32 bytes of
+/// OS entropy as 64 lowercase hex chars. Lives in the browser only (an
+/// `HttpOnly` cookie); the store keeps its hash.
 pub struct BrowserSecret(Zeroizing<String>);
 
 impl BrowserSecret {
@@ -88,12 +89,12 @@ impl std::fmt::Debug for BrowserSecret {
     }
 }
 
-/// SHA-256 of a browser's login cookie: what a session is bound to.
+/// SHA-256 of a browser's binding cookie: what a session is bound to.
 #[derive(Clone, Copy)]
 pub struct BrowserKey([u8; 32]);
 
 impl BrowserKey {
-    fn matches(&self, other: &BrowserKey) -> bool {
+    pub(crate) fn matches(&self, other: &BrowserKey) -> bool {
         bool::from(self.0.ct_eq(&other.0))
     }
 }

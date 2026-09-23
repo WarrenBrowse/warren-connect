@@ -24,7 +24,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 | `GET /v1/session/:sid/complete` | Redirect back into Discourse with the signed payload (cookie required, after the confirm) |
 | `POST /v1/session/:sid/cancel` | App-initiated decline of a sign-in still waiting for its approval |
 | `GET /handoff` | Page the app opens in its own browser after a same-device approval; the sid and the code ride in the URL fragment |
-| `GET /attach?topic=<id>` | Attach-logs page for an existing bug topic: deep link + polling |
+| `GET /attach?topic=<id>` | Attach-logs page for an existing bug topic: deep link + polling. Sets the `__Host-warren_attach` cookie that binds the session to this browser: a second visit from it gets the same session back, any other browser a session of its own |
 | `GET /attach?sid=<sid>` | Attach-logs page for a pre-topic session minted by `/v1/attach/new` |
 | `POST /v1/forum/attach-logs` | Wallet-signed gzipped problem report from the Warren app |
 | `POST /v1/forum/notifications` | Wallet-signed read of the caller's own forum notifications, for the app's activity panel |
@@ -137,14 +137,17 @@ the page deep-links `warren://attach-logs?sid=...&topic=...&host=...` into the
 Warren app, the app sends the wallet-signed gzipped redacted report, and this
 service verifies the signer is the topic author, uploads the log,
 private-messages the staff group with the attachment, and leaves a staff-only
-whisper on the public topic. The log never appears publicly.
+whisper on the public topic. The log never appears publicly. The status read
+and the cancel take the sid alone, because the app that calls them holds no
+cookie, so the page hands a session only to the browser that opened it (the
+`__Host-warren_attach` cookie) and never to whoever else names the same topic.
 
 Pre-topic mode: the forum theme calls `POST /v1/attach/new` while the user is
 still composing the report, opens `/attach?sid=<sid>` (deep link carries
 `topic=0`), and polls `/v1/attach/:sid/meta` to prefill the form from the
 report's `warren-product-version` / `os` metadata lines. The app's signed
 upload with `topic_id` 0 is parked in the session (state `received`, at most
-100 sessions hold log bytes; the oldest holder is evicted at capacity). Right
+16 sessions hold log bytes; the oldest holder is evicted at capacity). Right
 after topic creation the theme calls `POST /v1/attach/:sid/bind` with the new
 `topic_id`: same author check, then the same three Discourse writes. The
 session API (`new`, `meta`, `bind`, `status`, `cancel`) answers CORS for the

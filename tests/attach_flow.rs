@@ -17,8 +17,8 @@ use warren_connect::attach::AttachStore;
 use warren_connect::forum_api::ForumApi;
 use warren_connect::handle;
 use warren_connect::nonces::NonceStore;
-use warren_connect::routes::{AppState, router};
-use warren_connect::sessions::SessionStore;
+use warren_connect::routes::{ATTACH_COOKIE, AppState, router};
+use warren_connect::sessions::{BrowserKey, BrowserSecret, SessionStore};
 use warren_connect::store::{IdentityStore, MemoryIdentity};
 
 mod forum_vector;
@@ -218,6 +218,11 @@ fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
     })
 }
 
+/// The browser a session minted straight in the store belongs to.
+fn a_browser() -> BrowserKey {
+    BrowserSecret::generate().key()
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -312,6 +317,172 @@ async fn attach_page_renders_deep_link_and_poll() {
     assert_eq!(
         body_json(response).await,
         serde_json::json!({"status": "pending"})
+    );
+}
+
+/// One browser opening the topic attach page.
+struct AttachVisit {
+    html: String,
+    sid: String,
+    /// The whole `Set-Cookie` line for the attach cookie, when one was set.
+    set_cookie: Option<String>,
+}
+
+impl AttachVisit {
+    /// The attach cookie's value, as the browser keeps it.
+    fn cookie(&self) -> Option<String> {
+        self.set_cookie
+            .as_deref()
+            .and_then(|line| line.strip_prefix(&format!("{ATTACH_COOKIE}=")))
+            .and_then(|rest| rest.split(';').next())
+            .map(str::to_owned)
+    }
+}
+
+/// A browser opening `/attach?topic=<topic>`, presenting `cookie` as its
+/// attach cookie when it holds one.
+async fn visit_attach_page(state: Arc<AppState>, topic: u64, cookie: Option<&str>) -> AttachVisit {
+    let mut request = Request::get(format!("/attach?topic={topic}"));
+    if let Some(cookie) = cookie {
+        request = request.header("Cookie", format!("{ATTACH_COOKIE}={cookie}"));
+    }
+    let response = router(state)
+        .oneshot(request.body(Body::empty()).expect("request"))
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookie = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with(&format!("{ATTACH_COOKIE}=")))
+        .map(str::to_owned);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    let sid_start = html.find("warren://attach-logs?sid=").expect("link") + 25;
+    let sid = html[sid_start..sid_start + 32].to_owned();
+    AttachVisit {
+        html,
+        sid,
+        set_cookie,
+    }
+}
+
+#[tokio::test]
+async fn another_browser_opening_the_same_topic_gets_nothing_of_the_authors_session() {
+    // A topic id is public, so anybody can open this page for any topic.
+    // Handing them the session the author's page waits on let them poll it
+    // and cancel it under the author's feet.
+    let v = forum_vector::load();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, _stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let author = visit_attach_page(state.clone(), 42, None).await;
+
+    let stranger = visit_attach_page(state.clone(), 42, None).await;
+    let other_browser = visit_attach_page(state.clone(), 42, Some(&"b".repeat(64))).await;
+    for (who, visit) in [
+        ("a visitor without a cookie", &stranger),
+        ("another browser", &other_browser),
+    ] {
+        assert_ne!(visit.sid, author.sid, "{who} gets a session of its own");
+        assert!(
+            !visit.html.contains(&author.sid),
+            "{who} reads nothing of the author's session"
+        );
+    }
+    let response = router(state.clone())
+        .oneshot(
+            Request::post(format!("/v1/attach/{}/cancel", stranger.sid))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_answer(
+        &read_status(state.clone(), &author.sid).await,
+        &v.responses.attach_status.get("pending"),
+        "the stranger's cancel leaves the author's session waiting",
+    );
+    let cookie = author
+        .cookie()
+        .expect("the page binds the author's browser");
+    let again = visit_attach_page(state.clone(), 42, Some(&cookie)).await;
+    assert_eq!(
+        again.sid, author.sid,
+        "a refresh in the author's browser keeps its session"
+    );
+    assert_answer(
+        &upload(state.clone(), &key, &author.sid, 42, REPORT, [1; 16]).await,
+        &v.responses.attach.get("attached"),
+        "the author's app completes the author's session",
+    );
+    assert_answer(
+        &read_status(state, &author.sid).await,
+        &v.responses.attach_status.get("done"),
+        "and the author's page sees it done",
+    );
+}
+
+#[tokio::test]
+async fn the_topic_attach_page_binds_its_browser_with_a_host_only_cookie() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+
+    let first = visit_attach_page(state.clone(), 42, None).await;
+
+    let value = first.cookie().expect("an attach cookie");
+    assert_eq!(value.len(), 64);
+    assert!(
+        value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    assert_eq!(
+        first.set_cookie.as_deref(),
+        Some(
+            format!(
+                "{ATTACH_COOKIE}={value}; Max-Age=1800; Path=/; Secure; HttpOnly; SameSite=Lax"
+            )
+            .as_str()
+        ),
+        "HttpOnly and host-only, and alive exactly as long as a session"
+    );
+    let other_topic = visit_attach_page(state.clone(), 43, Some(&value)).await;
+    assert_eq!(
+        other_topic.cookie(),
+        Some(value),
+        "a browser keeps its secret across the topics it opens"
+    );
+    let forged = visit_attach_page(state, 42, Some("forged")).await;
+    assert_ne!(
+        forged.sid, first.sid,
+        "a cookie of any other shape binds nothing"
+    );
+    assert!(
+        forged.cookie().is_some_and(|fresh| fresh.len() == 64),
+        "and is replaced by a secret of our own"
     );
 }
 
@@ -583,7 +754,10 @@ async fn attach_logs_happy_path_uploads_pms_and_whispers() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -646,7 +820,10 @@ async fn a_non_author_is_rejected_with_not_author() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -716,7 +893,10 @@ async fn a_topic_mismatch_is_not_found() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -741,7 +921,10 @@ async fn an_oversized_b64_field_is_413() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = format!(
         r#"{{"sid":"{sid}","topic_id":42,"log_gz_b64":"{}"}}"#,
@@ -791,7 +974,10 @@ async fn a_malformed_payload_is_400_and_never_reaches_discourse() {
         ([21u8; 16], bad_gzip),
         ([22u8; 16], non_utf8),
     ] {
-        let sid = state.attach.create(42, now_unix()).expect("create");
+        let sid = state
+            .attach
+            .create(42, &a_browser(), now_unix())
+            .expect("create");
         let body = format!(r#"{{"sid":"{sid}","topic_id":42,"log_gz_b64":"{log_gz_b64}"}}"#);
         let response = router(state.clone())
             .oneshot(signed_attach_request(&key, &body, nonce))
@@ -834,7 +1020,10 @@ async fn cancel_marks_the_session_cancelled() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let response = router(state.clone())
         .oneshot(
@@ -1290,7 +1479,10 @@ async fn a_topic_session_refuses_topic_zero() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -1442,7 +1634,10 @@ async fn a_discourse_write_failure_leaves_the_session_retryable() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -1481,7 +1676,10 @@ async fn attach_with_metadata_posts_a_public_note_after_the_whisper() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -1525,7 +1723,10 @@ async fn attach_without_metadata_posts_no_public_note() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     let body = serde_json::json!({
         "sid": sid,
@@ -1566,7 +1767,10 @@ async fn tagging_preserves_the_tags_the_topic_already_carries() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     let body = serde_json::json!({
         "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
     })
@@ -1604,7 +1808,10 @@ async fn a_forum_that_still_sends_bare_tag_names_attaches_too() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     let body = serde_json::json!({
         "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
     })
@@ -1634,7 +1841,10 @@ async fn a_second_log_version_does_not_rewrite_the_tags() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     let body = serde_json::json!({
         "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
     })
@@ -1671,7 +1881,10 @@ async fn the_reporter_gets_a_private_receipt_naming_their_topic() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     let body = serde_json::json!({
         "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
     })
@@ -1711,7 +1924,10 @@ async fn the_staff_pm_subject_carries_the_topic_title_unescaped() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     let body = serde_json::json!({
         "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
     })
@@ -1750,7 +1966,10 @@ async fn a_report_far_larger_than_the_old_ceiling_is_accepted() {
         "system".into(),
         "staff".into(),
     )));
-    let sid = state.attach.create(42, now_unix()).expect("create");
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
 
     // ~12 MiB of realistic, repetitive log text: past the old 2 MiB body
     // ceiling once base64'd, and past the old 8 MiB decompressed cap.
@@ -1959,7 +2178,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
     )));
 
     // A topic-bound session: pending, its meta names the topic, then attached.
-    let bound = state.attach.create(4242, now_unix()).expect("create");
+    let bound = state
+        .attach
+        .create(4242, &a_browser(), now_unix())
+        .expect("create");
     assert_answer(
         &read_status(state.clone(), &bound).await,
         &v.responses.attach_status.get("pending"),
@@ -2006,7 +2228,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
     );
 
     // A cancelled session, and a session nobody minted.
-    let cancelled = state.attach.create(7, now_unix()).expect("create");
+    let cancelled = state
+        .attach
+        .create(7, &a_browser(), now_unix())
+        .expect("create");
     let response = router(state.clone())
         .oneshot(
             Request::post(format!("/v1/attach/{cancelled}/cancel"))
@@ -2047,7 +2272,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
     );
 
     // A signature stamped an hour ago, on a live session.
-    let skewed = state.attach.create(8, now_unix()).expect("create");
+    let skewed = state
+        .attach
+        .create(8, &a_browser(), now_unix())
+        .expect("create");
     let body = format!(
         r#"{{"sid":"{skewed}","topic_id":8,"log_gz_b64":"{}"}}"#,
         gz_b64(&log)
@@ -2079,7 +2307,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
     );
 
     // A base64 field past the cap.
-    let big = state.attach.create(9, now_unix()).expect("create");
+    let big = state
+        .attach
+        .create(9, &a_browser(), now_unix())
+        .expect("create");
     let body = format!(
         r#"{{"sid":"{big}","topic_id":9,"log_gz_b64":"{}"}}"#,
         "A".repeat(warren_connect::attach::MAX_LOG_GZ_B64_CHARS + 1)
@@ -2102,7 +2333,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         "system".into(),
         "staff".into(),
     )));
-    let theirs = other.attach.create(42, now_unix()).expect("create");
+    let theirs = other
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     assert_answer(
         &upload(other, &key, &theirs, 42, &log, [6; 16]).await,
         &v.responses.attach.get("not_author"),
@@ -2115,7 +2349,10 @@ async fn every_pinned_attach_answer_is_what_this_router_sends() {
         "system".into(),
         "staff".into(),
     )));
-    let mine = down.attach.create(42, now_unix()).expect("create");
+    let mine = down
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
     assert_answer(
         &upload(down, &key, &mine, 42, &log, [7; 16]).await,
         &v.responses.attach.get("forum_unavailable"),
