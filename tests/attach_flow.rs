@@ -19,7 +19,7 @@ use warren_connect::handle;
 use warren_connect::nonces::NonceStore;
 use warren_connect::routes::{ATTACH_COOKIE, AppState, router};
 use warren_connect::sessions::{BrowserKey, BrowserSecret, SessionStore};
-use warren_connect::store::{IdentityStore, MemoryIdentity};
+use warren_connect::store::IdentityStore;
 
 mod forum_vector;
 use forum_vector::{assert_answer, assert_signed_by_the_contract, observe, verify_at_vector_clock};
@@ -230,7 +230,7 @@ fn unreachable_pool() -> sqlx::PgPool {
 }
 
 fn test_state(forum_api: Option<ForumApi>) -> Arc<AppState> {
-    test_state_with_identity(forum_api, IdentityStore::Memory(MemoryIdentity::default()))
+    test_state_with_identity(forum_api, IdentityStore::Memory(Box::default()))
 }
 
 fn test_state_with_identity(forum_api: Option<ForumApi>, identity: IdentityStore) -> Arc<AppState> {
@@ -2754,7 +2754,7 @@ async fn uploads_the_route_refuses_spend_no_nonce() {
             "system".into(),
             "staff".into(),
         )),
-        IdentityStore::Memory(MemoryIdentity::default()),
+        IdentityStore::Memory(Box::default()),
         NonceStore::with_max_entries(4),
     );
     link(&state, &key).await;

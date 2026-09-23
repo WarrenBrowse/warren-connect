@@ -146,12 +146,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let forum_pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(store::FORUM_POOL_CONNECTIONS)
         .connect(&required("FORUM_DATABASE_URL")?)
         .await
         .context("connect forum_auth database")?;
     let warren_pool = PgPoolOptions::new()
-        .max_connections(3)
+        .max_connections(store::WARREN_POOL_CONNECTIONS)
         .connect(&required("WARREN_DATABASE_URL_RO")?)
         .await
         .context("connect warren database (read-only)")?;

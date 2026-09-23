@@ -13,8 +13,19 @@
 //! reverse handle -> pubkey lookup is intentionally no longer possible: a DB
 //! seizure yields keyed hashes and public handles, not wallets.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
 use sqlx::PgPool;
 use sqlx::Row as _;
+
+/// Connections of the Warren API database pool (read-only role), which the
+/// subscription standing is read through.
+pub const WARREN_POOL_CONNECTIONS: u32 = 3;
+
+/// Connections of the `forum_auth` pool, which holds the forum links.
+pub const FORUM_POOL_CONNECTIONS: u32 = 5;
 
 /// A coarse, value-free category for an sqlx error, safe to log under the
 /// no-log policy.
@@ -578,12 +589,12 @@ pub enum IdentityStore {
         discourse: Option<PgPool>,
     },
     /// Test double: in-memory maps with the same semantics.
-    Memory(MemoryIdentity),
+    Memory(Box<MemoryIdentity>),
 }
 
 /// In-memory identity state for tests: subscriptions keyed by SS58 address,
 /// links keyed by `external_id` holding the username and the slot, if drawn.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryIdentity {
     /// Subscription standing per wallet address.
     pub subscriptions: std::sync::Mutex<std::collections::HashMap<String, SubscriptionStatus>>,
@@ -592,6 +603,90 @@ pub struct MemoryIdentity {
     /// Forum staff by username. `None` stands for a Discourse database that
     /// is not wired, which is also the default.
     pub forum_staff: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>>,
+    /// The Warren API database the subscription standing is read from.
+    pub warren_db: MemoryDatabase,
+    /// The `forum_auth` database the links are read from and written to.
+    pub forum_db: MemoryDatabase,
+}
+
+impl Default for MemoryIdentity {
+    fn default() -> Self {
+        Self {
+            subscriptions: std::sync::Mutex::default(),
+            links: std::sync::Mutex::default(),
+            forum_staff: std::sync::Mutex::default(),
+            warren_db: MemoryDatabase::new(WARREN_POOL_CONNECTIONS as usize),
+            forum_db: MemoryDatabase::new(FORUM_POOL_CONNECTIONS as usize),
+        }
+    }
+}
+
+/// How long a query waits for a free connection before it fails, as sqlx's
+/// default acquire timeout, which the deployed pools keep.
+const MEMORY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stands in for one Postgres pool behind [`MemoryIdentity`]: the deployed
+/// number of connections, a query time and an outage switch. A query waits
+/// for a free connection and fails with `PoolTimedOut` when none frees in
+/// time, as sqlx does, so the stub harness can saturate a pool or take its
+/// database down and watch what each route makes of it.
+#[derive(Debug)]
+pub struct MemoryDatabase {
+    connections: tokio::sync::Semaphore,
+    query_time: Mutex<Duration>,
+    down: AtomicBool,
+    queries: AtomicUsize,
+}
+
+impl MemoryDatabase {
+    /// A database reached through a pool of `connections`, answering at once.
+    #[must_use]
+    pub fn new(connections: usize) -> Self {
+        Self {
+            connections: tokio::sync::Semaphore::new(connections),
+            query_time: Mutex::new(Duration::ZERO),
+            down: AtomicBool::new(false),
+            queries: AtomicUsize::new(0),
+        }
+    }
+
+    /// How long each query holds its connection from now on.
+    pub fn set_query_time(&self, query_time: Duration) {
+        *self
+            .query_time
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = query_time;
+    }
+
+    /// Takes the database down (every query fails) or brings it back.
+    pub fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    /// Queries that reached this database, answered or failed.
+    #[must_use]
+    pub fn queries(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+
+    async fn query<T>(&self, answer: impl FnOnce() -> T) -> Result<T, sqlx::Error> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        if self.down.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        let _connection = tokio::time::timeout(MEMORY_ACQUIRE_TIMEOUT, self.connections.acquire())
+            .await
+            .map_err(|_| sqlx::Error::PoolTimedOut)?
+            .map_err(|_| sqlx::Error::PoolClosed)?;
+        let query_time = *self
+            .query_time
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !query_time.is_zero() {
+            tokio::time::sleep(query_time).await;
+        }
+        Ok(answer())
+    }
 }
 
 impl IdentityStore {
@@ -607,13 +702,18 @@ impl IdentityStore {
             IdentityStore::Postgres { warren, .. } => {
                 subscription_status(warren, pubkey_ss58).await
             }
-            IdentityStore::Memory(m) => Ok(m
-                .subscriptions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(pubkey_ss58)
-                .copied()
-                .unwrap_or_default()),
+            IdentityStore::Memory(m) => {
+                m.warren_db
+                    .query(|| {
+                        m.subscriptions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(pubkey_ss58)
+                            .copied()
+                            .unwrap_or_default()
+                    })
+                    .await
+            }
         }
     }
 
@@ -627,12 +727,15 @@ impl IdentityStore {
                 upsert_link(forum, external_id, username).await
             }
             IdentityStore::Memory(m) => {
-                m.links
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(external_id.to_owned())
-                    .or_insert_with(|| (username.to_owned(), None));
-                Ok(())
+                m.forum_db
+                    .query(|| {
+                        m.links
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .entry(external_id.to_owned())
+                            .or_insert_with(|| (username.to_owned(), None));
+                    })
+                    .await
             }
         }
     }
@@ -673,11 +776,16 @@ impl IdentityStore {
                     .await?
                     .is_some())
             }
-            IdentityStore::Memory(m) => Ok(m
-                .links
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(external_id)),
+            IdentityStore::Memory(m) => {
+                m.forum_db
+                    .query(|| {
+                        m.links
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(external_id)
+                    })
+                    .await
+            }
         }
     }
 
@@ -689,14 +797,18 @@ impl IdentityStore {
         match self {
             IdentityStore::Postgres { forum, .. } => assign_notify_slot(forum, external_id).await,
             IdentityStore::Memory(m) => {
-                let mut links = m
-                    .links
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let next = i32::try_from(links.len()).unwrap_or(i32::MAX);
-                Ok(links
-                    .get_mut(external_id)
-                    .map(|(_, slot)| *slot.get_or_insert(next)))
+                m.forum_db
+                    .query(|| {
+                        let mut links = m
+                            .links
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let next = i32::try_from(links.len()).unwrap_or(i32::MAX);
+                        links
+                            .get_mut(external_id)
+                            .map(|(_, slot)| *slot.get_or_insert(next))
+                    })
+                    .await
             }
         }
     }

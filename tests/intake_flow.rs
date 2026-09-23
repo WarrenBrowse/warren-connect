@@ -20,7 +20,7 @@ use warren_connect::intake::RateLimiter;
 use warren_connect::nonces::NonceStore;
 use warren_connect::routes::{AppState, IntakeState, router};
 use warren_connect::sessions::SessionStore;
-use warren_connect::store::{IdentityStore, MemoryIdentity};
+use warren_connect::store::IdentityStore;
 use warren_connect::ticket::TicketKey;
 
 /// The handle secret every test state is built with; the ticket key derives
@@ -139,7 +139,7 @@ fn test_state(intake: Option<IntakeState>) -> Arc<AppState> {
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
-        identity: IdentityStore::Memory(MemoryIdentity::default()),
+        identity: IdentityStore::Memory(Box::default()),
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),

@@ -57,6 +57,9 @@ struct Setup<'a> {
     /// Wire both Discourse roles, to a database that never answers, so the
     /// notification routes run as far as their first Discourse read.
     discourse_wired: bool,
+    /// Build the Postgres form of the identity store over databases that
+    /// never answer, instead of the in-memory one.
+    unreachable_identity: bool,
 }
 
 impl Default for Setup<'_> {
@@ -70,6 +73,7 @@ impl Default for Setup<'_> {
             public_host: "connect.test",
             nonce_cap: None,
             discourse_wired: false,
+            unreachable_identity: false,
         }
     }
 }
@@ -104,7 +108,15 @@ fn build_state(setup: Setup<'_>) -> Arc<AppState> {
         admins: Allowlist::parse(setup.admins).expect("allowlist"),
         forum_pool: lazy.clone(),
         warren_pool: lazy.clone(),
-        identity: IdentityStore::Memory(memory),
+        identity: if setup.unreachable_identity {
+            IdentityStore::Postgres {
+                forum: lazy.clone(),
+                warren: lazy.clone(),
+                discourse: Some(lazy.clone()),
+            }
+        } else {
+            IdentityStore::Memory(Box::new(memory))
+        },
         discourse_pool: setup.discourse_wired.then(|| lazy.clone()),
         seen_pool: setup.discourse_wired.then_some(lazy),
         digest_generation: Default::default(),
@@ -2371,4 +2383,136 @@ async fn a_replayed_notification_call_is_refused() {
         assert_eq!(replay.status, 401, "{path}: {}", replay.body_utf8);
         assert_eq!(replay.body_utf8, "nonce rejected", "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A gate read that fails answers nothing about the wallet. It is a retryable
+// 502 that leaves the login waiting for its approval, never a "never paid"
+// that cancels it: a lookup error is what a flood of free wallets can cause
+// at will.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_warren_database_outage_answers_a_retryable_error_and_leaves_the_login_pending() {
+    let state = paid_state();
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    let page = open_sso(&app, "n-warren-down", None).await;
+    let flooder = open_sso(&app, "n-warren-down-free", None).await;
+    memory(&state).warren_db.set_down(true);
+
+    let free = send(
+        &app,
+        signed_bound_login(&free_key(0x71), &flooder.sid(), [0xa0; 16]),
+    )
+    .await;
+    let paid = send(&app, signed_bound_login(&key, &page.sid(), [0xa1; 16])).await;
+
+    for (who, answer, opened) in [("free", &free, &flooder), ("paid", &paid, &page)] {
+        assert_eq!(answer.status, 502, "{who}: {}", answer.body_utf8);
+        assert_eq!(answer.body_utf8, "forum backend error", "{who}");
+        let status = send(&app, status_request(&opened.sid(), Some(&opened.cookie()))).await;
+        assert_eq!(
+            status.body_utf8, r#"{"status":"pending"}"#,
+            "{who}: an unread standing ends no login"
+        );
+    }
+    memory(&state).warren_db.set_down(false);
+    let retry = send(&app, signed_bound_login(&key, &page.sid(), [0xa2; 16])).await;
+    assert_eq!(retry.status, 200, "{}", retry.body_utf8);
+}
+
+#[tokio::test]
+async fn a_forum_link_that_cannot_be_written_answers_a_retryable_error_and_leaves_the_login_pending()
+ {
+    let state = paid_state();
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    let page = open_sso(&app, "n-forum-down", None).await;
+    memory(&state).forum_db.set_down(true);
+
+    let during = send(&app, signed_bound_login(&key, &page.sid(), [0xa3; 16])).await;
+
+    assert_eq!(during.status, 502, "{}", during.body_utf8);
+    let status = send(&app, status_request(&page.sid(), Some(&page.cookie()))).await;
+    assert_eq!(status.body_utf8, r#"{"status":"pending"}"#);
+    memory(&state).forum_db.set_down(false);
+    let retry = send(&app, signed_bound_login(&key, &page.sid(), [0xa4; 16])).await;
+    assert_eq!(retry.status, 200, "{}", retry.body_utf8);
+}
+
+#[tokio::test]
+async fn a_legacy_approval_whose_forum_link_cannot_be_read_answers_a_retryable_error() {
+    // The staff read finds no account under the handle and falls back to the
+    // forum link, which is unreadable: nothing is known about the wallet, so
+    // the approval is neither refused as staff nor let through.
+    let state = paid_state_with(LegacyApproval::Allow, Some(&[]), "");
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    let browser = open_sso(&app, "n-legacy-down", None).await;
+    memory(&state).forum_db.set_down(true);
+
+    let answer = send(
+        &app,
+        signed_login_request(&key, &browser.sid(), unix_now(), [0xa5; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.status, 502, "{}", answer.body_utf8);
+    let status = send(
+        &app,
+        status_request(&browser.sid(), Some(&browser.cookie())),
+    )
+    .await;
+    assert_eq!(status.body_utf8, r#"{"status":"pending"}"#);
+}
+
+#[tokio::test]
+async fn a_legacy_approval_whose_staff_query_fails_answers_a_retryable_error() {
+    // A deployment with no Discourse database refuses every legacy approval
+    // for good (`a_legacy_approval_from_a_staff_wallet_is_refused_...`). A
+    // wired one whose query fails this time knows nothing about the wallet.
+    let state = build_state(Setup {
+        legacy: LegacyApproval::Allow,
+        unreachable_identity: true,
+        ..Setup::default()
+    });
+    let app = router(state);
+    let (key, _) = paid_signer();
+    let browser = open_sso(&app, "n-legacy-query", None).await;
+
+    let answer = send(
+        &app,
+        signed_login_request(&key, &browser.sid(), unix_now(), [0xa8; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.status, 502, "{}", answer.body_utf8);
+    let status = send(
+        &app,
+        status_request(&browser.sid(), Some(&browser.cookie())),
+    )
+    .await;
+    assert_eq!(status.body_utf8, r#"{"status":"pending"}"#);
+}
+
+#[tokio::test]
+async fn the_notification_routes_answer_a_retryable_error_when_the_forum_links_cannot_be_read() {
+    let state = build_state(Setup {
+        discourse_wired: true,
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    memory(&state).forum_db.set_down(true);
+
+    for (path, nonce) in [
+        ("/v1/forum/notifications", [0xa6; 16]),
+        ("/v1/forum/notifications/seen", [0xa7; 16]),
+    ] {
+        let answer = send(&app, signed_post(&key, path, "{}", unix_now(), nonce)).await;
+
+        assert_eq!(answer.status, 502, "{path}: {}", answer.body_utf8);
+    }
+    assert_eq!(state.nonces.held(), 0);
 }

@@ -24,6 +24,7 @@ use crate::sessions::{
     Approach, BrowserKey, BrowserSecret, CancelReason, CompletionCode, ConfirmOutcome, Consumed,
     SESSION_TTL_SECS, SessionStatus, SessionStore,
 };
+use crate::store::StaffLookupError;
 use crate::ticket::TicketKey;
 use crate::verify::{SignedHeaders, VerifiedRequest, verify_signed_request};
 use crate::{handle, pages, store};
@@ -575,51 +576,71 @@ impl LegacyRefusal {
 }
 
 /// The gate a legacy approval passes before anything is written for it.
+///
+/// # Errors
+/// [`LegacyGate::Refused`] for a deployment or a wallet the legacy form is
+/// closed to, [`LegacyGate::Unread`] when the wallet's staff status could not
+/// be read this time.
 async fn legacy_admission(
     state: &AppState,
     identity: &crate::verify::VerifiedIdentity,
-) -> Result<(), LegacyRefusal> {
+) -> Result<(), LegacyGate> {
     if state.legacy_approval == LegacyApproval::Deny {
-        return Err(LegacyRefusal::Disabled);
+        return Err(LegacyGate::Refused(LegacyRefusal::Disabled));
     }
-    if is_forum_staff(state, identity).await {
-        return Err(LegacyRefusal::Staff);
+    match is_forum_staff(state, identity).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(LegacyGate::Refused(LegacyRefusal::Staff)),
+        Err(err) => {
+            tracing::warn!(
+                kind = sqlx_error_kind(&err),
+                "forum staff status unreadable"
+            );
+            Err(LegacyGate::Unread)
+        }
     }
-    Ok(())
+}
+
+/// What stops a legacy approval.
+enum LegacyGate {
+    /// For good: the session is cancelled and the page asks for an update.
+    Refused(LegacyRefusal),
+    /// The staff status could not be read. Nothing is known about the
+    /// wallet, so the approval is answered with a retryable error and the
+    /// session keeps waiting.
+    Unread,
 }
 
 /// Staff for the legacy gate: on the allowlist, or admin or moderator of the
 /// wallet's forum account. Discourse keeps the grant of an account that is
 /// already staff whatever the login asserts, so the allowlist alone would
-/// miss every operator promoted from the admin UI. A status that cannot be
-/// read counts as staff: the gate fails closed.
-async fn is_forum_staff(state: &AppState, identity: &crate::verify::VerifiedIdentity) -> bool {
+/// miss every operator promoted from the admin UI.
+///
+/// A deployment with no Discourse database counts as staff: nobody's
+/// standing can be read there, and a retry would not change that.
+///
+/// # Errors
+/// The staff query's or the forum link read's error: nothing is known about
+/// the wallet this time, and the caller answers a retryable error.
+async fn is_forum_staff(
+    state: &AppState,
+    identity: &crate::verify::VerifiedIdentity,
+) -> Result<bool, sqlx::Error> {
     if state.admins.is_admin(&identity.pubkey_ss58) {
-        return true;
+        return Ok(true);
     }
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
     match state.identity.forum_staff(&forum.username).await {
-        Ok(Some(staff)) => staff,
+        Ok(Some(staff)) => Ok(staff),
         // No account under the derived handle. A wallet that never signed in
         // has none; one that did has an account under another name (renamed,
         // or suffixed at creation), whose standing this read cannot see.
-        Ok(None) => match state.identity.is_linked(&forum.external_id).await {
-            Ok(linked) => linked,
-            Err(err) => {
-                tracing::warn!(
-                    kind = sqlx_error_kind(&err),
-                    "forum link unreadable: treated as staff"
-                );
-                true
-            }
-        },
-        Err(err) => {
-            tracing::warn!(
-                kind = err.kind(),
-                "forum staff status unreadable: treated as staff"
-            );
-            true
+        Ok(None) => state.identity.is_linked(&forum.external_id).await,
+        Err(StaffLookupError::NotWired) => {
+            tracing::warn!("no Discourse database for the staff status: treated as staff");
+            Ok(true)
         }
+        Err(StaffLookupError::Query(err)) => Err(err),
     }
 }
 
@@ -682,20 +703,24 @@ async fn forum_login(
     if !state.sessions.awaits_approval(&primary_sid, now) {
         return Err(AuthError::Session);
     }
-    if form == LoginForm::Legacy
-        && let Err(refusal) = legacy_admission(&state, identity).await
-    {
-        // The browser page tells the user to update the app; the app itself
-        // predates this answer and shows a generic failure.
-        state
-            .sessions
-            .cancel(&primary_sid, CancelReason::AppUpdateRequired, now);
-        tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
-            refusal = refusal.token(),
-            "forum login refused: legacy approval"
-        );
-        return Err(AuthError::AppUpdateRequired);
+    if form == LoginForm::Legacy {
+        match legacy_admission(&state, identity).await {
+            Ok(()) => {}
+            Err(LegacyGate::Refused(refusal)) => {
+                // The browser page tells the user to update the app; the app
+                // itself predates this answer and shows a generic failure.
+                state
+                    .sessions
+                    .cancel(&primary_sid, CancelReason::AppUpdateRequired, now);
+                tracing::info!(
+                    pubkey = %redact(&identity.pubkey_ss58),
+                    refusal = refusal.token(),
+                    "forum login refused: legacy approval"
+                );
+                return Err(AuthError::AppUpdateRequired);
+            }
+            Err(LegacyGate::Unread) => return Err(AuthError::Forum),
+        }
     }
 
     // The legacy refusal above and the paywall below end the session the
@@ -718,7 +743,9 @@ async fn forum_login(
             );
             return Err(AuthError::Nonce);
         }
-        Err(AdmitError::Store) => return Err(AuthError::Session),
+        // Retryable, and the session keeps waiting for its approval: the
+        // apps show a transient failure and sign again.
+        Err(AdmitError::Unavailable) => return Err(AuthError::Forum),
     };
 
     // Kept before the payload moves `username` into the session: the approving
@@ -780,8 +807,9 @@ enum AdmitError {
     /// Past the paywall, the nonce was not admitted: a replay, or the replay
     /// store refused it.
     Nonce,
-    /// The link could not be recorded (database).
-    Store,
+    /// A database the admission reads or writes failed. It says nothing about
+    /// the wallet, so it ends no session and a retry can succeed.
+    Unavailable,
 }
 
 /// The one admission path of a wallet-signed forum identity, shared by the
@@ -799,19 +827,20 @@ async fn admit_forum_identity(
 
     // Access control: a forum account requires having paid for Warren at least
     // once (a wallet is free to mint, so with no email/no IP, payment is the
-    // only sybil cost) unless the wallet is staff. A subscription-lookup failure
-    // is treated as "never paid" so an outage fails closed rather than opening
-    // the gate (an admin still passes on the allowlist).
+    // only sybil cost) unless the wallet is staff. A lookup that fails admits
+    // nothing and refuses nothing: read as "never paid", a flood that loads
+    // the database would turn every paying user's sign-in into a
+    // subscription refusal.
     let status = state
         .identity
         .subscription_status(&identity.pubkey_ss58)
         .await
-        .unwrap_or_else(|e| {
+        .map_err(|e| {
             // Log the sqlx error KIND only, never `%e` (a Postgres error detail
             // on the identity columns could echo a pubkey; no-log policy).
             tracing::error!(kind = ?sqlx_error_kind(&e), "subscription lookup failed");
-            store::SubscriptionStatus::default()
-        });
+            AdmitError::Unavailable
+        })?;
     if !login_allowed(status.ever_paid, admin) {
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);
@@ -830,7 +859,7 @@ async fn admit_forum_identity(
             // pubkey/handle in the Postgres error detail. Log the kind + a redacted
             // pubkey prefix only.
             tracing::error!(kind = ?sqlx_error_kind(&e), pubkey = %redact(&identity.pubkey_ss58), "link upsert failed");
-            AdmitError::Store
+            AdmitError::Unavailable
         })?;
 
     // Best effort: an admission that cannot get a digest slot is still an
@@ -935,7 +964,7 @@ async fn forum_notifications(
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "notifications: link lookup failed");
-            AuthError::Session
+            AuthError::Forum
         })?;
     if !linked {
         return Ok(Json(serde_json::json!({ "notifications": [] })).into_response());
@@ -1014,7 +1043,7 @@ async fn forum_notifications_seen(
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "seen: link lookup failed");
-            AuthError::Session
+            AuthError::Forum
         })?;
     if !linked {
         // A wallet that never logged in to the forum has no list to mark, and
@@ -1710,7 +1739,7 @@ async fn forum_report(
                 );
                 AuthError::Nonce
             }
-            AdmitError::Store => AuthError::Forum,
+            AdmitError::Unavailable => AuthError::Forum,
         })?;
     // Charged after the signature and the gate: a forged or never-paid
     // request must not burn a member's budget. After the nonce too: the

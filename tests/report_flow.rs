@@ -249,7 +249,7 @@ fn state_with_nonces(
         admins: Default::default(),
         forum_pool: lazy.clone(),
         warren_pool: lazy,
-        identity: IdentityStore::Memory(memory),
+        identity: IdentityStore::Memory(Box::new(memory)),
         discourse_pool: None,
         seen_pool: None,
         digest_generation: Default::default(),
@@ -1415,4 +1415,43 @@ async fn a_report_over_its_budget_spends_its_nonce_so_its_replay_cannot_outwait_
         StatusCode::UNAUTHORIZED,
         "refused as a replay, which lasts, rather than by the budget, which does not"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Gate reads: a standing that cannot be read is a retryable 5xx the app shows
+// as a server error, never the "subscription required" it would tell a paying
+// user to act on.
+// ---------------------------------------------------------------------------
+
+/// The in-memory identity behind a suite state.
+fn memory(state: &AppState) -> &MemoryIdentity {
+    match &state.identity {
+        IdentityStore::Memory(memory) => memory,
+        IdentityStore::Postgres { .. } => unreachable!("the suite never builds the Postgres form"),
+    }
+}
+
+#[tokio::test]
+async fn a_warren_database_outage_is_a_retryable_error_not_a_subscription_refusal() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x21);
+    let state = test_state(Some(&url), Some(&key), 3);
+    memory(&state).warren_db.set_down(true);
+
+    let during = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x21; 16], now_unix()),
+    )
+    .await;
+
+    assert_eq!(during.status(), StatusCode::BAD_GATEWAY);
+    assert!(ops(&stub).is_empty(), "nothing reaches the forum");
+    memory(&state).warren_db.set_down(false);
+    let retry = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x22; 16], now_unix()),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::CREATED);
 }
