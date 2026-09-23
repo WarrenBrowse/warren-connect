@@ -51,6 +51,14 @@ const MAX_OPENS_PER_PAYLOAD: u8 = 3;
 /// store holds logins.
 const MAX_APPROVED_PER_WALLET: usize = 3;
 
+/// Records of displaced logins kept per login the store holds. A flood that
+/// pushed records out before they expire would hand its payloads fresh
+/// counts and could churn the store as fast as it sends. Pushing one out
+/// takes more distinct harvested payloads than the store and its records hold
+/// together, 110,000, and that many payloads at three logins each per TTL
+/// already open over a thousand logins a second.
+const DISPLACED_RECORDS_PER_SESSION: usize = 10;
+
 /// Wrong codes a browser may type before its login is cancelled. The code is
 /// six digits, so the holder of a cookie and a relayed approval wins with
 /// probability 5 in a million per approval they manage to obtain.
@@ -388,9 +396,11 @@ impl Session {
     }
 }
 
-/// What a displaced login leaves behind until it would have expired, so its
-/// payload keeps its owner and its count of logins opened: without it a flood
-/// that displaces a payload's login would hand that payload a fresh count.
+/// What a displaced login leaves behind until it would have expired, or
+/// until [`DISPLACED_RECORDS_PER_SESSION`] times the store's capacity younger
+/// records push it out, so its payload keeps its owner and its count of
+/// logins opened: without it a flood that displaces a payload's login would
+/// hand that payload a fresh count.
 struct Displaced {
     browser: BrowserKey,
     opens: u8,
@@ -406,7 +416,7 @@ pub struct SessionStore {
     by_qr: Mutex<HashMap<String, String>>,
     /// Displaced logins, by nonce.
     displaced: Mutex<HashMap<String, Displaced>>,
-    /// Logins held at once, and records of displaced ones kept at once.
+    /// Logins held at once.
     capacity: usize,
 }
 
@@ -454,7 +464,7 @@ impl SessionStore {
     /// store is full. The owner reopening a cancelled or completed login gets
     /// a fresh session in its place, up to [`MAX_OPENS_PER_PAYLOAD`] logins
     /// while the latest one lives. A login displaced from a full store keeps
-    /// both rules for its payload until it would have expired.
+    /// both rules for its payload through its record (see [`Displaced`]).
     ///
     /// # Errors
     /// [`AuthError::BrowserMismatch`] when the nonce's live or displaced
@@ -576,7 +586,7 @@ impl SessionStore {
             .ok_or(AuthError::Session)?;
         let session = sessions.remove(&victim).expect("the victim was just found");
         by_qr.remove(&session.qr_sid);
-        if displaced.len() >= self.capacity
+        if displaced.len() >= self.capacity * DISPLACED_RECORDS_PER_SESSION
             && let Some(oldest) = displaced
                 .iter()
                 .min_by_key(|(_, d)| d.created_unix)
@@ -1495,7 +1505,9 @@ mod tests {
         store
             .create("p".into(), "r".into(), &owner, 3)
             .expect("third login");
-        flood(&store, "displace-third", 1, 4);
+        // A flood ten times the store's size displaces it and then displaces
+        // the flood's own logins, and the payload's record outlasts it.
+        flood(&store, "displace-third", 10, 4);
 
         assert_eq!(
             store.create("p".into(), "r".into(), &owner, 5).map(|_| ()),
@@ -1513,15 +1525,16 @@ mod tests {
     #[test]
     fn a_flood_keeps_the_store_and_its_displaced_records_bounded() {
         let capacity = 4;
+        let records = capacity * DISPLACED_RECORDS_PER_SESSION;
         let store = SessionStore::with_capacity(capacity);
 
-        flood(&store, "flood", 10 * capacity, 0);
-        flood(&store, "later", 10 * capacity, SESSION_TTL_SECS);
+        flood(&store, "flood", 2 * (capacity + records), 0);
+        flood(&store, "later", 2 * (capacity + records), SESSION_TTL_SECS);
 
         let sessions = store.sessions.lock().expect("sessions").len();
         let by_qr = store.by_qr.lock().expect("qr index").len();
         let displaced = store.displaced.lock().expect("displaced").len();
-        assert_eq!((sessions, by_qr, displaced), (capacity, capacity, capacity));
+        assert_eq!((sessions, by_qr, displaced), (capacity, capacity, records));
     }
 
     #[test]
