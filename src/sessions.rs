@@ -259,6 +259,50 @@ impl ApprovalClaim<'_> {
     pub fn sid(&self) -> &str {
         &self.sid
     }
+
+    /// Records a bound approval: the login waits for its browser to present
+    /// the code returned here. The caller decides what to put in `user` from
+    /// the [`Approach`] the claim came with.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] if the login expired, was displaced, or stopped
+    /// waiting for an approval while this one was admitted: a second
+    /// approval never replaces the first. [`AuthError::RateLimited`] when
+    /// the wallet already holds [`MAX_APPROVED_PER_WALLET`] logins past
+    /// their approval; the login keeps waiting.
+    pub fn approve_bound(
+        &self,
+        _admitted: &Admitted,
+        user: SsoUser,
+        now_unix: u64,
+    ) -> Result<CompletionCode, AuthError> {
+        let code = CompletionCode::generate();
+        self.store.approve(
+            &self.sid,
+            State::AwaitingCode {
+                user,
+                code: code.clone(),
+                attempts_left: CODE_ATTEMPTS,
+            },
+            now_unix,
+        )?;
+        Ok(code)
+    }
+
+    /// Records an approval from an app that predates the code: the login is
+    /// ready at once, still for its own browser only.
+    ///
+    /// # Errors
+    /// As [`Self::approve_bound`].
+    pub fn approve_legacy(
+        &self,
+        _admitted: &Admitted,
+        user: SsoUser,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
+        self.store
+            .approve(&self.sid, State::Approved { user }, now_unix)
+    }
 }
 
 impl Drop for ApprovalClaim<'_> {
@@ -623,29 +667,38 @@ impl SessionStore {
         Ok((primary, Approach::CrossDevice))
     }
 
-    /// Claims the login behind either id for one approval, saying which id
-    /// it arrived on.
+    /// Claims the login behind either id for one approval by `wallet` (its
+    /// forum external id), saying which id it arrived on.
     ///
     /// # Errors
     /// [`AuthError::Session`] if the id matches no live login, or the login
     /// no longer waits for an approval. [`AuthError::Forum`] while another
     /// approval of it is being admitted: retryable, since that one may still
-    /// fail and leave the login waiting.
+    /// fail and leave the login waiting. [`AuthError::RateLimited`] when
+    /// `wallet` already holds [`MAX_APPROVED_PER_WALLET`] logins past their
+    /// approval, refused here so that it buys no read.
     pub fn claim_approval(
         &self,
         sid: &str,
+        wallet: &str,
         now_unix: u64,
     ) -> Result<(ApprovalClaim<'_>, Approach), AuthError> {
         let (primary, approach) = self.resolve(sid, now_unix)?;
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
-        let session = sessions.get_mut(&primary).ok_or(AuthError::Session)?;
+        let session = sessions.get(&primary).ok_or(AuthError::Session)?;
         if !matches!(session.state, State::Pending) {
             return Err(AuthError::Session);
         }
         if session.approving {
             return Err(AuthError::Forum);
         }
-        session.approving = true;
+        if approved_by(&sessions, wallet, now_unix) >= MAX_APPROVED_PER_WALLET {
+            return Err(AuthError::RateLimited);
+        }
+        sessions
+            .get_mut(&primary)
+            .expect("the login was just read")
+            .approving = true;
         // Released before the claim exists: its drop takes this lock.
         drop(sessions);
         let claim = ApprovalClaim {
@@ -686,70 +739,24 @@ impl SessionStore {
         }
     }
 
-    /// Records a bound approval: the session waits for its browser to present
-    /// the code returned here. Accepts either id; the caller decides what to
-    /// put in `user` from the [`Approach`] it got out of [`Self::resolve`].
-    ///
-    /// # Errors
-    /// [`AuthError::Session`] if the session is unknown, expired, or no longer
-    /// waiting for an approval: a second approval never replaces the first.
-    /// [`AuthError::RateLimited`] when the wallet already holds
-    /// [`MAX_APPROVED_PER_WALLET`] logins past their approval; the session
-    /// keeps waiting.
-    pub fn approve_bound(
-        &self,
-        _admitted: &Admitted,
-        sid: &str,
-        user: SsoUser,
-        now_unix: u64,
-    ) -> Result<CompletionCode, AuthError> {
-        let code = CompletionCode::generate();
-        self.approve(
-            sid,
-            State::AwaitingCode {
-                user,
-                code: code.clone(),
-                attempts_left: CODE_ATTEMPTS,
-            },
-            now_unix,
-        )?;
-        Ok(code)
-    }
-
-    /// Records an approval from an app that predates the code: the session
-    /// is ready at once, still for its own browser only.
-    ///
-    /// # Errors
-    /// As [`Self::approve_bound`].
-    pub fn approve_legacy(
-        &self,
-        _admitted: &Admitted,
-        sid: &str,
-        user: SsoUser,
-        now_unix: u64,
-    ) -> Result<(), AuthError> {
-        self.approve(sid, State::Approved { user }, now_unix)
-    }
-
-    fn approve(&self, sid: &str, next: State, now_unix: u64) -> Result<(), AuthError> {
-        let (primary, _) = self.resolve(sid, now_unix)?;
+    /// Moves the claimed login `primary` past its approval. The wallet limit
+    /// is read again here: two claims of one wallet taken together both
+    /// passed it.
+    fn approve(&self, primary: &str, next: State, now_unix: u64) -> Result<(), AuthError> {
         let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
         if !sessions
-            .get(&primary)
-            .is_some_and(|s| matches!(s.state, State::Pending))
+            .get(primary)
+            .is_some_and(|s| s.live(now_unix) && matches!(s.state, State::Pending))
         {
             return Err(AuthError::Session);
         }
-        let held = next.approved_by().map_or(0, |wallet| {
-            sessions
-                .values()
-                .filter(|s| s.live(now_unix) && s.state.approved_by() == Some(wallet))
-                .count()
-        });
+        let held = next
+            .approved_by()
+            .map_or(0, |wallet| approved_by(&sessions, wallet, now_unix));
         if held >= MAX_APPROVED_PER_WALLET {
             return Err(AuthError::RateLimited);
         }
-        let session = sessions.get_mut(&primary).ok_or(AuthError::Session)?;
+        let session = sessions.get_mut(primary).ok_or(AuthError::Session)?;
         session.state = next;
         Ok(())
     }
@@ -854,6 +861,14 @@ impl SessionStore {
     }
 }
 
+/// Live logins `wallet` holds past their approval.
+fn approved_by(sessions: &HashMap<String, Session>, wallet: &str, now_unix: u64) -> usize {
+    sessions
+        .values()
+        .filter(|s| s.live(now_unix) && s.state.approved_by() == Some(wallet))
+        .count()
+}
+
 /// The live session `sid` names, if `browser` is the one it is bound to.
 fn owned<'a>(
     sessions: &'a HashMap<String, Session>,
@@ -886,6 +901,29 @@ mod tests {
         BrowserSecret::generate().key()
     }
 
+    /// A bound approval of the login behind `sid`, claimed first as the
+    /// route does.
+    fn approve_bound(
+        store: &SessionStore,
+        sid: &str,
+        user: SsoUser,
+        now_unix: u64,
+    ) -> Result<CompletionCode, AuthError> {
+        let (claim, _) = store.claim_approval(sid, &user.external_id, now_unix)?;
+        claim.approve_bound(&Admitted::for_tests(), user, now_unix)
+    }
+
+    /// A legacy approval of the login behind `sid`, claimed first.
+    fn approve_legacy(
+        store: &SessionStore,
+        sid: &str,
+        user: SsoUser,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
+        let (claim, _) = store.claim_approval(sid, &user.external_id, now_unix)?;
+        claim.approve_legacy(&Admitted::for_tests(), user, now_unix)
+    }
+
     fn open(store: &SessionStore, nonce: &str, browser: &BrowserKey) -> SessionIds {
         store
             .create(nonce.into(), "https://f/sso_login".into(), browser, 0)
@@ -899,9 +937,7 @@ mod tests {
         let ids = open(&store, "n", &b);
 
         assert_eq!(store.status(&ids.sid, &b, 1), Ok(SessionStatus::Pending));
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 2)
-            .expect("approve");
+        let code = approve_bound(&store, &ids.sid, user(), 2).expect("approve");
         assert_eq!(
             store.status(&ids.sid, &b, 3),
             Ok(SessionStatus::AwaitingCode)
@@ -927,9 +963,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        approve_bound(&store, &ids.sid, user(), 1).expect("approve");
 
         assert!(matches!(
             store.consume(&ids.sid, &b, 2),
@@ -946,8 +980,7 @@ mod tests {
                 let ids = open(&store, &format!("n{i}"), &b);
                 let mut wallet = user();
                 wallet.external_id = format!("e{i}");
-                store
-                    .approve_bound(&Admitted::for_tests(), &ids.sid, wallet, 1)
+                approve_bound(&store, &ids.sid, wallet, 1)
                     .expect("approve")
                     .as_str()
                     .to_owned()
@@ -972,9 +1005,7 @@ mod tests {
         let owner = browser();
         let stranger = browser();
         let ids = open(&store, "n", &owner);
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        let code = approve_bound(&store, &ids.sid, user(), 1).expect("approve");
 
         assert_eq!(
             store.status(&ids.sid, &stranger, 2),
@@ -1018,9 +1049,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        let code = approve_bound(&store, &ids.sid, user(), 1).expect("approve");
         let wrong = if code.as_str() == "000000" {
             "000001"
         } else {
@@ -1059,9 +1088,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        let code = approve_bound(&store, &ids.sid, user(), 1).expect("approve");
         store
             .confirm(&ids.sid, &b, code.as_str(), 2)
             .expect("first");
@@ -1077,9 +1104,7 @@ mod tests {
         let store = SessionStore::default();
         let owner = browser();
         let ids = open(&store, "n", &owner);
-        store
-            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        approve_legacy(&store, &ids.sid, user(), 1).expect("approve");
 
         assert_eq!(
             store.status(&ids.sid, &owner, 2),
@@ -1102,18 +1127,14 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("first");
+        approve_bound(&store, &ids.sid, user(), 1).expect("first");
 
         assert_eq!(
-            store
-                .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 2)
-                .map(|_| ()),
+            approve_bound(&store, &ids.qr_sid, user(), 2).map(|_| ()),
             Err(AuthError::Session)
         );
         assert_eq!(
-            store.approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 2),
+            approve_legacy(&store, &ids.sid, user(), 2),
             Err(AuthError::Session)
         );
     }
@@ -1123,9 +1144,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store
-            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        approve_legacy(&store, &ids.sid, user(), 1).expect("approve");
         assert!(matches!(
             store.consume(&ids.sid, &b, 2),
             Ok(Consumed::Login(_))
@@ -1153,11 +1172,7 @@ mod tests {
             store.status(&ids.sid, &b, SESSION_TTL_SECS),
             Err(AuthError::BrowserMismatch)
         );
-        assert!(
-            store
-                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), SESSION_TTL_SECS)
-                .is_err()
-        );
+        assert!(approve_bound(&store, &ids.sid, user(), SESSION_TTL_SECS).is_err());
         assert!(store.resolve(&ids.qr_sid, SESSION_TTL_SECS).is_err());
     }
 
@@ -1175,11 +1190,7 @@ mod tests {
             }),
             "either id cancels, and the browser polling its own sees it"
         );
-        assert!(
-            store
-                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 3)
-                .is_err()
-        );
+        assert!(approve_bound(&store, &ids.sid, user(), 3).is_err());
     }
 
     #[test]
@@ -1187,9 +1198,7 @@ mod tests {
         let store = SessionStore::default();
         let b = browser();
         let ids = open(&store, "n", &b);
-        store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        approve_bound(&store, &ids.sid, user(), 1).expect("approve");
 
         store.cancel(&ids.sid, CancelReason::UserCancelled, 2);
 
@@ -1208,9 +1217,7 @@ mod tests {
         assert!(store.awaits_approval(&ids.qr_sid, 1), "the QR id too");
         assert!(!store.awaits_approval("deadbeef", 1));
 
-        store
-            .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 2)
-            .expect("approve");
+        approve_bound(&store, &ids.qr_sid, user(), 2).expect("approve");
 
         assert!(!store.awaits_approval(&ids.sid, 3));
         assert!(!store.awaits_approval(&ids.qr_sid, 3));
@@ -1240,9 +1247,7 @@ mod tests {
         let b = browser();
         let ids = open(&store, "n", &b);
 
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.qr_sid, user(), 1)
-            .expect("phone");
+        let code = approve_bound(&store, &ids.qr_sid, user(), 1).expect("phone");
 
         assert_eq!(
             store.status(&ids.sid, &b, 2),
@@ -1278,9 +1283,7 @@ mod tests {
         let store = SessionStore::default();
         let owner = browser();
         let ids = open(&store, "n", &owner);
-        store
-            .approve_legacy(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        approve_legacy(&store, &ids.sid, user(), 1).expect("approve");
         store.consume(&ids.sid, &owner, 2).expect("complete");
 
         assert_eq!(
@@ -1349,19 +1352,72 @@ mod tests {
         let store = SessionStore::default();
         let ids = open(&store, "n", &browser());
 
-        let (claim, approach) = store.claim_approval(&ids.qr_sid, 1).expect("first");
+        let (claim, approach) = store.claim_approval(&ids.qr_sid, "e", 1).expect("first");
         assert_eq!(
             (claim.sid(), approach),
             (ids.sid.as_str(), Approach::CrossDevice)
         );
         assert_eq!(
-            store.claim_approval(&ids.sid, 1).map(|_| ()),
+            store.claim_approval(&ids.sid, "e", 1).map(|_| ()),
             Err(AuthError::Forum),
             "a second approval meanwhile is told to retry"
         );
         drop(claim);
 
-        assert!(store.claim_approval(&ids.sid, 2).is_ok());
+        assert!(store.claim_approval(&ids.sid, "e", 2).is_ok());
+    }
+
+    #[test]
+    fn two_claims_taken_together_cannot_carry_a_wallet_past_its_limit() {
+        let store = SessionStore::default();
+        for i in 1..MAX_APPROVED_PER_WALLET {
+            let ids = open(&store, &format!("n{i}"), &browser());
+            approve_bound(&store, &ids.sid, user(), 1).expect("approve");
+        }
+        let (a, b) = (open(&store, "a", &browser()), open(&store, "b", &browser()));
+        let (first, _) = store.claim_approval(&a.sid, "e", 2).expect("claim a");
+        let (second, _) = store
+            .claim_approval(&b.sid, "e", 2)
+            .expect("the wallet is under its limit when both are claimed");
+        first
+            .approve_bound(&Admitted::for_tests(), user(), 2)
+            .expect("reaches the limit");
+
+        assert_eq!(
+            second
+                .approve_bound(&Admitted::for_tests(), user(), 2)
+                .map(|_| ()),
+            Err(AuthError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn a_login_that_stops_waiting_while_its_approval_is_admitted_takes_none() {
+        let store = SessionStore::default();
+        let b = browser();
+        let ids = open(&store, "n", &b);
+        let (claim, _) = store.claim_approval(&ids.qr_sid, "e", 1).expect("claim");
+        store.cancel(&ids.sid, CancelReason::UserCancelled, 1);
+
+        assert_eq!(
+            claim.approve_legacy(&Admitted::for_tests(), user(), 2),
+            Err(AuthError::Session)
+        );
+        assert_eq!(
+            store.status(&ids.sid, &b, 2),
+            Ok(SessionStatus::Cancelled {
+                reason: CancelReason::UserCancelled
+            })
+        );
+        let slow = open(&store, "slow", &browser());
+        let (claim, _) = store.claim_approval(&slow.sid, "e", 1).expect("claim");
+        assert_eq!(
+            claim
+                .approve_bound(&Admitted::for_tests(), user(), SESSION_TTL_SECS)
+                .map(|_| ()),
+            Err(AuthError::Session),
+            "nor one that expired meanwhile"
+        );
     }
 
     #[test]
@@ -1371,11 +1427,11 @@ mod tests {
         store.cancel(&ids.sid, CancelReason::UserCancelled, 1);
 
         assert_eq!(
-            store.claim_approval(&ids.sid, 2).map(|_| ()),
+            store.claim_approval(&ids.sid, "e", 2).map(|_| ()),
             Err(AuthError::Session)
         );
         assert_eq!(
-            store.claim_approval("deadbeef", 2).map(|_| ()),
+            store.claim_approval("deadbeef", "e", 2).map(|_| ()),
             Err(AuthError::Session)
         );
     }
@@ -1441,13 +1497,9 @@ mod tests {
         let store = SessionStore::with_capacity(4);
         let (awaiting, confirmed) = (browser(), browser());
         let awaiting_ids = open(&store, "awaiting", &awaiting);
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &awaiting_ids.sid, user(), 1)
-            .expect("approve");
+        let code = approve_bound(&store, &awaiting_ids.sid, user(), 1).expect("approve");
         let confirmed_ids = open(&store, "confirmed", &confirmed);
-        let confirmed_code = store
-            .approve_bound(&Admitted::for_tests(), &confirmed_ids.sid, user(), 1)
-            .expect("approve");
+        let confirmed_code = approve_bound(&store, &confirmed_ids.sid, user(), 1).expect("approve");
         store
             .confirm(&confirmed_ids.sid, &confirmed, confirmed_code.as_str(), 2)
             .expect("confirm");
@@ -1469,9 +1521,7 @@ mod tests {
         let store = SessionStore::with_capacity(MAX_APPROVED_PER_WALLET);
         for i in 0..MAX_APPROVED_PER_WALLET {
             let ids = open(&store, &format!("n{i}"), &browser());
-            store
-                .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-                .expect("approve");
+            approve_bound(&store, &ids.sid, user(), 1).expect("approve");
         }
 
         assert_eq!(
@@ -1548,18 +1598,12 @@ mod tests {
             .collect();
         let mut codes = Vec::new();
         for ids in &logins[..MAX_APPROVED_PER_WALLET] {
-            codes.push(
-                store
-                    .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-                    .expect("approve"),
-            );
+            codes.push(approve_bound(&store, &ids.sid, user(), 1).expect("approve"));
         }
         let last = &logins[MAX_APPROVED_PER_WALLET];
 
         assert_eq!(
-            store
-                .approve_bound(&Admitted::for_tests(), &last.sid, user(), 2)
-                .map(|_| ()),
+            approve_bound(&store, &last.sid, user(), 2).map(|_| ()),
             Err(AuthError::RateLimited)
         );
         assert!(
@@ -1570,9 +1614,7 @@ mod tests {
         stranger.external_id = "another wallet".into();
         let other = open(&store, "other", &browser());
         assert!(
-            store
-                .approve_legacy(&Admitted::for_tests(), &other.sid, stranger, 2)
-                .is_ok(),
+            approve_legacy(&store, &other.sid, stranger, 2).is_ok(),
             "another wallet is not held back"
         );
         store
@@ -1582,9 +1624,7 @@ mod tests {
             .consume(&logins[0].sid, &browsers[0], 3)
             .expect("complete");
         assert!(
-            store
-                .approve_bound(&Admitted::for_tests(), &last.sid, user(), 4)
-                .is_ok(),
+            approve_bound(&store, &last.sid, user(), 4).is_ok(),
             "a completed login gives its place back"
         );
     }
@@ -1642,9 +1682,7 @@ mod tests {
         assert_eq!(format!("{:?}", secret.key()), "BrowserKey(redacted)");
         let store = SessionStore::default();
         let ids = open(&store, "n", &secret.key());
-        let code = store
-            .approve_bound(&Admitted::for_tests(), &ids.sid, user(), 1)
-            .expect("approve");
+        let code = approve_bound(&store, &ids.sid, user(), 1).expect("approve");
         assert_eq!(format!("{code:?}"), "CompletionCode(redacted)");
 
         let rendered = format!("{store:?}");

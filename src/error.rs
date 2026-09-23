@@ -82,7 +82,8 @@ pub enum AuthError {
     /// distinguishes "never existed" from "no longer exists", on purpose.
     #[error("unknown_code")]
     InvalidTicket,
-    /// Too many guest intakes from this client or globally in the window.
+    /// Too many guest intakes from this client or globally in the window, or
+    /// a wallet already holds as many approved logins as it may.
     #[error("rate limited")]
     RateLimited,
     /// A backend call failed (Discourse, or a database a gate or an

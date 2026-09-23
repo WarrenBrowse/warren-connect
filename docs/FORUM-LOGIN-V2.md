@@ -241,6 +241,10 @@ happen to a v2 client and maps to the generic failure.
   - the legacy transition window for non-staff wallets while the flag is
     `allow`;
   - an app-side cancel by anyone holding a sid, before the approval only;
+  - each sign-in a wallet approves holds one of its three places until a
+    browser completes it or it expires, and only that browser can end it
+    sooner: a victim who approves three relayed sign-ins gets a 429 on their
+    own for up to five minutes;
   - the provider holds 10,000 sign-ins, and each forum visit mints a payload
     `/sso` accepts, so a pile of harvested payloads fills it. A full provider
     displaces the oldest sign-in that ended, then the oldest one still waiting

@@ -703,11 +703,15 @@ async fn forum_login(
 
     // Only a login still waiting for its approval can take one, so refuse
     // here rather than after the lookup and the link upsert: a corrected
-    // retry after a clock-skew cancel is the common shape. The claim holds
-    // the login until this handler returns or is dropped, so the reads below
-    // run once however many approvals of it arrive together. The QR is read
-    // from a second device, so no staff claim rides on it.
-    let (claim, approach) = state.sessions.claim_approval(&login.sid, now)?;
+    // retry after a clock-skew cancel is the common shape, and so is a
+    // wallet already holding its approved logins. The claim holds the login
+    // until this handler returns or is dropped, so the reads below run once
+    // however many approvals of it arrive together. The QR is read from a
+    // second device, so no staff claim rides on it.
+    let wallet = handle::derive(&state.handle_secret, &identity.pubkey);
+    let (claim, approach) = state
+        .sessions
+        .claim_approval(&login.sid, &wallet.external_id, now)?;
     let primary_sid = claim.sid();
     if form == LoginForm::Legacy {
         match legacy_admission(&state, identity).await {
@@ -771,9 +775,7 @@ async fn forum_login(
     };
     let body = match form {
         LoginForm::Bound => {
-            let code = state
-                .sessions
-                .approve_bound(&admitted.admission, primary_sid, user, now)?;
+            let code = claim.approve_bound(&admitted.admission, user, now)?;
             let handoff = (approach == Approach::SameDevice)
                 .then(|| handoff_url(&state.public_host, primary_sid, &code));
             bound_approved_body(
@@ -784,9 +786,7 @@ async fn forum_login(
             )
         }
         LoginForm::Legacy => {
-            state
-                .sessions
-                .approve_legacy(&admitted.admission, primary_sid, user, now)?;
+            claim.approve_legacy(&admitted.admission, user, now)?;
             login_approved_body(&handle_for_client, admitted.notify_slot)
         }
     };
@@ -2597,10 +2597,10 @@ mod tests {
         let ids = store
             .create("n".into(), "r".into(), &browser, 0)
             .expect("create");
-        let code = store
+        let (claim, _) = store.claim_approval(&ids.sid, "e", 1).expect("claim");
+        let code = claim
             .approve_bound(
                 &crate::verify::Admitted::for_tests(),
-                &ids.sid,
                 SsoUser {
                     external_id: "e".into(),
                     username: "u".into(),
