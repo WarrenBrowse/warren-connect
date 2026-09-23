@@ -1659,7 +1659,7 @@ async fn admit_linked_signer(
     if forum_link(state, identity, forum).await? {
         return Ok(());
     }
-    // The wallet alone: it wrote no topic, so it is tied to none.
+    // The wallet alone, never next to the topic an upload named.
     tracing::info!(
         pubkey = %redact(&identity.pubkey_ss58),
         "attach-logs refused: upload from a wallet with no forum link"

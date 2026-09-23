@@ -2509,7 +2509,7 @@ async fn a_legacy_approval_whose_forum_link_cannot_be_read_answers_a_retryable_e
 #[tokio::test]
 async fn a_legacy_approval_whose_staff_query_fails_answers_a_retryable_error() {
     // A deployment with no Discourse database refuses every legacy approval
-    // for good (`a_legacy_approval_from_a_staff_wallet_is_refused_...`). A
+    // for good (`a_legacy_approval_from_a_staff_wallet_is_refused_even_when_legacy_is_allowed`). A
     // wired one whose query fails this time knows nothing about the wallet.
     let state = build_state(Setup {
         legacy: LegacyApproval::Allow,

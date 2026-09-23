@@ -431,17 +431,6 @@ pub enum StaffLookupError {
     Query(#[source] sqlx::Error),
 }
 
-impl StaffLookupError {
-    /// A value-free category, safe to log (see [`error_kind`]).
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            StaffLookupError::NotWired => "not_wired",
-            StaffLookupError::Query(err) => error_kind(err),
-        }
-    }
-}
-
 /// A wallet's subscription standing, derived from the single `subscriptions`
 /// row (created only on payment, never purged on expiry by `retention.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
