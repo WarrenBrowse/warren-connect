@@ -12,7 +12,6 @@ use axum::http::Request;
 use http_body_util::BodyExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use warren_connect::nonces::NonceStore;
 use warren_connect::verify::{SignedHeaders, VerifiedIdentity, verify_signed_request};
 use warren_contract::auth::{canonical_message, sign_request};
 
@@ -249,9 +248,9 @@ pub fn verify_at_vector_clock(vector: &Vector, req: &SignedRequest) -> VerifiedI
         &req.path,
         req.body_utf8.as_bytes(),
         vector.signer.timestamp,
-        &NonceStore::default(),
     )
-    .unwrap_or_else(|err| panic!("{}: the pinned request must verify: {err}", req.name));
+    .unwrap_or_else(|err| panic!("{}: the pinned request must verify: {err}", req.name))
+    .identity;
     assert_eq!(
         identity.pubkey_ss58, vector.signer.pubkey_ss58,
         "{}",

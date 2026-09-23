@@ -637,15 +637,8 @@ async fn forum_login(
 ) -> Result<Response, AuthError> {
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
-    let identity = match verify_signed_request(
-        &signed,
-        "POST",
-        "/v1/forum/login",
-        &body,
-        now,
-        &state.nonces,
-    ) {
-        Ok(identity) => identity,
+    let request = match verify_signed_request(&signed, "POST", "/v1/forum/login", &body, now) {
+        Ok(request) => request,
         Err(err) => {
             if matches!(err, AuthError::Clock) {
                 // Best effort: without this the browser polls "pending" until
@@ -675,6 +668,10 @@ async fn forum_login(
             return Err(err);
         }
     };
+    request.admit(&state.nonces, now).inspect_err(|err| {
+        tracing::debug!(error = %err, "forum login auth refused");
+    })?;
+    let identity = request.identity;
 
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
     let form = LoginForm::of(login.login_version)?;
@@ -908,27 +905,25 @@ async fn forum_notifications(
     body: axum::body::Bytes,
 ) -> Result<Response, AuthError> {
     let signed = extract_signed_headers(&headers)?;
-    let identity = verify_signed_request(
-        &signed,
-        "POST",
-        "/v1/forum/notifications",
-        &body,
-        now_unix(),
-        &state.nonces,
-    )?;
+    let now = now_unix();
+    let request = verify_signed_request(&signed, "POST", "/v1/forum/notifications", &body, now)?;
+    request.admit(&state.nonces, now)?;
+    let identity = request.identity;
     let discourse_pool = state
         .discourse_pool
         .as_ref()
         .ok_or(AuthError::FeatureDisabled)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-    let registered = store::username_for_external_id(&state.forum_pool, &forum.external_id)
+    let linked = state
+        .identity
+        .is_linked(&forum.external_id)
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "notifications: link lookup failed");
             AuthError::Session
         })?;
-    if registered.is_none() {
+    if !linked {
         return Ok(Json(serde_json::json!({ "notifications": [] })).into_response());
     }
 
@@ -991,24 +986,23 @@ async fn forum_notifications_seen(
     body: axum::body::Bytes,
 ) -> Result<Response, AuthError> {
     let signed = extract_signed_headers(&headers)?;
-    let identity = verify_signed_request(
-        &signed,
-        "POST",
-        "/v1/forum/notifications/seen",
-        &body,
-        now_unix(),
-        &state.nonces,
-    )?;
+    let now = now_unix();
+    let request =
+        verify_signed_request(&signed, "POST", "/v1/forum/notifications/seen", &body, now)?;
+    request.admit(&state.nonces, now)?;
+    let identity = request.identity;
     let seen_pool = state.seen_pool.as_ref().ok_or(AuthError::FeatureDisabled)?;
 
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-    let registered = store::username_for_external_id(&state.forum_pool, &forum.external_id)
+    let linked = state
+        .identity
+        .is_linked(&forum.external_id)
         .await
         .map_err(|e| {
             tracing::error!(kind = ?sqlx_error_kind(&e), "seen: link lookup failed");
             AuthError::Session
         })?;
-    if registered.is_none() {
+    if !linked {
         // A wallet that never logged in to the forum has no list to mark, and
         // Discourse is not touched at all.
         return Ok(Json(serde_json::json!({ "seen": false })).into_response());
@@ -1308,14 +1302,9 @@ async fn forum_attach_logs(
     let api = forum_api_enabled(&state)?;
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
-    let identity = verify_signed_request(
-        &signed,
-        "POST",
-        "/v1/forum/attach-logs",
-        &body,
-        now,
-        &state.nonces,
-    )?;
+    let request = verify_signed_request(&signed, "POST", "/v1/forum/attach-logs", &body, now)?;
+    request.admit(&state.nonces, now)?;
+    let identity = request.identity;
 
     // Every refusal below reaches the reporter as a generic failure, so each
     // branch names itself here: without this, four attach attempts against a
@@ -1665,24 +1654,19 @@ async fn forum_report(
     let api = forum_api_enabled(&state)?;
     let signed = extract_signed_headers(&headers)?;
     let now = now_unix();
-    let identity = verify_signed_request(
-        &signed,
-        "POST",
-        "/v1/forum/report",
-        &body,
-        now,
-        &state.nonces,
-    )
-    .inspect_err(|err| {
-        if matches!(err, AuthError::Clock) {
-            tracing::info!(
-                drift_secs = now.abs_diff(signed.timestamp),
-                "report refused: client clock outside window"
-            );
-        } else {
-            tracing::debug!(error = %err, "report auth refused");
-        }
-    })?;
+    let request = verify_signed_request(&signed, "POST", "/v1/forum/report", &body, now)
+        .and_then(|request| request.admit(&state.nonces, now).map(|()| request))
+        .inspect_err(|err| {
+            if matches!(err, AuthError::Clock) {
+                tracing::info!(
+                    drift_secs = now.abs_diff(signed.timestamp),
+                    "report refused: client clock outside window"
+                );
+            } else {
+                tracing::debug!(error = %err, "report auth refused");
+            }
+        })?;
+    let identity = request.identity;
 
     let req: crate::report::ReportRequest = serde_json::from_slice(&body).map_err(|_| {
         tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "report refused: body is not valid JSON");

@@ -1,11 +1,11 @@
-//! Verification of a wallet-signed login request.
+//! Verification of a wallet-signed request.
 //!
 //! Same frozen wire contract as the Warren API: the four `X-Warren-*` headers
-//! over the canonical message from `warren_contract::auth`. Semantics mirror
-//! the production `WarrenAuthVerifier` (warren-core): clock window, then
-//! Ed25519 verification, then nonce consumption. The nonce is consumed only
-//! AFTER the signature verifies so an attacker cannot burn a victim's nonce
-//! with a garbage signature.
+//! over the canonical message from `warren_contract::auth`. The clock window
+//! and the Ed25519 check mirror the production `WarrenAuthVerifier`
+//! (warren-core). The nonce is spent in a step of its own,
+//! [`VerifiedRequest::admit`], which only a proven signature can reach, so a
+//! garbage signature cannot burn a victim's nonce.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -40,20 +40,43 @@ pub struct VerifiedIdentity {
     pub pubkey_ss58: String,
 }
 
-/// Verifies a signed request end to end.
+/// A request whose signature is proven and whose nonce is not spent yet.
+#[derive(Debug)]
+pub struct VerifiedRequest {
+    /// The wallet that signed it.
+    pub identity: VerifiedIdentity,
+    nonce_hex: String,
+}
+
+impl VerifiedRequest {
+    /// Spends the request's nonce.
+    ///
+    /// # Errors
+    /// [`AuthError::Nonce`] on a replay, when the wallet is over its budget,
+    /// or when the store is full.
+    pub fn admit(&self, nonces: &NonceStore, now_unix: u64) -> Result<(), AuthError> {
+        if nonces.check_and_store(&self.identity.pubkey_ss58, &self.nonce_hex, now_unix) {
+            Ok(())
+        } else {
+            Err(AuthError::Nonce)
+        }
+    }
+}
+
+/// Verifies the signature of a request: key, clock window, nonce shape and
+/// Ed25519 signature. Spends no nonce: see [`VerifiedRequest::admit`].
 ///
 /// # Errors
 /// [`AuthError::Pubkey`] on SS58/point decode failure, [`AuthError::Clock`]
-/// outside the timestamp window, [`AuthError::Signature`] on Ed25519
-/// mismatch, [`AuthError::Nonce`] on malformed or replayed nonce.
+/// outside the timestamp window, [`AuthError::Nonce`] on a malformed nonce,
+/// [`AuthError::Signature`] on Ed25519 mismatch.
 pub fn verify_signed_request(
     headers: &SignedHeaders,
     method: &str,
     path: &str,
     body: &[u8],
     now_unix: u64,
-    nonces: &NonceStore,
-) -> Result<VerifiedIdentity, AuthError> {
+) -> Result<VerifiedRequest, AuthError> {
     let pubkey =
         warren_contract::ss58::decode(&headers.pubkey_ss58).map_err(|_| AuthError::Pubkey)?;
     let verifying = VerifyingKey::from_bytes(&pubkey).map_err(|_| AuthError::Pubkey)?;
@@ -97,14 +120,12 @@ pub fn verify_signed_request(
     // proven key bytes rather than the raw client string.
     let pubkey_ss58 = warren_contract::ss58::encode(&pubkey);
 
-    // Signature proven: only now is the nonce consumed (DoS ordering).
-    if !nonces.check_and_store(&pubkey_ss58, &headers.nonce_hex, now_unix) {
-        return Err(AuthError::Nonce);
-    }
-
-    Ok(VerifiedIdentity {
-        pubkey,
-        pubkey_ss58,
+    Ok(VerifiedRequest {
+        identity: VerifiedIdentity {
+            pubkey,
+            pubkey_ss58,
+        },
+        nonce_hex: headers.nonce_hex.clone(),
     })
 }
 
@@ -135,10 +156,10 @@ mod tests {
     fn accepts_a_valid_signed_request() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let h = signed(&key, "POST", "/v1/forum/login", b"{}", 1_000, [1; 16]);
-        let nonces = NonceStore::default();
 
-        let id = verify_signed_request(&h, "POST", "/v1/forum/login", b"{}", 1_000, &nonces)
-            .expect("valid request must verify");
+        let id = verify_signed_request(&h, "POST", "/v1/forum/login", b"{}", 1_000)
+            .expect("valid request must verify")
+            .identity;
         assert_eq!(id.pubkey, key.verifying_key().to_bytes());
         assert_eq!(id.pubkey_ss58, h.pubkey_ss58);
     }
@@ -147,9 +168,8 @@ mod tests {
     fn rejects_a_tampered_body() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let h = signed(&key, "POST", "/p", b"{\"sid\":\"a\"}", 1_000, [1; 16]);
-        let nonces = NonceStore::default();
 
-        let err = verify_signed_request(&h, "POST", "/p", b"{\"sid\":\"EVIL\"}", 1_000, &nonces)
+        let err = verify_signed_request(&h, "POST", "/p", b"{\"sid\":\"EVIL\"}", 1_000)
             .expect_err("body swap must break the signature");
         assert!(matches!(err, AuthError::Signature));
     }
@@ -158,9 +178,8 @@ mod tests {
     fn rejects_a_stale_timestamp() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
-        let nonces = NonceStore::default();
 
-        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000 + 61, &nonces)
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000 + 61)
             .expect_err("61 s of skew is outside the window");
         assert!(matches!(err, AuthError::Clock));
     }
@@ -171,25 +190,15 @@ mod tests {
         let h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
         let nonces = NonceStore::default();
 
-        verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces).expect("first use passes");
-        let err = verify_signed_request(&h, "POST", "/p", b"", 1_001, &nonces)
+        verify_signed_request(&h, "POST", "/p", b"", 1_000)
+            .expect("first use verifies")
+            .admit(&nonces, 1_000)
+            .expect("and is admitted");
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_001)
+            .expect("the replay carries a valid signature")
+            .admit(&nonces, 1_001)
             .expect_err("identical request replayed must be rejected");
         assert!(matches!(err, AuthError::Nonce));
-    }
-
-    #[test]
-    fn a_bad_signature_does_not_burn_the_nonce() {
-        let key = SigningKey::from_bytes(&[7u8; 32]);
-        let mut h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
-        let good_sig = h.signature_hex.clone();
-        h.signature_hex = "00".repeat(64);
-        let nonces = NonceStore::default();
-
-        verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
-            .expect_err("garbage signature rejected");
-        h.signature_hex = good_sig;
-        verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
-            .expect("the legitimate request must still pass afterwards");
     }
 
     #[test]
@@ -203,9 +212,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let mut h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
         h.pubkey_ss58 = warren_contract::ss58::encode(&identity);
-        let nonces = NonceStore::default();
 
-        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000)
             .expect_err("a small-order key must be refused");
         assert!(matches!(err, AuthError::Pubkey), "got {err:?}");
     }
@@ -215,9 +223,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let mut h = signed(&key, "POST", "/p", b"", 1_000, [1; 16]);
         h.pubkey_ss58 = "not-an-address".into();
-        let nonces = NonceStore::default();
 
-        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000, &nonces)
+        let err = verify_signed_request(&h, "POST", "/p", b"", 1_000)
             .expect_err("bad address must be rejected");
         assert!(matches!(err, AuthError::Pubkey));
     }
