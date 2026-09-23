@@ -2702,9 +2702,9 @@ async fn a_flood_of_free_wallet_logins_reaches_the_warren_database_a_bounded_num
 }
 
 #[tokio::test(start_paused = true)]
-async fn approvals_of_one_login_sent_together_read_the_subscriptions_at_most_twice() {
-    // The first "never paid" ends the session, and an approval that waited
-    // for the gate meanwhile finds it ended rather than reading again.
+async fn approvals_of_one_login_sent_together_read_the_subscriptions_once() {
+    // One approval of a login is admitted at a time: the others sent with it
+    // are turned away before they read anything.
     let state = build_state(Setup::default());
     let app = router(state.clone());
     memory(&state)
@@ -2717,20 +2717,68 @@ async fn approvals_of_one_login_sent_together_read_the_subscriptions_at_most_twi
 
     let answered = statuses(flood(&app, approvals)).await;
 
+    assert_eq!(memory(&state).warren_db.queries(), 1, "{answered:?}");
     assert_eq!(
         answered.iter().filter(|s| **s == 403).count(),
-        memory(&state).warren_db.queries(),
-        "one refusal per read: {answered:?}"
+        1,
+        "{answered:?}"
     );
     assert!(
-        memory(&state).warren_db.queries() <= 2,
-        "{}",
-        memory(&state).warren_db.queries()
+        answered.iter().all(|s| *s == 403 || *s == 502),
+        "the others are told to retry: {answered:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_approvals_of_one_login_sent_together_read_the_staff_status_once() {
+    let state = build_state(Setup {
+        legacy: LegacyApproval::Allow,
+        forum_staff: Some(&[]),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    memory(&state)
+        .forum_db
+        .set_query_time(std::time::Duration::from_secs(1));
+    let page = open_sso(&app, "n-one-legacy", None).await;
+    let approvals = (0..8u8)
+        .map(|i| signed_login_request(&free_key(0x20 + i), &page.sid(), unix_now(), [i; 16]))
+        .collect();
+
+    let answered = statuses(flood(&app, approvals)).await;
+
+    assert_eq!(memory(&state).forum_db.queries(), 1, "{answered:?}");
     assert!(
-        answered.iter().all(|s| *s == 403 || *s == 404),
-        "the others find the session ended: {answered:?}"
+        answered.iter().all(|s| *s == 403 || *s == 502),
+        "{answered:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_abandoned_halfway_gives_its_login_back() {
+    let (key, ss58) = paid_signer();
+    let state = build_state(Setup {
+        paid_ss58: Some(&ss58),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+    let page = open_sso(&app, "n-abandoned", None).await;
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::from_secs(10));
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send(&app, signed_bound_login(&key, &page.sid(), [0x70; 16])),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the app gave up while its read waited");
+    memory(&state)
+        .warren_db
+        .set_query_time(std::time::Duration::ZERO);
+
+    let retry = send(&app, signed_bound_login(&key, &page.sid(), [0x71; 16])).await;
+
+    assert_eq!(retry.status, 200, "{}", retry.body_utf8);
 }
 
 #[tokio::test(start_paused = true)]

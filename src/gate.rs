@@ -56,10 +56,10 @@ const _: () = assert!(LOGIN_PERMITS + OPEN_PERMITS < FORUM_POOL_CONNECTIONS as u
 pub struct Gates {
     /// The login's reads: its paywall, and the staff status of the legacy
     /// form. A login read needs a session still waiting for its approval,
-    /// which ends at the first "never paid", and one DiscourseConnect payload
-    /// from the forum opens three at most, so it is the costly read to flood
-    /// and it has a bulkhead of its own that no flood of the open routes can
-    /// fill.
+    /// which ends at the first "never paid" and takes one approval at a time,
+    /// and one DiscourseConnect payload from the forum opens three at most,
+    /// so it is the costly read to flood and it has a bulkhead of its own
+    /// that no flood of the open routes can fill.
     pub login: GateLimiter,
     /// The reads any signature can order with nothing else: the in-app
     /// report's paywall, and the forum link the notification routes and the

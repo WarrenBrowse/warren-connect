@@ -79,13 +79,14 @@ by anyone relaying the request.
 | 403 | text | wallet never subscribed | subscription-required (unchanged) |
 | 404 | text | session unknown, expired, cancelled, or already approved | expired (unchanged) |
 | 429 | text | the wallet already holds three sign-ins it approved and no browser completed; the session keeps waiting | generic failure |
+| 502 | text | a database read or write failed, the login gate is full, or another approval of this session is being admitted; the session keeps waiting | generic failure |
 
 `notify_slot` is omitted when none was drawn, as in v1. `handle` and
-`notify_slot` keep their v1 meaning. The vector does not pin the 429 body:
-every client maps it to its generic failure.
+`notify_slot` keep their v1 meaning. The vector does not pin the 429 and 502
+bodies: every client maps both to its generic failure.
 
 A session accepts exactly one approval. A second approval, from any wallet,
-answers 404.
+answers 404, and 502 while the first one is still being admitted.
 
 #### `GET /v1/session/{sid}/status` (the preflight, no cookie)
 

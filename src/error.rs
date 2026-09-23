@@ -85,9 +85,10 @@ pub enum AuthError {
     /// Too many guest intakes from this client or globally in the window.
     #[error("rate limited")]
     RateLimited,
-    /// A backend call failed: Discourse, or a database a gate or an
-    /// admission reads or writes. Nothing was granted or marked done, and a
-    /// retry can succeed.
+    /// A backend call failed (Discourse, or a database a gate or an
+    /// admission reads or writes), a gate is full, or another approval of the
+    /// same login is being admitted. Nothing was granted or marked done, and
+    /// a retry can succeed.
     #[error("forum backend error")]
     Forum,
 }

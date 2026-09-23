@@ -701,15 +701,14 @@ async fn forum_login(
     let login: LoginBody = serde_json::from_slice(&body).map_err(|_| AuthError::Session)?;
     let form = LoginForm::of(login.login_version)?;
 
-    // Which of the session's two ids this approval arrived on. The QR is read
-    // from a second device, so no staff claim rides on it.
-    let (primary_sid, approach) = state.sessions.resolve(&login.sid, now)?;
     // Only a login still waiting for its approval can take one, so refuse
     // here rather than after the lookup and the link upsert: a corrected
-    // retry after a clock-skew cancel is the common shape.
-    if !state.sessions.awaits_approval(&primary_sid, now) {
-        return Err(AuthError::Session);
-    }
+    // retry after a clock-skew cancel is the common shape. The claim holds
+    // the login until this handler returns or is dropped, so the reads below
+    // run once however many approvals of it arrive together. The QR is read
+    // from a second device, so no staff claim rides on it.
+    let (claim, approach) = state.sessions.claim_approval(&login.sid, now)?;
+    let primary_sid = claim.sid();
     if form == LoginForm::Legacy {
         match legacy_admission(&state, identity).await {
             Ok(()) => {}
@@ -718,7 +717,7 @@ async fn forum_login(
                 // itself predates this answer and shows a generic failure.
                 state
                     .sessions
-                    .cancel(&primary_sid, CancelReason::AppUpdateRequired, now);
+                    .cancel(primary_sid, CancelReason::AppUpdateRequired, now);
                 tracing::info!(
                     pubkey = %redact(&identity.pubkey_ss58),
                     refusal = refusal.token(),
@@ -735,7 +734,7 @@ async fn forum_login(
     // longer awaits an approval, so a replay stops at the check above, and
     // whoever holds the sid can end it anyway through the unsigned cancel.
     let door = Door::Login {
-        session: &primary_sid,
+        session: primary_sid,
     };
     let admitted = match admit_forum_identity(&state, &request, door).await {
         Ok(admitted) => admitted,
@@ -772,12 +771,11 @@ async fn forum_login(
     };
     let body = match form {
         LoginForm::Bound => {
-            let code =
-                state
-                    .sessions
-                    .approve_bound(&admitted.admission, &primary_sid, user, now)?;
+            let code = state
+                .sessions
+                .approve_bound(&admitted.admission, primary_sid, user, now)?;
             let handoff = (approach == Approach::SameDevice)
-                .then(|| handoff_url(&state.public_host, &primary_sid, &code));
+                .then(|| handoff_url(&state.public_host, primary_sid, &code));
             bound_approved_body(
                 &handle_for_client,
                 admitted.notify_slot,
@@ -788,7 +786,7 @@ async fn forum_login(
         LoginForm::Legacy => {
             state
                 .sessions
-                .approve_legacy(&admitted.admission, &primary_sid, user, now)?;
+                .approve_legacy(&admitted.admission, primary_sid, user, now)?;
             login_approved_body(&handle_for_client, admitted.notify_slot)
         }
     };
@@ -870,8 +868,8 @@ async fn paywall_standing(
             .gates
             .login
             .run(async {
-                // Approvals of one session sent together queue here, and the
-                // first "never paid" ends it: the rest read nothing.
+                // A login that ended while this approval waited for the gate
+                // reads nothing.
                 if !state.sessions.awaits_approval(session, now_unix()) {
                     return Err(AdmitError::SessionEnded);
                 }

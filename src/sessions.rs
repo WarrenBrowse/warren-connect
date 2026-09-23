@@ -233,6 +233,48 @@ pub struct SessionIds {
     pub qr_sid: String,
 }
 
+/// One approval of a login being admitted, from [`SessionStore::claim_approval`].
+///
+/// An approval reads before it decides (the subscription standing, and the
+/// staff status of the legacy form), and a wallet costs nothing to mint, so
+/// approvals of one login sent together would each buy those reads. The
+/// claim lets one through at a time. Dropping it gives the login back, also
+/// when the request is abandoned halfway.
+pub struct ApprovalClaim<'a> {
+    store: &'a SessionStore,
+    sid: String,
+}
+
+impl ApprovalClaim<'_> {
+    /// The claimed login's same-device id, whichever id the approval named.
+    #[must_use]
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl Drop for ApprovalClaim<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock still gives the login back: a panic here, while
+        // unwinding from another one, would abort the process.
+        let mut sessions = self
+            .store
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = sessions.get_mut(&self.sid) {
+            session.approving = false;
+        }
+    }
+}
+
+impl std::fmt::Debug for ApprovalClaim<'_> {
+    /// The id is a session id: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalClaim(redacted)")
+    }
+}
+
 /// What a confirm attempt did to the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmOutcome {
@@ -336,6 +378,8 @@ struct Session {
     state: State,
     /// Logins opened for this nonce, this one included.
     opens: u8,
+    /// An approval of this login is being admitted (an [`ApprovalClaim`]).
+    approving: bool,
 }
 
 impl Session {
@@ -495,6 +539,7 @@ impl SessionStore {
                 qr_sid: qr_sid.clone(),
                 state: State::Pending,
                 opens,
+                approving: false,
             },
         );
         Ok(SessionIds { sid, qr_sid })
@@ -566,6 +611,38 @@ impl SessionStore {
             return Err(AuthError::Session);
         }
         Ok((primary, Approach::CrossDevice))
+    }
+
+    /// Claims the login behind either id for one approval, saying which id
+    /// it arrived on.
+    ///
+    /// # Errors
+    /// [`AuthError::Session`] if the id matches no live login, or the login
+    /// no longer waits for an approval. [`AuthError::Forum`] while another
+    /// approval of it is being admitted: retryable, since that one may still
+    /// fail and leave the login waiting.
+    pub fn claim_approval(
+        &self,
+        sid: &str,
+        now_unix: u64,
+    ) -> Result<(ApprovalClaim<'_>, Approach), AuthError> {
+        let (primary, approach) = self.resolve(sid, now_unix)?;
+        let mut sessions = self.sessions.lock().expect("session mutex never poisoned");
+        let session = sessions.get_mut(&primary).ok_or(AuthError::Session)?;
+        if !matches!(session.state, State::Pending) {
+            return Err(AuthError::Session);
+        }
+        if session.approving {
+            return Err(AuthError::Forum);
+        }
+        session.approving = true;
+        // Released before the claim exists: its drop takes this lock.
+        drop(sessions);
+        let claim = ApprovalClaim {
+            store: self,
+            sid: primary,
+        };
+        Ok((claim, approach))
     }
 
     /// Whether the session behind either id still waits for an approval.
@@ -1255,6 +1332,42 @@ mod tests {
                 .create(format!("{tag}-{i}"), "r".into(), &browser(), now_unix)
                 .unwrap_or_else(|err| panic!("flood {tag}-{i}: {err}"));
         }
+    }
+
+    #[test]
+    fn a_login_takes_one_approval_at_a_time_and_a_dropped_claim_gives_it_back() {
+        let store = SessionStore::default();
+        let ids = open(&store, "n", &browser());
+
+        let (claim, approach) = store.claim_approval(&ids.qr_sid, 1).expect("first");
+        assert_eq!(
+            (claim.sid(), approach),
+            (ids.sid.as_str(), Approach::CrossDevice)
+        );
+        assert_eq!(
+            store.claim_approval(&ids.sid, 1).map(|_| ()),
+            Err(AuthError::Forum),
+            "a second approval meanwhile is told to retry"
+        );
+        drop(claim);
+
+        assert!(store.claim_approval(&ids.sid, 2).is_ok());
+    }
+
+    #[test]
+    fn only_a_login_waiting_for_its_approval_can_be_claimed() {
+        let store = SessionStore::default();
+        let ids = open(&store, "n", &browser());
+        store.cancel(&ids.sid, CancelReason::UserCancelled, 1);
+
+        assert_eq!(
+            store.claim_approval(&ids.sid, 2).map(|_| ()),
+            Err(AuthError::Session)
+        );
+        assert_eq!(
+            store.claim_approval("deadbeef", 2).map(|_| ()),
+            Err(AuthError::Session)
+        );
     }
 
     #[test]
