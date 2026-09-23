@@ -2016,11 +2016,19 @@ async fn attach_bind(
     let now = now_unix();
     let data = state.attach.claim_bind(&sid, now)?;
 
-    let topic = match api.topic(bind.topic_id).await {
-        Ok(topic) => topic,
-        Err(err) => {
+    // The same bulkhead as the uploads' fetch: a bind that Discourse failed
+    // is handed back for a retry, so nothing else bounds how often a held sid
+    // can make this read.
+    let topic = match state.gates.topic.run(api.topic(bind.topic_id)).await {
+        Ok(Ok(topic)) => topic,
+        Ok(Err(err)) => {
             state.attach.release_bind(&sid);
             return Err(err.into());
+        }
+        Err(GateBusy) => {
+            tracing::debug!("attach topic gate saturated");
+            state.attach.release_bind(&sid);
+            return Err(AuthError::Forum);
         }
     };
     if !topic.author_username.eq_ignore_ascii_case(&data.username) {

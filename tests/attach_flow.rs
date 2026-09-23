@@ -2988,3 +2988,55 @@ async fn a_topic_fetch_past_a_full_topic_gate_is_refused_at_once() {
         "two fetches ran; the eight queued behind them gave up after two seconds"
     );
 }
+
+#[tokio::test]
+async fn a_bind_past_a_full_topic_gate_is_refused_at_once_and_stays_retryable() {
+    // The bind is unauthenticated and a Discourse failure hands its session
+    // back for a retry, so its topic fetch shares the bulkhead of the
+    // uploads'.
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(stub_api(&url)));
+    link(&state, &key).await;
+    let pre = new_pre_sid(state.clone()).await;
+    let parked = send(
+        &state,
+        signed_attach_request(&key, &upload_body(&pre, 0), [0x20; 16]),
+    )
+    .await;
+    assert_eq!(parked.body_utf8, r#"{"status":"received"}"#);
+    *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_secs(3));
+    let in_flight: Vec<_> = (0..10u8)
+        .map(|i| {
+            let sid = state
+                .attach
+                .create(42, &a_browser(), now_unix())
+                .expect("create");
+            let request = signed_attach_request(&key, &upload_body(&sid, 42), [i; 16]);
+            let state = state.clone();
+            tokio::spawn(async move { send(&state, request).await })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while state.gates.topic.queued() < 8 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let started = std::time::Instant::now();
+
+    let turned_away = send(&state, bind_request(&pre, 42)).await;
+
+    assert_eq!(turned_away.status, 502, "{}", turned_away.body_utf8);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        read_status(state.clone(), &pre).await.body_utf8,
+        r#"{"status":"received"}"#,
+        "the parked report waits for the theme's retry"
+    );
+    for task in in_flight {
+        task.await.expect("task");
+    }
+}
