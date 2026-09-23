@@ -29,6 +29,21 @@ use warren_contract::auth::{
 
 const HANDLE_SECRET: &[u8] = b"a-test-handle-secret-32-bytes!!!";
 
+/// A point where a stub endpoint stops until the test releases it, so the
+/// test acts while a request is provably inside that call.
+#[derive(Default)]
+struct Gate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Gate {
+    async fn pass(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
 #[derive(Debug)]
 struct StubCall {
     op: String,
@@ -41,8 +56,10 @@ struct StubState {
     other_authors: Mutex<std::collections::HashMap<u64, String>>,
     /// How long the topic endpoint takes to answer, so requests overlap.
     topic_delay: Mutex<Option<std::time::Duration>>,
-    /// How long the upload takes, so a request can land mid-delivery.
-    upload_delay: Mutex<Option<std::time::Duration>>,
+    /// Holds the topic fetch until the test lets it go.
+    topic_gate: Mutex<Option<Arc<Gate>>>,
+    /// Holds the upload until the test lets it go.
+    upload_gate: Mutex<Option<Arc<Gate>>>,
     upload_ok: bool,
     /// Tags the topic already carries, echoed back by the topic endpoint.
     existing_tags: Vec<String>,
@@ -59,6 +76,10 @@ async fn stub_topic(
     let delay = *s.topic_delay.lock().expect("stub mutex");
     if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
+    }
+    let gate = s.topic_gate.lock().expect("stub mutex").clone();
+    if let Some(gate) = gate {
+        gate.pass().await;
     }
     let topic: u64 = topic_json
         .trim_end_matches(".json")
@@ -107,9 +128,9 @@ async fn stub_upload(
     State(s): State<Arc<StubState>>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let delay = *s.upload_delay.lock().expect("stub mutex");
-    if let Some(delay) = delay {
-        tokio::time::sleep(delay).await;
+    let gate = s.upload_gate.lock().expect("stub mutex").clone();
+    if let Some(gate) = gate {
+        gate.pass().await;
     }
     if !s.upload_ok {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -173,7 +194,8 @@ async fn spawn_stub_with_tag_shape(
         author: author.to_owned(),
         other_authors: Mutex::new(std::collections::HashMap::new()),
         topic_delay: Mutex::new(None),
-        upload_delay: Mutex::new(None),
+        topic_gate: Mutex::new(None),
+        upload_gate: Mutex::new(None),
         upload_ok,
         existing_tags,
         tags_as_objects,
@@ -386,9 +408,9 @@ async fn visit_attach_page(state: Arc<AppState>, topic: u64, cookie: Option<&str
 
 #[tokio::test]
 async fn another_browser_opening_the_same_topic_gets_nothing_of_the_authors_session() {
-    // A topic id is public, so anybody can open this page for any topic.
-    // Handing them the session the author's page waits on let them poll it
-    // and cancel it under the author's feet.
+    // A topic id is public, so anybody can open this page for any topic, and
+    // the sid alone polls and cancels a session: the page hands a visitor
+    // only a session of its own.
     let v = forum_vector::load();
     let key = SigningKey::from_bytes(&[7u8; 32]);
     let (url, _stub) = spawn_stub(&author_username(&key), true).await;
@@ -413,11 +435,7 @@ async fn another_browser_opening_the_same_topic_gets_nothing_of_the_authors_sess
         );
     }
     let response = router(state.clone())
-        .oneshot(
-            Request::post(format!("/v1/attach/{}/cancel", stranger.sid))
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(cancel_request(&stranger.sid))
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::OK);
@@ -476,17 +494,28 @@ async fn the_topic_attach_page_binds_its_browser_with_a_host_only_cookie() {
         ),
         "HttpOnly and host-only, and alive exactly as long as a session"
     );
-    let other_topic = visit_attach_page(state.clone(), 43, Some(&value)).await;
+    let other_topic = visit_attach_page(state, 43, Some(&value)).await;
     assert_eq!(
         other_topic.cookie(),
         Some(value),
         "a browser keeps its secret across the topics it opens"
     );
+}
+
+#[tokio::test]
+async fn an_attach_cookie_of_another_shape_binds_nothing() {
+    let (url, _stub) = spawn_stub("whoever", true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    let first = visit_attach_page(state.clone(), 42, None).await;
+
     let forged = visit_attach_page(state, 42, Some("forged")).await;
-    assert_ne!(
-        forged.sid, first.sid,
-        "a cookie of any other shape binds nothing"
-    );
+
+    assert_ne!(forged.sid, first.sid, "it fetches no session");
     assert!(
         forged.cookie().is_some_and(|fresh| fresh.len() == 64),
         "and is replaced by a secret of our own"
@@ -1091,7 +1120,7 @@ async fn a_cancel_after_the_app_delivered_leaves_the_report_to_its_bind() {
     assert_eq!(
         body_json(response).await,
         serde_json::json!({"status": "cancelled"}),
-        "the cancel answers as it always did"
+        "the answer does not say what the cancel did"
     );
     assert_answer(
         &read_status(state.clone(), &sid).await,
@@ -1114,7 +1143,8 @@ async fn a_cancel_during_the_delivery_never_turns_delivered_logs_into_an_error()
     let v = forum_vector::load();
     let key = SigningKey::from_bytes(&[7u8; 32]);
     let (url, stub) = spawn_stub(&author_username(&key), true).await;
-    *stub.upload_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_millis(1000));
+    let gate = Arc::new(Gate::default());
+    *stub.upload_gate.lock().expect("stub mutex") = Some(gate.clone());
     let state = test_state(Some(ForumApi::new(
         &url,
         "k".into(),
@@ -1129,21 +1159,19 @@ async fn a_cancel_during_the_delivery_never_turns_delivered_logs_into_an_error()
         let (state, key, sid) = (state.clone(), key.clone(), sid.clone());
         async move { upload(state, &key, &sid, 42, REPORT, [14; 16]).await }
     });
-    let mut in_flight = false;
-    for _ in 0..400 {
-        if read_status(state.clone(), &sid).await.body_utf8 == r#"{"status":"processing"}"# {
-            in_flight = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(in_flight, "the delivery reached Discourse");
+    gate.entered.notified().await;
 
     router(state.clone())
         .oneshot(cancel_request(&sid))
         .await
         .expect("infallible");
 
+    assert_answer(
+        &read_status(state.clone(), &sid).await,
+        &v.responses.attach_status.get("processing"),
+        "the cancel leaves a delivery in flight alone",
+    );
+    gate.release.notify_one();
     assert_answer(
         &delivery.await.expect("the upload task"),
         &v.responses.attach.get("attached"),
@@ -1164,7 +1192,8 @@ async fn a_cancel_landing_before_the_delivery_starts_stops_it() {
     let v = forum_vector::load();
     let key = SigningKey::from_bytes(&[7u8; 32]);
     let (url, stub) = spawn_stub(&author_username(&key), true).await;
-    *stub.topic_delay.lock().expect("stub mutex") = Some(std::time::Duration::from_millis(1000));
+    let gate = Arc::new(Gate::default());
+    *stub.topic_gate.lock().expect("stub mutex") = Some(gate.clone());
     let state = test_state(Some(ForumApi::new(
         &url,
         "k".into(),
@@ -1179,14 +1208,13 @@ async fn a_cancel_landing_before_the_delivery_starts_stops_it() {
         let (state, key, sid) = (state.clone(), key.clone(), sid.clone());
         async move { upload(state, &key, &sid, 42, REPORT, [15; 16]).await }
     });
-    // Well inside the topic fetch. A cancel that beat the upload to the store
-    // altogether would end the same way.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    gate.entered.notified().await;
 
     router(state.clone())
         .oneshot(cancel_request(&sid))
         .await
         .expect("infallible");
+    gate.release.notify_one();
 
     assert_answer(
         &delivery.await.expect("the upload task"),

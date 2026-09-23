@@ -27,7 +27,10 @@ use crate::sessions::BrowserKey;
 /// valid report, and got an expired session. A topic-bound session parks no
 /// report until that upload lands, so it costs a map entry and nothing else,
 /// and there is no reason for it to be shorter than the pre-topic one.
-pub const ATTACH_TTL_SECS: u64 = 1_800;
+///
+/// Also the attach cookie's `Max-Age`: set again on every visit, it outlives
+/// each session it binds.
+pub(crate) const ATTACH_TTL_SECS: u64 = 1_800;
 
 /// Pre-topic sessions span composing a whole report form, so they live longer.
 const ATTACH_PRE_TTL_SECS: u64 = 1_800;
@@ -130,7 +133,8 @@ struct AttachSession {
     owner: Option<BrowserKey>,
     created_unix: u64,
     done: bool,
-    /// Set when the app's upload lands, before the Discourse round-trips.
+    /// Set while the app's upload is delivered to Discourse, past the author
+    /// check: the page shows progress, and a decline leaves the session alone.
     processing: bool,
     /// A bind holds the session while it talks to Discourse.
     binding: bool,
@@ -592,8 +596,17 @@ pub fn gunzip_capped(gz: &[u8]) -> Result<String, AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::sessions::BrowserSecret;
+    use std::io::Write as _;
+
+    /// The one browser most of these tests open their pages in.
+    fn browser() -> BrowserKey {
+        BrowserSecret::parse(&"a".repeat(64)).expect("shape").key()
+    }
+
     #[test]
-    fn processing_is_a_display_hint_that_can_be_taken_back() {
+    fn a_failed_delivery_stops_showing_as_processing() {
         // Set when the delivery starts, cleared when it fails, so the page
         // never spins on work that is no longer happening.
         let store = AttachStore::default();
@@ -641,6 +654,9 @@ mod tests {
     fn a_decline_ends_only_a_session_still_waiting_for_the_upload() {
         let store = AttachStore::default();
         let waiting = store.create(42, &browser(), 0).expect("create");
+        let failed = store.create(45, &browser(), 0).expect("create");
+        store.start_delivery(&failed, 0).expect("start");
+        store.clear_processing(&failed);
         let delivering = store.create(43, &browser(), 0).expect("create");
         store.start_delivery(&delivering, 0).expect("start");
         let parked = store.create_pre(0).expect("create_pre");
@@ -648,16 +664,25 @@ mod tests {
         let done = store.create(44, &browser(), 0).expect("create");
         store.complete(&done, 0).expect("complete");
 
-        for sid in [&waiting, &delivering, &parked, &done] {
+        for sid in [&waiting, &failed, &delivering, &parked, &done] {
             store.decline(sid, 1);
         }
 
-        assert_eq!(
-            store.status(&waiting, 2).expect("status"),
-            AttachStatus::Cancelled {
-                reason: "user_cancelled".into()
-            }
-        );
+        for (sid, what) in [
+            (&waiting, "a session the app never uploaded to"),
+            (
+                &failed,
+                "a session whose delivery failed and awaits a retry",
+            ),
+        ] {
+            assert_eq!(
+                store.status(sid, 2).expect("status"),
+                AttachStatus::Cancelled {
+                    reason: "user_cancelled".into()
+                },
+                "{what}"
+            );
+        }
         assert_eq!(
             store.status(&delivering, 2).expect("status"),
             AttachStatus::Processing
@@ -671,15 +696,6 @@ mod tests {
             "the parked report is still there to bind"
         );
         assert_eq!(store.status(&done, 2).expect("status"), AttachStatus::Done);
-    }
-
-    use super::*;
-    use crate::sessions::BrowserSecret;
-    use std::io::Write as _;
-
-    /// The one browser most of these tests open their pages in.
-    fn browser() -> BrowserKey {
-        BrowserSecret::parse(&"a".repeat(64)).expect("shape").key()
     }
 
     #[test]

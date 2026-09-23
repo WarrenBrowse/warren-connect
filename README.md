@@ -24,7 +24,7 @@ Design record and runbook: `warren-core/docs/55-FORUM-DISCOURSE-SUPPORT.md`
 | `GET /v1/session/:sid/complete` | Redirect back into Discourse with the signed payload (cookie required, after the confirm) |
 | `POST /v1/session/:sid/cancel` | App-initiated decline of a sign-in still waiting for its approval |
 | `GET /handoff` | Page the app opens in its own browser after a same-device approval; the sid and the code ride in the URL fragment |
-| `GET /attach?topic=<id>` | Attach-logs page for an existing bug topic: deep link + polling. Sets the `__Host-warren_attach` cookie that binds the session to this browser: a second visit from it gets the same session back, any other browser a session of its own |
+| `GET /attach?topic=<id>` | Attach-logs page for an existing bug topic: deep link + polling. Sets the `__Host-warren_attach` cookie that binds the session to this browser: a second visit from it gets the same session back (when the browser keeps cookies), any other browser a session of its own |
 | `GET /attach?sid=<sid>` | Attach-logs page for a pre-topic session minted by `/v1/attach/new` |
 | `POST /v1/forum/attach-logs` | Wallet-signed gzipped problem report from the Warren app |
 | `POST /v1/forum/notifications` | Wallet-signed read of the caller's own forum notifications, for the app's activity panel |
