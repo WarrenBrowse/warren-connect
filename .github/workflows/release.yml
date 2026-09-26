@@ -45,7 +45,7 @@ concurrency:
 jobs:
   release:
     name: build + push image
-    runs-on: [self-hosted, linux, x64, docker, warren]
+    runs-on: [self-hosted, Linux, X64, libra-docker]
     timeout-minutes: 90
 
     steps:

@@ -24,7 +24,7 @@ jobs:
     name: fmt + clippy + test
     # Self-hosted runners: never execute fork PRs. Same-repo PRs and pushes only.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 25
     steps:
       # The integration tests replay the shared golden vectors (the public
