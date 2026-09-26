@@ -11,10 +11,13 @@ name: Release
 # shipping a fix meant compiling on the production box. Deploying is now
 # `docker compose pull` against a tag anyone can cut.
 #
-# Compile-on-runner, never inside `docker build`: the x64 pool is a Rosetta
-# container, and inside BuildKit there is no PID-1 reaper, so a rustc that
-# crashes under emulation becomes a zombie holding its GNU jobserver token and
-# cargo waits forever. Same rationale, same shape as warren-core's docker.yml.
+# Runs on a GitHub-hosted runner. The shipped artifact is a static musl binary
+# inside a distroless image, so it carries no host glibc floor.
+#
+# Compile-on-runner, never inside `docker build`: this shape dates from the
+# Rosetta x64 pool, where a rustc crashing inside BuildKit (no PID-1 reaper)
+# became a zombie holding its GNU jobserver token and cargo waited forever.
+# Same shape as warren-core's docker.yml.
 
 on:
   push:
@@ -45,7 +48,7 @@ concurrency:
 jobs:
   release:
     name: build + push image
-    runs-on: [self-hosted, Linux, X64, libra-docker]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -84,8 +87,7 @@ jobs:
         run: |
           set -eux
           rustup target add "$CARGO_TARGET"
-          # The runner's NOPASSWD sudo is scoped to apt, and the image ships
-          # with empty apt lists, so update before install.
+          # The hosted image ships no musl-gcc.
           if ! command -v musl-gcc >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends musl-tools
@@ -94,25 +96,23 @@ jobs:
       - name: Build the release binary on the runner
         run: |
           set -euo pipefail
-          # $HOME is the runner container's persistent volume, so the target dir
-          # and the cargo registry survive across runs without a cache round-trip.
-          export CARGO_TARGET_DIR="$HOME/warren-connect-target"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
 
-          # Retries only the two Rosetta failure modes that are not real errors:
-          # a crashed rustc that never returns its jobserver token (cargo then
-          # waits forever, so `timeout` kills it with 124/137), and an
-          # intermittent SIGSEGV on a random crate. A real compile error fails
-          # on the first pass.
+          # Retries only the two failure modes seen under Rosetta that are not
+          # real errors: a crashed rustc that never returns its jobserver token
+          # (cargo then waits forever, so `timeout` kills it with 124/137), and
+          # an intermittent SIGSEGV on a random crate. A real compile error
+          # fails on the first pass.
           retry_flaky() {
             for attempt in 1 2 3; do
               if timeout -k 60s 25m "$@" 2>&1 | tee /tmp/cargo-out.txt; then return 0; fi
               rc=${PIPESTATUS[0]}
               if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-                echo "::warning::cargo hung under Rosetta and was killed (attempt $attempt/3); retrying"
+                echo "::warning::cargo hung and was killed (attempt $attempt/3); retrying"
                 continue
               fi
               if grep -qE "SIGSEGV|signal: 11|signal: 4|signal: 6|Illegal instruction" /tmp/cargo-out.txt; then
-                echo "::warning::rustc crashed under Rosetta (attempt $attempt/3); retrying"
+                echo "::warning::rustc crashed (attempt $attempt/3); retrying"
                 continue
               fi
               return "$rc"

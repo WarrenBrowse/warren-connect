@@ -1,7 +1,7 @@
 name: CI
 
-# Runs exclusively on the WarrenBrowse org self-hosted runners. Do not switch
-# to a GitHub-hosted runner.
+# Runs on GitHub-hosted runners: free and unlimited for a public repo, and
+# faster than the self-hosted pools were.
 
 on:
   push:
@@ -22,9 +22,9 @@ concurrency:
 jobs:
   checks:
     name: fmt + clippy + test
-    # Self-hosted runners: never execute fork PRs. Same-repo PRs and pushes only.
+    # Same-repo PRs and pushes only, a guard kept from the self-hosted era.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       # The integration tests replay the shared golden vectors (the public
@@ -33,11 +33,10 @@ jobs:
         with:
           submodules: true
 
-      # warren-contract is a private git dependency. The ENGINE_TOKEN secret is
-      # an enrichment, never a precondition: when it is unset the step warns and
-      # falls through to the runner's own git credentials, which can fetch the
-      # dependency on their own. Failing hard on a missing secret would redden
-      # runs the runner could have completed.
+      # The WarrenBrowse git dependencies are public today. The ENGINE_TOKEN
+      # secret is an enrichment, never a precondition: when it is unset the step
+      # warns and cargo fetches them anonymously. Failing hard on a missing
+      # secret would redden runs that could have completed.
       - name: authenticate the private git dependency (best effort)
         env:
           ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN }}
@@ -45,11 +44,11 @@ jobs:
           set -euo pipefail
           echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
           if [ -z "${ENGINE_TOKEN:-}" ]; then
-            echo "::warning::ENGINE_TOKEN is unset; relying on the runner's own git credentials"
+            echo "::warning::ENGINE_TOKEN is unset; fetching the git dependencies anonymously"
             exit 0
           fi
-          # Ephemeral XDG_CONFIG_HOME so the token never lands in a persistent
-          # file on a shared runner.
+          # Ephemeral XDG_CONFIG_HOME so the token never lands in the user's
+          # git config.
           mkdir -p "$RUNNER_TEMP/gitconfig/git"
           echo "XDG_CONFIG_HOME=$RUNNER_TEMP/gitconfig" >> "$GITHUB_ENV"
           git config --file "$RUNNER_TEMP/gitconfig/git/config" \
@@ -60,16 +59,19 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Three #[sqlx::test] tests need a real Postgres (DATABASE_URL). The
-      # self-hosted runner has no Docker daemon, so a `services:` container is
-      # unavailable: run a throwaway user-owned cluster from the postgresql
-      # binaries on the runner, exactly as warren-core's CI does. Keeping the two
+      # Three #[sqlx::test] tests need a real Postgres (DATABASE_URL). Run a
+      # throwaway user-owned cluster from the postgresql binaries the runner
+      # image ships, exactly as warren-core's CI does. Keeping the two
       # identical means a runner-image drift is diagnosed once, not twice.
       - name: Start PostgreSQL for the #[sqlx::test] tests
         run: |
@@ -104,9 +106,7 @@ jobs:
 
       # This service holds the DiscourseConnect secret, the forum handle HMAC
       # key and a Discourse admin API key, so a known-vulnerable dependency is
-      # a real finding here rather than hygiene. Installed on demand: the
-      # runner image carries no cargo-deny and a docker action is unavailable
-      # (no daemon on this pool).
+      # a real finding here rather than hygiene.
       # cargo-deny's own git fetch of the advisory database failed on every
       # run of 2026-09-02 (a cached clone that could not fast-forward, then a
       # fresh clone that could not clone at all), with no code change between
@@ -115,14 +115,10 @@ jobs:
       # directory cargo-deny derives for the default database URL, and the
       # check then runs without touching the network.
       #
-      # `persist-credentials: false` is load-bearing: the clone is copied
-      # below into `~/.cargo/advisory-dbs`, a cache every WarrenBrowse
-      # workflow on this runner pool shares. With the default, the checkout
-      # leaves this job's token as `http.https://github.com/.extraheader` in
-      # the clone's `.git/config`; the token dies with the job, and the next
-      # repo whose cargo-deny fetches that cache (warren-core, 2026-09-07,
-      # six of eight arm64 runners) gets a 401 from GitHub on a PUBLIC repo
-      # and dies on "could not read Username ... terminal prompts disabled".
+      # `persist-credentials: false` keeps this job's token out of the clone's
+      # `.git/config` once it is copied into `~/.cargo/advisory-dbs`: on a
+      # persistent runner that copy outlives the token, and cargo-deny's next
+      # fetch there died on a 401 (warren-core, 2026-09-07).
       - name: Fetch the RustSec advisory database
         uses: actions/checkout@v5
         with:
@@ -131,16 +127,14 @@ jobs:
           path: advisory-db
           fetch-depth: 1
           persist-credentials: false
+      # Pinned: `--disable-fetch` needs 0.19 (an older binary answered
+      # "unexpected argument" on 2026-09-02).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.4
       - name: cargo deny (advisories, bans, licenses, sources)
         run: |
           set -euo pipefail
-          # The runner keeps ~/.cargo/bin between runs, and the copy it kept
-          # predates `--disable-fetch` (0.19 has it; the run of 2026-09-02
-          # answered "unexpected argument"). Pin the version rather than
-          # trusting whatever binary is lying around.
-          if ! cargo deny --version 2>/dev/null | grep -q '^cargo-deny 0\.19\.'; then
-            cargo install --locked cargo-deny --version 0.19.4 --force
-          fi
           cargo deny --version
           rm -rf ~/.cargo/advisory-dbs
           mkdir -p ~/.cargo/advisory-dbs
