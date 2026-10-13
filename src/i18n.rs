@@ -204,7 +204,7 @@ pub(crate) struct Strings {
 }
 
 const EN: Strings = Strings {
-    tagline: "A burrow, not footprints.",
+    tagline: "The burrow where we help each other.",
     a_tab: "Warren forum sign-in",
     a_label: "Community forum",
     a_heading: "Sign in with your Warren app",
@@ -284,7 +284,7 @@ const EN: Strings = Strings {
 };
 
 const FR: Strings = Strings {
-    tagline: "Un terrier, pas d'empreintes.",
+    tagline: "Le terrier o\u{f9} l'on s'entraide.",
     a_tab: "Connexion au forum Warren",
     a_label: "Forum communautaire",
     a_heading: "Connectez-vous avec votre application Warren",
@@ -364,7 +364,7 @@ const FR: Strings = Strings {
 };
 
 const RO: Strings = Strings {
-    tagline: "O vizuin\u{103}, nu urme.",
+    tagline: "Vizuina unde ne ajut\u{103}m unii pe al\u{21b}ii.",
     a_tab: "Autentificare pe forumul Warren",
     a_label: "Forumul comunit\u{103}\u{21b}ii",
     a_heading: "Autentific\u{103}-te cu aplica\u{21b}ia Warren",
