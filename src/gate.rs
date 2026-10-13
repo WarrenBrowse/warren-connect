@@ -195,12 +195,23 @@ struct QueuePlace<'a>(&'a AtomicUsize);
 
 impl<'a> QueuePlace<'a> {
     fn take(queued: &'a AtomicUsize, max_queued: usize) -> Option<Self> {
-        queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max_queued).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self(queued))
+        // A compare-exchange loop rather than `fetch_update`: newer toolchains
+        // deprecate that name for `try_update`, which the 1.89 MSRV lacks.
+        let mut current = queued.load(Ordering::Acquire);
+        loop {
+            if current >= max_queued {
+                return None;
+            }
+            match queued.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(queued)),
+                Err(seen) => current = seen,
+            }
+        }
     }
 }
 
