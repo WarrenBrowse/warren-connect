@@ -507,9 +507,8 @@ pub async fn username_for_external_id(
 
 /// GDPR unlink: remove the forum link for a wallet, keyed by its `external_id`
 /// (the caller derives it from the wallet, [`crate::handle::derive`]). Returns
-/// the number of rows removed. Not yet exposed by any route: the
-/// account-deletion endpoint (auth model, proof of wallet control) remains
-/// TODO, and this is the storage primitive it will call.
+/// the number of rows removed. Exposed to the wallet itself by the signed
+/// `POST /v1/forum/unlink`, where the signature is the proof of control.
 ///
 /// # Errors
 /// Propagates sqlx errors.
@@ -757,6 +756,35 @@ impl IdentityStore {
                 .as_ref()
                 .map(|staff| staff.get(username).copied())
                 .ok_or(StaffLookupError::NotWired),
+        }
+    }
+
+    /// Removes the wallet's forum link (GDPR unlink); `true` when a link
+    /// existed. The forum account and its posts stay under the pseudonym, but
+    /// nothing in this service can match that pseudonym to the wallet anymore.
+    ///
+    /// # Errors
+    /// Propagates sqlx errors from the Postgres form.
+    pub async fn delete_link(
+        &self,
+        _admitted: &Admitted,
+        external_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        match self {
+            IdentityStore::Postgres { forum, .. } => {
+                Ok(delete_link_for_external_id(forum, external_id).await? > 0)
+            }
+            IdentityStore::Memory(m) => {
+                m.forum_db
+                    .query(|| {
+                        m.links
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(external_id)
+                            .is_some()
+                    })
+                    .await
+            }
         }
     }
 

@@ -3041,3 +3041,110 @@ async fn a_legacy_approval_from_an_allowlisted_wallet_is_refused_at_once_even_wh
     assert_eq!(answer.body_utf8, r#"{"error":"app_update_required"}"#);
     statuses(logins).await;
 }
+
+// ---------------------------------------------------------------------------
+// GDPR unlink: a wallet removes its own forum link. The signature is the only
+// proof of control, as for every other wallet-signed route, and the answer
+// says nothing about any other wallet.
+// ---------------------------------------------------------------------------
+
+fn is_linked(state: &AppState, key: &ed25519_dalek::SigningKey) -> bool {
+    let forum = warren_connect::handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    memory(state)
+        .links
+        .lock()
+        .expect("mutex")
+        .contains_key(&forum.external_id)
+}
+
+#[tokio::test]
+async fn a_linked_wallet_removes_its_own_forum_link() {
+    let state = build_state(Setup::default());
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    mark_linked(&state, &key);
+
+    let answer = send(
+        &app,
+        signed_post(&key, "/v1/forum/unlink", "{}", unix_now(), [0xb1; 16]),
+    )
+    .await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body_utf8);
+    assert_eq!(answer.body_utf8, r#"{"unlinked":true}"#);
+    assert!(
+        !is_linked(&state, &key),
+        "the link row is gone: the forum handle can no longer be matched to this wallet"
+    );
+}
+
+#[tokio::test]
+async fn unlinking_a_wallet_with_no_link_answers_false_and_spends_no_nonce() {
+    let state = build_state(Setup {
+        nonce_cap: Some(4),
+        ..Setup::default()
+    });
+    let app = router(state.clone());
+
+    let answer = send(
+        &app,
+        signed_post(
+            &free_key(0xb2),
+            "/v1/forum/unlink",
+            "{}",
+            unix_now(),
+            [0xb2; 16],
+        ),
+    )
+    .await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body_utf8);
+    assert_eq!(answer.body_utf8, r#"{"unlinked":false}"#);
+    assert_eq!(
+        state.nonces.held(),
+        0,
+        "an unlinked wallet must not be able to fill the nonce store for free"
+    );
+}
+
+#[tokio::test]
+async fn unlink_refuses_an_unsigned_request() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(
+            Request::post("/v1/forum/unlink")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_replayed_unlink_is_refused() {
+    let state = build_state(Setup::default());
+    let app = router(state.clone());
+    let (key, _) = paid_signer();
+    mark_linked(&state, &key);
+    let now = unix_now();
+
+    let first = send(
+        &app,
+        signed_post(&key, "/v1/forum/unlink", "{}", now, [0xb3; 16]),
+    )
+    .await;
+    mark_linked(&state, &key);
+    let replay = send(
+        &app,
+        signed_post(&key, "/v1/forum/unlink", "{}", now, [0xb3; 16]),
+    )
+    .await;
+
+    assert_eq!(first.status, 200, "{}", first.body_utf8);
+    assert_eq!(replay.status, 401, "{}", replay.body_utf8);
+    assert!(
+        is_linked(&state, &key),
+        "a replay must not delete a link made since"
+    );
+}

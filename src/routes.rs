@@ -13,7 +13,6 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq as _;
 
 use warren_contract::auth::{HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP};
-use warren_contract::redact;
 
 use crate::attach::{self, AttachKind, AttachStatus, AttachStore};
 use crate::discourse::{self, SsoUser};
@@ -443,6 +442,11 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/v1/forum/notifications/seen",
             post(forum_notifications_seen).layer(axum::extract::DefaultBodyLimit::max(1024)),
         )
+        .route(
+            "/v1/forum/unlink",
+            // The signed body is an empty JSON object.
+            post(forum_unlink).layer(axum::extract::DefaultBodyLimit::max(1024)),
+        )
         .merge(attach_api)
         .merge(intake_api)
         .route("/transparency", get(transparency))
@@ -723,7 +727,6 @@ async fn forum_login(
                     .sessions
                     .cancel(primary_sid, CancelReason::AppUpdateRequired, now);
                 tracing::info!(
-                    pubkey = %redact(&identity.pubkey_ss58),
                     refusal = refusal.token(),
                     "forum login refused: legacy approval"
                 );
@@ -750,10 +753,7 @@ async fn forum_login(
             return Err(AuthError::SubscriptionRequired);
         }
         Err(AdmitError::Nonce) => {
-            tracing::info!(
-                pubkey = %redact(&identity.pubkey_ss58),
-                "forum login refused: nonce not admitted"
-            );
+            tracing::info!("forum login refused: nonce not admitted");
             return Err(AuthError::Nonce);
         }
         Err(AdmitError::SessionEnded) => return Err(AuthError::Session),
@@ -792,7 +792,6 @@ async fn forum_login(
     };
 
     tracing::info!(
-        pubkey = %redact(&identity.pubkey_ss58),
         form = form.token(),
         cross_device = approach == Approach::CrossDevice,
         "forum login approved"
@@ -990,7 +989,7 @@ async fn admit_forum_identity(
         paywall_standing(state, identity, door).await?
     };
     if !login_allowed(status.ever_paid, admin) {
-        tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "forum admission refused: never paid");
+        tracing::info!("forum admission refused: never paid");
         return Err(AdmitError::NeverPaid);
     }
     let admission = request
@@ -1004,9 +1003,8 @@ async fn admit_forum_identity(
         .await
         .map_err(|e| {
             // Never `%e` here: a unique-constraint violation puts the offending
-            // pubkey/handle in the Postgres error detail. Log the kind + a redacted
-            // pubkey prefix only.
-            tracing::error!(kind = ?sqlx_error_kind(&e), pubkey = %redact(&identity.pubkey_ss58), "link upsert failed");
+            // pubkey/handle in the Postgres error detail. Log the kind only.
+            tracing::error!(kind = ?sqlx_error_kind(&e), "link upsert failed");
             AdmitError::Unavailable
         })?;
     // Called only once the link is written: a link read that started before
@@ -1203,6 +1201,43 @@ async fn forum_notifications_seen(
     // No handle and no bookmark value: both identify the account.
     tracing::info!("forum notification list marked seen");
     Ok(Json(serde_json::json!({ "seen": true })).into_response())
+}
+
+/// GDPR unlink, requested by the wallet itself: removes the link between the
+/// wallet and its forum pseudonym. The signature is the only proof of control,
+/// as for every wallet-signed route; the pseudonym and its posts stay on the
+/// forum, unattributable from here on.
+///
+/// A wallet with no link answers `false` without spending a nonce, the same
+/// guard the notification routes use against a flood of free wallets.
+async fn forum_unlink(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, AuthError> {
+    let signed = extract_signed_headers(&headers)?;
+    let now = now_unix();
+    let request = verify_signed_request(&signed, "POST", "/v1/forum/unlink", &body, now)?;
+    let identity = &request.identity;
+
+    let forum = handle::derive(&state.handle_secret, &identity.pubkey);
+    if !forum_link(&state, identity, &forum).await? {
+        return Ok(Json(serde_json::json!({ "unlinked": false })).into_response());
+    }
+    let admission = request.admit(&state.nonces, now_unix())?;
+
+    let removed = state
+        .identity
+        .delete_link(&admission, &forum.external_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(kind = sqlx_error_kind(&e), "unlink: delete failed");
+            AuthError::Forum
+        })?;
+
+    // No handle and no wallet: the event itself is all an operator needs.
+    tracing::info!(removed, "forum link removed at the wallet's request");
+    Ok(Json(serde_json::json!({ "unlinked": removed })).into_response())
 }
 
 /// The broadcast forum-activity digest, in its unsigned internal form:
@@ -1495,15 +1530,11 @@ async fn forum_attach_logs(
     // live service left zero server-side trace and the incident was
     // reconstructed from Discourse's request log alone.
     let req: AttachLogsBody = serde_json::from_slice(&body).map_err(|_| {
-        tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
-            "attach-logs refused: body is not valid JSON"
-        );
+        tracing::info!("attach-logs refused: body is not valid JSON");
         AuthError::Payload
     })?;
     if req.log_gz_b64.len() > attach::MAX_LOG_GZ_B64_CHARS {
         tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
             b64_chars = req.log_gz_b64.len(),
             "attach-logs refused: base64 field over the size cap"
         );
@@ -1517,26 +1548,19 @@ async fn forum_attach_logs(
     if kind == AttachKind::PreTopic {
         admit_linked_signer(&state, identity, &forum).await?;
         let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
-            tracing::info!(
-                pubkey = %redact(&identity.pubkey_ss58),
-                "attach-logs refused: nonce not admitted"
-            );
+            tracing::info!("attach-logs refused: nonce not admitted");
         })?;
-        let (log_text, meta) = decode_report(&req.log_gz_b64, &identity.pubkey_ss58, None)?;
+        let (log_text, meta) = decode_report(&req.log_gz_b64, None)?;
         state
             .attach
             .store_received(&admission, &req.sid, &forum.username, log_text, meta, now)
             .inspect_err(|err| {
                 tracing::info!(
-                    pubkey = %redact(&identity.pubkey_ss58),
                     error = %err,
                     "attach-logs refused: the pre-topic report was not parked"
                 );
             })?;
-        tracing::info!(
-            pubkey = %redact(&identity.pubkey_ss58),
-            "pre-topic report received"
-        );
+        tracing::info!("pre-topic report received");
         return Ok((
             StatusCode::OK,
             Json(serde_json::json!({"status": "received"})),
@@ -1603,8 +1627,7 @@ async fn forum_attach_logs(
         );
     })?;
 
-    let (log_text, meta) =
-        decode_report(&req.log_gz_b64, &identity.pubkey_ss58, Some(req.topic_id))?;
+    let (log_text, meta) = decode_report(&req.log_gz_b64, Some(req.topic_id))?;
 
     // Discourse writes; the session is marked done only after all of them, so
     // a mid-flight failure leaves it retryable. A retry re-runs every write:
@@ -1658,10 +1681,7 @@ async fn admit_linked_signer(
         return Ok(());
     }
     // The wallet alone, never next to the topic an upload named.
-    tracing::info!(
-        pubkey = %redact(&identity.pubkey_ss58),
-        "attach-logs refused: upload from a wallet with no forum link"
-    );
+    tracing::info!("attach-logs refused: upload from a wallet with no forum link");
     Err(AuthError::NotAuthor)
 }
 
@@ -1734,6 +1754,16 @@ async fn notify_staff(
             ),
         )
         .await?;
+    // Best effort: the logs are delivered once the PM exists. A missing timer
+    // leaves this report for the operator's retention pass, it loses nothing.
+    let delete_at = chrono::Utc::now() + chrono::Duration::days(attach::LOG_RETENTION_DAYS);
+    if let Err(err) = api.schedule_deletion(pm_topic_id, delete_at).await {
+        tracing::warn!(
+            error = %err,
+            topic_id,
+            "logs delivered but the staff PM deletion timer could not be set"
+        );
+    }
     api.post_whisper(topic_id, &forum_api::whisper_raw(pm_topic_id))
         .await?;
     // Publish only the safe-to-publish facts (app version, OS) so the public
@@ -1780,22 +1810,15 @@ async fn notify_staff(
 /// is `None` for a report that has no topic yet.
 fn decode_report(
     log_gz_b64: &str,
-    pubkey_ss58: &str,
     topic_id: Option<u64>,
 ) -> Result<(String, attach::ReportMeta), AuthError> {
     let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, log_gz_b64)
         .map_err(|_| {
-            log_decode_refusal(
-                pubkey_ss58,
-                topic_id,
-                None,
-                "log_gz_b64 is not valid base64",
-            );
+            log_decode_refusal(topic_id, None, "log_gz_b64 is not valid base64");
             AuthError::Payload
         })?;
     let log_text = attach::gunzip_capped(&gz).inspect_err(|_| {
         log_decode_refusal(
-            pubkey_ss58,
             topic_id,
             Some(gz.len()),
             "payload does not gunzip to UTF-8 under the cap",
@@ -1816,14 +1839,13 @@ fn decode_budgeted(
     report_state: &ReportState,
     wallet: &str,
     log_gz_b64: &str,
-    signer_ss58: &str,
     now: u64,
 ) -> Result<(String, attach::ReportMeta), AuthError> {
     if let Err(err) = report_state.decode_failures.admit(wallet.to_owned(), now) {
         report_state.limiter.release(wallet);
         return Err(err);
     }
-    match decode_report(log_gz_b64, signer_ss58, None) {
+    match decode_report(log_gz_b64, None) {
         Ok(decoded) => {
             report_state.decode_failures.release(wallet);
             Ok(decoded)
@@ -1835,25 +1857,14 @@ fn decode_budgeted(
     }
 }
 
-/// Names a decode refusal by the topic when there is one and by the wallet
-/// otherwise, never both: on the topic path the author check has already
-/// tied the signer to a public topic, so the pair, even redacted, would be
-/// the wallet-to-forum link the pairwise handle exists to break. The topic
-/// alone routes the incident; the wallet alone is all a pre-topic report has.
-fn log_decode_refusal(
-    pubkey_ss58: &str,
-    topic_id: Option<u64>,
-    gz_bytes: Option<usize>,
-    reason: &str,
-) {
+/// Names a decode refusal by the topic when there is one. No log line carries
+/// the wallet, not even redacted: next to a topic it would be the
+/// wallet-to-forum link the pairwise handle exists to break, and alone it is
+/// still a stable per-user key.
+fn log_decode_refusal(topic_id: Option<u64>, gz_bytes: Option<usize>, reason: &str) {
     match topic_id {
         Some(topic_id) => tracing::info!(topic_id, gz_bytes, reason, "report refused"),
-        None => tracing::info!(
-            pubkey = %redact(pubkey_ss58),
-            gz_bytes,
-            reason,
-            "report refused"
-        ),
+        None => tracing::info!(gz_bytes, reason, "report refused"),
     }
 }
 
@@ -1894,10 +1905,9 @@ async fn forum_report(
                 tracing::debug!(error = %err, "report auth refused");
             }
         })?;
-    let identity = &request.identity;
 
     let req: crate::report::ReportRequest = serde_json::from_slice(&body).map_err(|_| {
-        tracing::info!(pubkey = %redact(&identity.pubkey_ss58), "report refused: body is not valid JSON");
+        tracing::info!("report refused: body is not valid JSON");
         AuthError::InvalidReport
     })?;
     crate::report::validate(&req)?;
@@ -1907,10 +1917,7 @@ async fn forum_report(
         .map_err(|err| match err {
             AdmitError::NeverPaid => AuthError::SubscriptionRequired,
             AdmitError::Nonce => {
-                tracing::info!(
-                    pubkey = %redact(&identity.pubkey_ss58),
-                    "report refused: nonce not admitted"
-                );
+                tracing::info!("report refused: nonce not admitted");
                 AuthError::Nonce
             }
             AdmitError::Unavailable | AdmitError::SessionEnded => AuthError::Forum,
@@ -1927,13 +1934,7 @@ async fn forum_report(
     // of a signature. Still before any write, so a broken payload costs no
     // Discourse call.
     let decoded = match req.log_gz_b64.as_deref() {
-        Some(b64) => Some(decode_budgeted(
-            report_state,
-            wallet,
-            b64,
-            &identity.pubkey_ss58,
-            now,
-        )?),
+        Some(b64) => Some(decode_budgeted(report_state, wallet, b64, now)?),
         None => None,
     };
 
@@ -1959,7 +1960,6 @@ async fn forum_report(
         // (attach-logs, bind) for this wallet: refuse rather than publish
         // under a name the derivation does not produce.
         tracing::error!(
-            pubkey = %redact(&identity.pubkey_ss58),
             "report refused: forum settled on a username other than the derived handle"
         );
         return Err(AuthError::Forum);

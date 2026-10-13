@@ -80,6 +80,11 @@ pub const MAX_LOG_GZ_B64_CHARS: usize = 16_000_000;
 /// get refused outright, which is worse for the reporter than a truncated tail.
 pub const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 
+/// How long a delivered problem report stays on the forum. The staff PM that
+/// carries the uploaded log gets a Discourse deletion timer this many days
+/// out when it is created: the published retention for deposited logs.
+pub const LOG_RETENTION_DAYS: i64 = 365;
+
 /// Attach session state visible to the polling browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachStatus {

@@ -9,8 +9,8 @@
 //!
 //! This broker is the one Warren service that sees a wallet pubkey and a
 //! forum identity in the same process, so a single unredacted log line here
-//! would rebuild exactly the link the pairwise handle exists to break. The
-//! canonical safe wrapper is `warren_contract::redact`.
+//! would rebuild exactly the link the pairwise handle exists to break. No log
+//! line names the wallet at all, not even through `warren_contract::redact`.
 //!
 //! The check runs at source level with a walkdir over `src/` so a newly
 //! added module cannot slip past it.
@@ -23,10 +23,9 @@
 /// identifier is what keeps SQL literals (`WHERE username = $1`) and route
 /// templates out of the scan.
 const FORBIDDEN_LITERAL_SUBSTRINGS: &[&str] = &[
-    // Full wallet pubkey, in either encoding. The redacted form
-    // `pubkey = %redact(&identity.pubkey_ss58)` is the only accepted one:
-    // the full value is a stable correlation key across every request of
-    // the same user.
+    // Full wallet pubkey, in either encoding: the full value is a stable
+    // correlation key across every request of the same user. The redacted
+    // prefix is refused too (`no_log_line_carries_a_wallet_even_redacted`).
     "= %identity.pubkey",
     "= ?identity.pubkey",
     "= %pubkey_ss58",
@@ -111,7 +110,7 @@ fn assert_no_forbidden_in(file: &str) {
             "source file `src/{file}` contains forbidden log-leakage substring {substr:?}. \
              warren-connect must never log a full wallet pubkey, a pairwise forum \
              identifier, a client IP, a nonce or signature, or a shared secret. \
-             Wrap the identifier in `warren_contract::redact` at the call site."
+             Leave the identifier out of the log line."
         );
     }
 }
@@ -411,4 +410,23 @@ fn the_capability_scan_rejects_each_carrier_and_keeps_a_message_that_names_one()
     }
     let clean = r#"tracing::info!("forum login cancelled: completion code attempts exhausted");"#;
     assert!(capabilities_in(clean).is_empty());
+}
+
+/// A log line carries no wallet at all, not even the redacted prefix. Eight
+/// characters of an SS58 address are a stable per-user key across lines, and
+/// the forum logs sit next to the forum identity: published retention for
+/// these logs promises no wallet in them.
+#[test]
+fn no_log_line_carries_a_wallet_even_redacted() {
+    let mut files = Vec::new();
+    collect_rs_files(std::path::Path::new("src"), "", &mut files);
+    for file in files {
+        let body = code_only(&read_module(&file));
+        for site in tracing_call_sites(&body) {
+            assert!(
+                !site.contains("redact("),
+                "src/{file} logs a redacted wallet: {site}"
+            );
+        }
+    }
 }

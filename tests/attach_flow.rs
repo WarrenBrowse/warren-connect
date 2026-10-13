@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use ed25519_dalek::SigningKey;
@@ -173,6 +173,18 @@ async fn stub_posts(
     Json(serde_json::json!({ "id": 100, "topic_id": 999 }))
 }
 
+async fn stub_timer(
+    State(s): State<Arc<StubState>>,
+    Path(topic_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    s.calls.lock().expect("stub mutex").push(StubCall {
+        op: "pm_timer".into(),
+        body: serde_json::json!({ "topic_id": topic_id, "timer": body }).to_string(),
+    });
+    Json(serde_json::json!({ "success": "OK" }))
+}
+
 async fn spawn_stub(author: &str, upload_ok: bool) -> (String, Arc<StubState>) {
     spawn_stub_tagged(author, upload_ok, Vec::new()).await
 }
@@ -211,6 +223,7 @@ async fn spawn_stub_with_tag_shape(
         .route("/t/-/{topic_id}", axum::routing::put(stub_topic_update))
         .route("/uploads.json", post(stub_upload))
         .route("/posts.json", post(stub_posts))
+        .route("/t/{topic_id}/timer.json", post(stub_timer))
         // Applied after the routes, or it covers none of them. The stub stands
         // in for Discourse, which accepts far more than axum's 2 MiB default;
         // without this the stub, not the code under test, rejects a big report.
@@ -864,7 +877,10 @@ async fn attach_logs_happy_path_uploads_pms_and_whispers() {
     {
         let calls = stub.calls.lock().expect("stub mutex");
         let ops: Vec<&str> = calls.iter().map(|c| c.op.as_str()).collect();
-        assert_eq!(ops, ["upload", "pm", "whisper", "author_pm", "tag"]);
+        assert_eq!(
+            ops,
+            ["upload", "pm", "pm_timer", "whisper", "author_pm", "tag"]
+        );
         assert!(
             calls[0].body.contains("warren-report-topic42-"),
             "upload carries the report filename"
@@ -876,10 +892,10 @@ async fn attach_logs_happy_path_uploads_pms_and_whispers() {
         assert!(calls[1].body.contains("upload://stubshorturl.log"));
         assert!(calls[1].body.contains("forum.warrenbrowse.com/t/42"));
         assert!(
-            calls[2].body.contains("forum.warrenbrowse.com/t/999"),
+            calls[3].body.contains("forum.warrenbrowse.com/t/999"),
             "whisper links the PM topic returned by Discourse"
         );
-        assert!(calls[2].body.contains("\"whisper\":\"true\""));
+        assert!(calls[3].body.contains("\"whisper\":\"true\""));
     }
 
     let response = router(state)
@@ -1432,15 +1448,23 @@ async fn pre_mode_happy_path_receives_then_binds() {
         let ops: Vec<&str> = calls.iter().map(|c| c.op.as_str()).collect();
         assert_eq!(
             ops,
-            ["upload", "pm", "whisper", "reply", "author_pm", "tag"],
+            [
+                "upload",
+                "pm",
+                "pm_timer",
+                "whisper",
+                "reply",
+                "author_pm",
+                "tag"
+            ],
             "the pre-mode REPORT carries metadata, so the public note follows"
         );
         assert!(calls[0].body.contains("warren-report-topic42-"));
         assert!(calls[0].body.contains("warren log line"));
         assert!(calls[1].body.contains("upload://stubshorturl.log"));
-        assert!(calls[2].body.contains("forum.warrenbrowse.com/t/999"));
+        assert!(calls[3].body.contains("forum.warrenbrowse.com/t/999"));
         // Values are markdown-escaped in the note; assert on chars that survive.
-        assert!(calls[3].body.contains("2026") && calls[3].body.contains("beta1"));
+        assert!(calls[4].body.contains("2026") && calls[4].body.contains("beta1"));
     }
 
     let response = router(state.clone())
@@ -2055,10 +2079,18 @@ async fn attach_with_metadata_posts_a_public_note_after_the_whisper() {
     let ops: Vec<&str> = calls.iter().map(|c| c.op.as_str()).collect();
     assert_eq!(
         ops,
-        ["upload", "pm", "whisper", "reply", "author_pm", "tag"],
+        [
+            "upload",
+            "pm",
+            "pm_timer",
+            "whisper",
+            "reply",
+            "author_pm",
+            "tag"
+        ],
         "a report carrying metadata must add one public reply"
     );
-    let reply = &calls[3].body;
+    let reply = &calls[4].body;
     assert!(reply.contains("beta1"), "public note names the version");
     assert!(reply.contains("macOS"), "public note names the os");
     assert!(
@@ -2103,7 +2135,7 @@ async fn attach_without_metadata_posts_no_public_note() {
     let ops: Vec<&str> = calls.iter().map(|c| c.op.as_str()).collect();
     assert_eq!(
         ops,
-        ["upload", "pm", "whisper", "author_pm", "tag"],
+        ["upload", "pm", "pm_timer", "whisper", "author_pm", "tag"],
         "nothing public to say"
     );
 }
@@ -3087,4 +3119,55 @@ async fn an_authors_own_uploads_spend_nothing_of_that_budget() {
     }
 
     assert_eq!(answers, [200; 11]);
+}
+
+#[tokio::test]
+async fn a_delivered_report_schedules_the_deletion_of_its_staff_pm_after_a_year() {
+    // The staff PM carries the uploaded log. Retention is 12 months
+    // (LOG_RETENTION_DAYS): Discourse deletes the PM on that timer, so the
+    // report does not outlive its purpose on the forum.
+    let key = SigningKey::from_bytes(&[18u8; 32]);
+    let (url, stub) = spawn_stub(&author_username(&key), true).await;
+    let state = test_state(Some(ForumApi::new(
+        &url,
+        "k".into(),
+        "system".into(),
+        "staff".into(),
+    )));
+    link(&state, &key).await;
+    let sid = state
+        .attach
+        .create(42, &a_browser(), now_unix())
+        .expect("create");
+    let body = serde_json::json!({
+        "sid": sid, "topic_id": 42, "log_gz_b64": gz_b64("warren log line\n"),
+    })
+    .to_string();
+    let before = chrono::Utc::now();
+    let response = router(state)
+        .oneshot(signed_attach_request(&key, &body, [38; 16]))
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = stub.calls.lock().expect("stub mutex");
+    let timer = calls
+        .iter()
+        .find(|c| c.op == "pm_timer")
+        .expect("deletion timer set on the staff PM");
+    let sent: serde_json::Value = serde_json::from_str(&timer.body).expect("json");
+    assert_eq!(
+        sent["topic_id"], "999",
+        "the timer targets the staff PM topic"
+    );
+    assert_eq!(sent["timer"]["status_type"], "delete");
+    let at = chrono::DateTime::parse_from_rfc3339(sent["timer"]["time"].as_str().expect("time"))
+        .expect("an RFC 3339 instant");
+    // The timer is sent at whole seconds, so compare within a minute.
+    let offset = (at.with_timezone(&chrono::Utc) - before).num_seconds();
+    let retention = warren_connect::attach::LOG_RETENTION_DAYS * 86_400;
+    assert!(
+        (retention - 60..=retention + 60).contains(&offset),
+        "the PM is deleted after the published log retention: {offset} s"
+    );
 }

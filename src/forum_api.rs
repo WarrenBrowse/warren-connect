@@ -547,6 +547,33 @@ impl ForumApi {
         Ok(body.topic_id)
     }
 
+    /// Sets a Discourse timer that deletes `topic_id` at `at`
+    /// (`POST /t/{id}/timer.json`, `status_type: delete`). Used on the staff
+    /// PM carrying a report, so the log leaves the forum after its retention.
+    ///
+    /// # Errors
+    /// [`ForumApiError`] on transport failure or non-success status. Callers
+    /// treat it as non-fatal: the report is already delivered.
+    pub async fn schedule_deletion(
+        &self,
+        topic_id: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ForumApiError> {
+        const OP: &str = "pm_timer";
+        let _: serde::de::IgnoredAny = self
+            .send(
+                OP,
+                self.request(reqwest::Method::POST, &format!("/t/{topic_id}/timer.json"))
+                    .json(&serde_json::json!({
+                        "time": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "status_type": "delete",
+                        "based_on_last_post": false,
+                    })),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Posts the staff-only whisper on the public topic.
     ///
     /// # Errors
