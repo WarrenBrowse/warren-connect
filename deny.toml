@@ -12,13 +12,15 @@ yanked = "warn"
 # Every entry states WHY it cannot hurt this service, and disappears the day
 # the dependency moves. Nothing is silenced by class.
 ignore = [
-    # atomic-polyfill is unmaintained (archived upstream). It arrives four
-    # levels down, through warren-contract -> warrenguard-wire -> postcard ->
-    # heapless 0.7, and exists to emulate atomics on single-core targets that
-    # lack them. This service runs on x86_64 with native atomics, so the
-    # polyfill is compiled out of the path it would take. Nothing in this
-    # repo can move it: it goes when heapless reaches 0.8 upstream.
-    { id = "RUSTSEC-2023-0089", reason = "transitive via heapless 0.7, inert on x86_64, not upgradable from this repo" },
+    # chrono is unmaintained (informational: no vulnerability, and no patched
+    # version to move to). It is a direct dependency, for clock arithmetic and
+    # two formatted dates, and sqlx is built with its `chrono` feature. Code
+    # that stops being maintained keeps doing what it does today, so nothing
+    # changes for this service until a vulnerability is reported, which would
+    # be a new advisory and would fail this check again. It leaves with the
+    # move to `time`, the migration warren-core has ahead of it for this same
+    # advisory.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability and no patched version; leaves with the move to time" },
 ]
 
 [bans]
