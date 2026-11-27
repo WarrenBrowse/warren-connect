@@ -2166,22 +2166,55 @@ async fn forum_report(
     let title = crate::report::topic_title(&req, &reference);
     let raw = crate::report::topic_raw(&req);
     let platform = req.platform.tag();
-    let topic_id = report_state
+    let created = report_state
         .topic_api
         .as_user(&admitted.forum.username)
         .create_topic(&title, &raw, report_state.category_id, &[platform])
-        .await?;
+        .await;
+    let (topic_id, sent_again) = match created {
+        Ok(topic_id) => (topic_id, false),
+        // The same report sent again, typically after the app's deadline ran
+        // out on a send the forum did file: Discourse refuses the identical
+        // first post for a few minutes. Answering the topic that exists keeps
+        // the retry from failing now and from filing a duplicate later.
+        Err(err @ forum_api::ForumApiError::Status { status: 422, .. }) => {
+            match api
+                .recent_topic_with_first_post(
+                    &admitted.forum.username,
+                    report_state.category_id,
+                    &raw,
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                )
+                .await
+            {
+                Ok(Some(topic_id)) => (topic_id, true),
+                Ok(None) => return Err(err.into()),
+                Err(lookup) => {
+                    tracing::warn!(error = %lookup, "report duplicate lookup failed");
+                    return Err(err.into());
+                }
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     // From here the topic exists: a staff-side failure is reported, never
     // answered as an error (the client would file the same topic twice).
     let logs = match uploaded {
         None => "none",
         Some((upload, meta)) => {
-            let topic = forum_api::TopicInfo {
+            let fresh = forum_api::TopicInfo {
                 title: title.clone(),
                 author_username: admitted.forum.username.clone(),
                 tags: vec![platform.to_owned()],
                 locked: false,
+            };
+            // A topic filed earlier carries its own title and whatever tags
+            // the staff added since, which the tag update must keep.
+            let topic = if sent_again {
+                api.topic(topic_id).await.unwrap_or(fresh)
+            } else {
+                fresh
             };
             // The client-declared facts fill in for a report whose header
             // carried none, so the public note is never empty for lack of
@@ -2224,6 +2257,7 @@ async fn forum_report(
         area = req.area.map_or("none", crate::report::Area::short),
         logs,
         sign_in = login_url.is_some(),
+        sent_again,
         "in-app report topic created"
     );
     let mut body = identity_fields(&admitted.forum.username, admitted.notify_slot);

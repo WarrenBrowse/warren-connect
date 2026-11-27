@@ -263,6 +263,46 @@ pub fn public_note_raw(version: Option<&str>, os: Option<&str>) -> Option<String
 
 /// Coarse operation name of the topic fetch, in errors and traces.
 const TOPIC_OP: &str = "topic_fetch";
+const OWN_TOPICS_OP: &str = "own_topics";
+const FIRST_POST_OP: &str = "first_post";
+
+/// How long after its first send a report sent again can match the topic
+/// that send created. Discourse refuses the identical post for
+/// `unique_posts_mins` (5 on this forum); the margin covers that setting
+/// being raised, and stays short enough that an old topic with the same
+/// words is never taken for this one.
+pub const DUPLICATE_WINDOW_SECS: i64 = 15 * 60;
+
+/// How many of the reporter's newest topics the duplicate lookup reads.
+const DUPLICATE_LOOKUP_TOPICS: usize = 5;
+
+/// Every field is read leniently: the list is Discourse's to reshape, and a
+/// topic missing a field is just not a candidate.
+#[derive(Deserialize)]
+struct OwnTopicsJson {
+    topic_list: OwnTopicList,
+}
+
+#[derive(Deserialize)]
+struct OwnTopicList {
+    #[serde(default)]
+    topics: Vec<OwnTopicJson>,
+}
+
+#[derive(Deserialize)]
+struct OwnTopicJson {
+    id: u64,
+    #[serde(default)]
+    category_id: Option<u64>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FirstPostJson {
+    #[serde(default)]
+    raw: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct CreatedBy {
@@ -662,6 +702,65 @@ impl ForumApi {
             )
             .await?;
         Ok(body.topic_id)
+    }
+
+    /// The topic `username` opened in `category_id` within the last
+    /// [`DUPLICATE_WINDOW_SECS`] before `now_unix` whose first post is `raw`,
+    /// among their newest [`DUPLICATE_LOOKUP_TOPICS`].
+    ///
+    /// Discourse refuses a first post identical to one the same account made
+    /// minutes before (`unique_posts_mins`) with a 422 whose reason is written
+    /// in the user's locale, so the refusal itself cannot be read: this is
+    /// how a report sent twice finds the topic its first send created. Reads
+    /// need a key allowed to read topics and posts (the system key; the report
+    /// key is scoped to `topics:write`).
+    ///
+    /// # Errors
+    /// [`ForumApiError`] on transport failure, non-success status, or a
+    /// malformed body.
+    pub async fn recent_topic_with_first_post(
+        &self,
+        username: &str,
+        category_id: u64,
+        raw: &str,
+        now_unix: i64,
+    ) -> Result<Option<u64>, ForumApiError> {
+        let list: OwnTopicsJson = self
+            .send(
+                OWN_TOPICS_OP,
+                self.request(
+                    reqwest::Method::GET,
+                    &format!("/topics/created-by/{}.json", urlencoding::encode(username)),
+                ),
+            )
+            .await?;
+        let candidates = list
+            .topic_list
+            .topics
+            .into_iter()
+            .take(DUPLICATE_LOOKUP_TOPICS)
+            .filter(|t| t.category_id == Some(category_id))
+            .filter(|t| {
+                t.created_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| (now_unix - at.timestamp()) <= DUPLICATE_WINDOW_SECS)
+            });
+        for topic in candidates {
+            let post: FirstPostJson = self
+                .send(
+                    FIRST_POST_OP,
+                    self.request(
+                        reqwest::Method::GET,
+                        &format!("/posts/by_number/{}/1.json", topic.id),
+                    ),
+                )
+                .await?;
+            if post.raw.as_deref().map(str::trim) == Some(raw.trim()) {
+                return Ok(Some(topic.id));
+            }
+        }
+        Ok(None)
     }
 
     async fn send<T: serde::de::DeserializeOwned>(

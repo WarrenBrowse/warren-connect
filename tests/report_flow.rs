@@ -52,6 +52,18 @@ struct StubState {
     upload_fails: bool,
     /// Makes the topic creation answer 500.
     topic_fails: bool,
+    /// Makes the topic creation answer 422 the way Discourse refuses a first
+    /// post identical to one the same account made minutes ago.
+    topic_too_similar: bool,
+    /// The topics `GET /topics/created-by/{username}.json` lists, newest
+    /// first: id, category, age in seconds.
+    own_topics: Vec<(u64, u64, i64)>,
+    /// Makes `GET /posts/by_number/{id}/1.json` serve the raw of the last
+    /// topic creation, as the reporter's earlier identical topic carries;
+    /// otherwise it serves some other text.
+    first_post_is_the_posted_raw: bool,
+    /// The raw of the last topic creation the stub saw.
+    posted_raw: Mutex<Option<String>>,
     /// Makes the whisper answer 500, after the topic exists.
     whisper_fails: bool,
     /// The topic `GET /t/{id}.json` serves: author and closed flag. `None`
@@ -139,6 +151,22 @@ async fn stub_posts(
         api_username: api_username(&headers),
         body: body.clone(),
     });
+    if op == "topic_create" {
+        *s.posted_raw.lock().expect("stub mutex") =
+            body.get("raw").and_then(|v| v.as_str()).map(str::to_owned);
+    }
+    if op == "topic_create" && s.topic_too_similar {
+        // The live answer. Discourse names the reason in the acting user's
+        // locale, so nothing may depend on this text.
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "action": "create_post",
+                "errors": ["Body is too similar to what you recently posted"],
+            })),
+        )
+            .into_response();
+    }
     if op == "topic_create" && s.topic_fails {
         return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
     }
@@ -182,6 +210,70 @@ async fn stub_topic(State(s): State<Arc<StubState>>) -> axum::response::Response
     }
 }
 
+async fn stub_own_topics(
+    State(s): State<Arc<StubState>>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    s.calls.lock().expect("stub mutex").push(StubCall {
+        op: "own_topics".into(),
+        api_username: api_username(&headers),
+        body: serde_json::json!({
+            "api_key": headers.get("Api-Key").and_then(|v| v.to_str().ok()),
+        }),
+    });
+    let now = chrono::Utc::now();
+    // The live shape, trimmed to the fields a reader could need.
+    let topics: Vec<serde_json::Value> = s
+        .own_topics
+        .iter()
+        .map(|(id, category, age)| {
+            serde_json::json!({
+                "id": id,
+                "title": "[macOS] It drops every hour. #abc123",
+                "category_id": category,
+                "created_at": (now - chrono::Duration::seconds(*age))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "closed": false,
+                "archived": false,
+                "visible": true,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "users": [],
+        "topic_list": {"can_create_topic": true, "per_page": 30, "topics": topics},
+    }))
+}
+
+async fn stub_first_post(
+    State(s): State<Arc<StubState>>,
+    headers: HeaderMap,
+    axum::extract::Path((topic_id, _)): axum::extract::Path<(u64, String)>,
+) -> Json<serde_json::Value> {
+    s.calls.lock().expect("stub mutex").push(StubCall {
+        op: "first_post".into(),
+        api_username: api_username(&headers),
+        body: serde_json::json!({"topic_id": topic_id}),
+    });
+    let raw = if s.first_post_is_the_posted_raw {
+        s.posted_raw
+            .lock()
+            .expect("stub mutex")
+            .clone()
+            .unwrap_or_default()
+    } else {
+        "### Your device\nmacos\n\n### What happened?\n> Something else entirely.".to_owned()
+    };
+    // Discourse keeps the raw as posted, minus surrounding whitespace.
+    Json(serde_json::json!({
+        "id": 9000 + topic_id,
+        "topic_id": topic_id,
+        "post_number": 1,
+        "raw": raw.trim(),
+        "cooked": "<p>...</p>",
+    }))
+}
+
 async fn spawn_stub(state: Arc<StubState>) -> String {
     let app = axum::Router::new()
         .route("/admin/users/sync_sso", post(stub_sync_sso))
@@ -189,6 +281,8 @@ async fn spawn_stub(state: Arc<StubState>) -> String {
         .route("/posts.json", post(stub_posts))
         .route("/t/-/{topic_id}", axum::routing::put(stub_topic_update))
         .route("/t/{topic_json}", get(stub_topic))
+        .route("/topics/created-by/{user_json}", get(stub_own_topics))
+        .route("/posts/by_number/{topic_id}/{n_json}", get(stub_first_post))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -694,6 +788,125 @@ async fn a_failed_upload_creates_no_topic_and_a_failed_topic_is_a_502() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(ops(&stub), vec!["sync_sso", "topic_create"]);
+}
+
+#[tokio::test]
+async fn an_identical_report_the_forum_refuses_answers_the_topic_it_already_filed() {
+    // The app's deadline ran out on a report the forum did file, and the
+    // reporter sent it again: Discourse refuses the identical first post for
+    // a few minutes, and the answer is the topic that exists.
+    let key = signer(41);
+    let handle = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username;
+    let stub = Arc::new(StubState {
+        topic_too_similar: true,
+        own_topics: vec![(4300, 7, 30), (4242, 13, 90)],
+        first_post_is_the_posted_raw: true,
+        topic: Some((handle.clone(), false)),
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 3);
+    let app = warren_connect::routes::router(state);
+
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &report_body(Some(REPORT)),
+            [41; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], "created");
+    assert_eq!(body["topic_id"], 4242);
+    assert_eq!(body["topic_url"], "https://forum.warrenbrowse.com/t/4242");
+    assert_eq!(body["logs"], "attached");
+    assert_eq!(
+        ops(&stub),
+        vec![
+            "sync_sso",
+            "upload",
+            "topic_create",
+            "own_topics",
+            "first_post",
+            "topic_fetch",
+            "pm",
+            "whisper",
+            "reply",
+            "author_pm",
+            "tag"
+        ],
+        "only the topic in the reports category is read, and the new logs reach it"
+    );
+    let calls = stub.calls.lock().expect("stub mutex");
+    assert_eq!(
+        calls[3].body["api_key"], "system-key",
+        "the report key may only write topics: the lookup reads with the system key"
+    );
+    assert_eq!(calls[4].body["topic_id"], 4242);
+    assert_eq!(calls[7].body["topic_id"], 4242, "the whisper lands on it");
+}
+
+#[tokio::test]
+async fn a_refused_topic_with_no_identical_recent_one_stays_a_502() {
+    let key = signer(42);
+    let stub = Arc::new(StubState {
+        topic_too_similar: true,
+        own_topics: vec![(4242, 13, 90)],
+        first_post_is_the_posted_raw: false,
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 3);
+    let app = warren_connect::routes::router(state);
+
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &report_body(None),
+            [42; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        ops(&stub),
+        vec!["sync_sso", "topic_create", "own_topics", "first_post"]
+    );
+}
+
+#[tokio::test]
+async fn an_identical_topic_older_than_the_forums_window_is_not_answered() {
+    // Discourse only refuses a duplicate posted within minutes, so an old
+    // topic with the same words cannot be the one this refusal is about.
+    let key = signer(43);
+    let stub = Arc::new(StubState {
+        topic_too_similar: true,
+        own_topics: vec![(4242, 13, 2 * 3_600)],
+        first_post_is_the_posted_raw: true,
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 3);
+    let app = warren_connect::routes::router(state);
+
+    let response = app
+        .oneshot(signed_report(
+            &key,
+            &report_body(None),
+            [43; 16],
+            now_unix(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(ops(&stub), vec!["sync_sso", "topic_create", "own_topics"]);
 }
 
 #[tokio::test]
