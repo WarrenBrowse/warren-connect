@@ -1575,11 +1575,21 @@ fn report_login_next(topic_id: u64) -> String {
 #[derive(Deserialize)]
 struct RedeemBody {
     token: String,
+    /// Absent from a page served before the page could ask by name, whose
+    /// one redeem always came with the reader's go.
+    #[serde(default = "confirmed_intent")]
+    intent: crate::report_login::Intent,
+}
+
+fn confirmed_intent() -> crate::report_login::Intent {
+    crate::report_login::Intent::Confirmed
 }
 
 /// Trades a report's login ticket for the binding cookie the forum round
-/// trip presents at `/sso`. A malformed body, an unknown ticket, an expired
-/// one and a spent one all answer `expired`.
+/// trip presents at `/sso`, or, when the page must ask first (see
+/// [`crate::report_login::Intent`]), answers the account the ticket signs in
+/// as and leaves it live. A malformed body, an unknown ticket, an expired one
+/// and a spent one all answer `expired`.
 ///
 /// Anything but the page's own same-origin JSON fetch answers `cross_site`
 /// and spends neither the ticket nor the redeem budget.
@@ -1595,14 +1605,29 @@ async fn report_login_redeem(
     }
     let now = now_unix();
     report.logins.redeems.admit((), now)?;
-    let login = serde_json::from_slice::<RedeemBody>(&body)
-        .ok()
-        .and_then(|body| report.logins.redeem(&body.token, now))
-        .ok_or_else(|| {
+    let redeemed = serde_json::from_slice::<RedeemBody>(&body)
+        .map_or(crate::report_login::Redeem::Expired, |body| {
+            report.logins.redeem(&body.token, body.intent, now)
+        });
+    let login = match redeemed {
+        crate::report_login::Redeem::SignedIn(login) => login,
+        crate::report_login::Redeem::Confirm { handle, topic_id } => {
+            let mut response = Json(serde_json::json!({
+                "confirm": { "handle": handle, "topic_id": topic_id }
+            }))
+            .into_response();
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            return Ok(response);
+        }
+        crate::report_login::Redeem::Expired => {
             // Debug: the route is public, an info line per guess amplifies.
             tracing::debug!("report sign-in refused: ticket unknown, expired or used");
-            AuthError::LoginTicketExpired
-        })?;
+            return Err(AuthError::LoginTicketExpired);
+        }
+    };
     let next = report_login_next(login.topic_id);
     let secret = report.logins.park(login, now);
     let mut response = Json(serde_json::json!({ "next": next })).into_response();

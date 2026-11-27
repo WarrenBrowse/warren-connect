@@ -162,6 +162,9 @@ pub(crate) struct Strings {
     pub(crate) r_working: &'static str,
     /// Shown with the button when a web page, not the app, opened the link.
     pub(crate) r_confirm: &'static str,
+    /// Asks before signing in, by the account's name: `{handle}` and
+    /// `{topic}` are filled in by the page's script, as text.
+    pub(crate) r_confirm_as: &'static str,
     pub(crate) r_continue: &'static str,
     pub(crate) r_expired_heading: &'static str,
     pub(crate) r_expired: &'static str,
@@ -259,6 +262,7 @@ const EN: Strings = Strings {
     r_heading: "Opening your report",
     r_working: "Signing you in to the forum\u{2026}",
     r_confirm: "You opened a sign-in link for a bug report. Continue only if you filed it from the Warren app on this device.",
+    r_confirm_as: "This link signs you in to the forum as {handle}, on report #{topic}. Continue only if your Warren app just showed you this name, under \u{201c}Posted as\u{201d}. Otherwise close this page: it would sign you in to someone else\u{2019}s account.",
     r_continue: "Continue to your report",
     r_expired_heading: "This sign-in link has expired",
     r_expired: "You can still read your report on the forum. Select Log In there to reply.",
@@ -347,6 +351,7 @@ const FR: Strings = Strings {
     r_heading: "Ouverture de votre signalement",
     r_working: "Connexion au forum en cours\u{2026}",
     r_confirm: "Vous avez ouvert un lien de connexion pour un signalement de bug. Continuez seulement si vous l'avez envoy\u{e9} depuis l'application Warren sur cet appareil.",
+    r_confirm_as: "Ce lien vous connecte au forum en tant que {handle}, sur le signalement n\u{b0}{topic}. Continuez seulement si votre application Warren vient de vous afficher ce nom, apr\u{e8}s \u{ab}\u{a0}Publi\u{e9} en tant que\u{a0}\u{bb}. Sinon, fermez cette page\u{a0}: elle vous connecterait au compte de quelqu\u{2019}un d\u{2019}autre.",
     r_continue: "Continuer vers votre signalement",
     r_expired_heading: "Ce lien de connexion a expir\u{e9}",
     r_expired: "Vous pouvez toujours lire votre signalement sur le forum. S\u{e9}lectionnez Se connecter pour y r\u{e9}pondre.",
@@ -435,6 +440,7 @@ const RO: Strings = Strings {
     r_heading: "Se deschide raportul t\u{103}u",
     r_working: "Te autentific\u{103}m pe forum\u{2026}",
     r_confirm: "Ai deschis un link de autentificare pentru un raport de eroare. Continu\u{103} doar dac\u{103} l-ai trimis din aplica\u{21b}ia Warren de pe acest dispozitiv.",
+    r_confirm_as: "Acest link te autentific\u{103} pe forum ca {handle}, pe raportul #{topic}. Continu\u{103} doar dac\u{103} aplica\u{21b}ia Warren tocmai \u{21b}i-a ar\u{103}tat acest nume, dup\u{103} \u{201e}Publicat ca\u{201d}. Altfel, \u{ee}nchide aceast\u{103} pagin\u{103}: te-ar autentifica \u{ee}n contul altcuiva.",
     r_continue: "Continu\u{103} spre raportul t\u{103}u",
     r_expired_heading: "Acest link de autentificare a expirat",
     r_expired: "Po\u{21b}i citi \u{ee}n continuare raportul pe forum. Apas\u{103} Autentificare acolo pentru a r\u{103}spunde.",

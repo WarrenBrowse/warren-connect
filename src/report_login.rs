@@ -26,6 +26,15 @@ use crate::sessions::{BrowserKey, BrowserSecret};
 /// the report answers, so two minutes covers a slow browser start.
 pub const TICKET_TTL_SECS: u64 = 120;
 
+/// Seconds after its issue during which a ticket the page opened by itself
+/// signs in with no question. The app opens the browser the moment the
+/// report answers (about a second, measured on the live forum on
+/// 2026-11-27), and a cold browser start stays well inside this. A link
+/// opened later went through someone's hands: a chat app hands a link to the
+/// browser exactly the way the app does, so nothing else tells an attacker's
+/// own link, sent to a victim, from the reporter's.
+pub const AUTO_SIGN_IN_SECS: u64 = 20;
+
 /// Seconds between the redeem and the forum's round trip back to `/sso`,
 /// which is two redirects in the same browser.
 pub const PENDING_TTL_SECS: u64 = 60;
@@ -79,6 +88,43 @@ fn ticket_key(token: &str) -> Option<[u8; 32]> {
     well_formed.then(|| Sha256::digest(token.as_bytes()).into())
 }
 
+/// What the report-login page asks of a ticket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Intent {
+    /// The page opened by itself: sign in if the ticket is fresh, otherwise
+    /// name the account and wait for the reader.
+    Auto,
+    /// Name the account without spending the ticket, for a page that asks
+    /// before it signs in.
+    Peek,
+    /// The reader confirmed: sign in.
+    Confirmed,
+}
+
+/// The answer to a redeem.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Redeem {
+    /// The ticket is spent; the browser signs in as this login.
+    SignedIn(ReportLogin),
+    /// The ticket is still live, and the reader decides: the forum account
+    /// it signs in as, which the app showed under "Posted as".
+    Confirm {
+        /// The reporter's forum username.
+        handle: String,
+        /// The topic the sign-in lands on.
+        topic_id: u64,
+    },
+    /// Malformed, unknown, expired or already used: the four answer the same.
+    Expired,
+}
+
+/// A live ticket and the time it was issued.
+struct Issued {
+    login: ReportLogin,
+    issued_at: u64,
+}
+
 /// What a ticket signs in as, exactly as the report built it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportLogin {
@@ -120,23 +166,34 @@ impl<T> Bounded<T> {
         });
     }
 
-    /// Removes the entry under `key` and returns it while it is live. Every
-    /// slot is compared, in constant time, whatever matches.
-    fn take(&mut self, key: &[u8; 32], now: u64) -> Option<T> {
+    /// The index of the entry under `key`. Every slot is compared, in
+    /// constant time, whatever matches.
+    fn find(&self, key: &[u8; 32]) -> Option<usize> {
         let mut found = None;
         for (index, slot) in self.slots.iter().enumerate() {
             if bool::from(slot.key.ct_eq(key)) {
                 found = Some(index);
             }
         }
-        let slot = self.slots.remove(found?);
+        found
+    }
+
+    /// The entry under `key` while it is live, left in place.
+    fn get(&self, key: &[u8; 32], now: u64) -> Option<&T> {
+        let slot = &self.slots[self.find(key)?];
+        (slot.expires_at > now).then_some(&slot.value)
+    }
+
+    /// Removes the entry under `key` and returns it while it is live.
+    fn take(&mut self, key: &[u8; 32], now: u64) -> Option<T> {
+        let slot = self.slots.remove(self.find(key)?);
         (slot.expires_at > now).then_some(slot.value)
     }
 }
 
 /// The two single-use stores of the report sign-in.
 pub struct ReportLoginStore {
-    tickets: Mutex<Bounded<ReportLogin>>,
+    tickets: Mutex<Bounded<Issued>>,
     pending: Mutex<Bounded<ReportLogin>>,
     /// Global budget of `POST /v1/report-login`. Never keyed by a client
     /// address: the stack pins `X-Forwarded-For`, and the route is public.
@@ -162,18 +219,45 @@ impl ReportLoginStore {
         self.tickets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, now + TICKET_TTL_SECS, login, now);
+            .insert(
+                key,
+                now + TICKET_TTL_SECS,
+                Issued {
+                    login,
+                    issued_at: now,
+                },
+                now,
+            );
         ticket
     }
 
-    /// Consumes the ticket `token`. `None` for a token that is malformed,
-    /// unknown, expired or already used: the four answer the same.
-    pub fn redeem(&self, token: &str, now: u64) -> Option<ReportLogin> {
-        let key = ticket_key(token)?;
-        self.tickets
+    /// Answers the page's `intent` for the ticket `token`: spends it and
+    /// signs in, or names the account and leaves it live (see [`Intent`]).
+    pub fn redeem(&self, token: &str, intent: Intent, now: u64) -> Redeem {
+        let Some(key) = ticket_key(token) else {
+            return Redeem::Expired;
+        };
+        let mut tickets = self
+            .tickets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(issued) = tickets.get(&key, now) else {
+            return Redeem::Expired;
+        };
+        let fresh = now.saturating_sub(issued.issued_at) <= AUTO_SIGN_IN_SECS;
+        match intent {
+            Intent::Confirmed => {}
+            Intent::Auto if fresh => {}
+            Intent::Auto | Intent::Peek => {
+                return Redeem::Confirm {
+                    handle: issued.login.user.username.clone(),
+                    topic_id: issued.login.topic_id,
+                };
+            }
+        }
+        tickets
             .take(&key, now)
+            .map_or(Redeem::Expired, |issued| Redeem::SignedIn(issued.login))
     }
 
     /// Parks a redeemed login for the browser's round trip through the
@@ -236,30 +320,49 @@ mod tests {
     fn a_ticket_redeems_once() {
         let store = ReportLoginStore::default();
         let ticket = store.issue(login(42), 1_000);
-        assert_eq!(store.redeem(ticket.as_str(), 1_001), Some(login(42)));
-        assert_eq!(store.redeem(ticket.as_str(), 1_001), None, "single use");
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Confirmed, 1_001),
+            Redeem::SignedIn(login(42))
+        );
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Confirmed, 1_001),
+            Redeem::Expired,
+            "single use"
+        );
     }
 
     #[test]
     fn a_ticket_expires_after_its_ttl() {
         let store = ReportLoginStore::default();
         let live = store.issue(login(1), 1_000);
-        assert!(
-            store
-                .redeem(live.as_str(), 1_000 + TICKET_TTL_SECS - 1)
-                .is_some()
+        assert_eq!(
+            store.redeem(
+                live.as_str(),
+                Intent::Confirmed,
+                1_000 + TICKET_TTL_SECS - 1
+            ),
+            Redeem::SignedIn(login(1))
         );
         let stale = store.issue(login(2), 1_000);
-        assert_eq!(store.redeem(stale.as_str(), 1_000 + TICKET_TTL_SECS), None);
+        assert_eq!(
+            store.redeem(stale.as_str(), Intent::Confirmed, 1_000 + TICKET_TTL_SECS),
+            Redeem::Expired
+        );
     }
 
     #[test]
     fn an_unknown_or_malformed_token_redeems_nothing() {
         let store = ReportLoginStore::default();
         let _issued = store.issue(login(1), 1_000);
-        assert_eq!(store.redeem(&"A".repeat(TICKET_CHARS), 1_001), None);
-        assert_eq!(store.redeem("short", 1_001), None);
-        assert_eq!(store.redeem(&"+".repeat(TICKET_CHARS), 1_001), None);
+        for token in [
+            "A".repeat(TICKET_CHARS),
+            "short".into(),
+            "+".repeat(TICKET_CHARS),
+        ] {
+            for intent in [Intent::Auto, Intent::Peek, Intent::Confirmed] {
+                assert_eq!(store.redeem(&token, intent, 1_001), Redeem::Expired);
+            }
+        }
     }
 
     #[test]
@@ -270,8 +373,80 @@ mod tests {
         for topic in 2..=MAX_ENTRIES as u64 {
             let _ = store.issue(login(topic), 1_000);
         }
-        assert_eq!(store.redeem(oldest.as_str(), 1_001), None);
-        assert_eq!(store.redeem(second.as_str(), 1_001), Some(login(1)));
+        assert_eq!(
+            store.redeem(oldest.as_str(), Intent::Confirmed, 1_001),
+            Redeem::Expired
+        );
+        assert_eq!(
+            store.redeem(second.as_str(), Intent::Confirmed, 1_001),
+            Redeem::SignedIn(login(1))
+        );
+    }
+
+    #[test]
+    fn an_auto_redeem_signs_in_while_the_ticket_is_fresh() {
+        // The app opens the browser the moment the report answers.
+        let store = ReportLoginStore::default();
+        let ticket = store.issue(login(5), 1_000);
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Auto, 1_000 + AUTO_SIGN_IN_SECS),
+            Redeem::SignedIn(login(5))
+        );
+    }
+
+    #[test]
+    fn an_auto_redeem_of_an_older_ticket_names_the_account_and_spends_nothing() {
+        // A link that took longer than a browser start to be opened went
+        // through someone's hands: a chat app opens it exactly the way the
+        // app does, so the reader is asked, by the account's name.
+        let store = ReportLoginStore::default();
+        let ticket = store.issue(login(6), 1_000);
+        let late = 1_000 + AUTO_SIGN_IN_SECS + 1;
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Auto, late),
+            Redeem::Confirm {
+                handle: "kobal-nisop-tadir".into(),
+                topic_id: 6
+            }
+        );
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Confirmed, late),
+            Redeem::SignedIn(login(6)),
+            "the ticket stayed live for the confirmation"
+        );
+    }
+
+    #[test]
+    fn a_peek_names_the_account_and_never_spends_the_ticket() {
+        let store = ReportLoginStore::default();
+        let ticket = store.issue(login(8), 1_000);
+        for _ in 0..2 {
+            assert_eq!(
+                store.redeem(ticket.as_str(), Intent::Peek, 1_001),
+                Redeem::Confirm {
+                    handle: "kobal-nisop-tadir".into(),
+                    topic_id: 8
+                }
+            );
+        }
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Confirmed, 1_001),
+            Redeem::SignedIn(login(8))
+        );
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Peek, 1_001),
+            Redeem::Expired
+        );
+    }
+
+    #[test]
+    fn a_peek_at_an_expired_ticket_names_nothing() {
+        let store = ReportLoginStore::default();
+        let ticket = store.issue(login(9), 1_000);
+        assert_eq!(
+            store.redeem(ticket.as_str(), Intent::Peek, 1_000 + TICKET_TTL_SECS),
+            Redeem::Expired
+        );
     }
 
     #[test]

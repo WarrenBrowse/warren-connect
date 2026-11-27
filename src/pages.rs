@@ -554,16 +554,19 @@ pub enum ReportLoginMode {
 /// gets a link to their topic, signed out, the topic checked as digits so the
 /// fragment cannot point the link anywhere else.
 ///
-/// The redeem spends the ticket before the page decides what to show, so a
-/// page that ends on the expired state (cookies blocked, a refused redeem)
-/// never leaves a live ticket behind it. In [`ReportLoginMode::Confirm`] the
-/// ticket is spent at the click.
+/// In [`ReportLoginMode::Auto`] the page asks to sign in at once, which the
+/// server grants only while the ticket is as fresh as an app-opened browser
+/// makes it; past that, and always in [`ReportLoginMode::Confirm`], the
+/// server names the account the link signs in as (the name the app showed
+/// under "Posted as") and the ticket is spent at the reader's click. A page
+/// that ends on the expired state after a redeem (cookies blocked, a refused
+/// redeem) never leaves a live ticket behind it.
 #[must_use]
 pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> String {
     let s = lang.strings();
-    let (mode_attr, state, confirm_hidden) = match mode {
-        ReportLoginMode::Auto => ("auto", s.r_working, " hidden"),
-        ReportLoginMode::Confirm => ("confirm", s.r_confirm, ""),
+    let (mode_attr, state) = match mode {
+        ReportLoginMode::Auto => ("auto", s.r_working),
+        ReportLoginMode::Confirm => ("confirm", s.r_confirm),
     };
     format!(
         r##"<!doctype html>
@@ -586,8 +589,8 @@ pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> Stri
   <span class="brand">Warren</span>
   <div class="spark">&#10022;</div>
   <h1 id="heading" data-expired="{expired_heading}">{heading}</h1>
-  <p id="state" aria-live="polite" data-expired="{expired}" data-working="{working}">{state}</p>
-  <p id="confirm"{confirm_hidden}><button class="button" id="continue" type="button">{continue_label}</button></p>
+  <p id="state" aria-live="polite" data-expired="{expired}" data-working="{working}" data-confirm-as="{confirm_as}">{state}</p>
+  <p id="confirm" hidden><button class="button" id="continue" type="button">{continue_label}</button></p>
   <p id="fallback" hidden><a class="button" id="topic" href="{forum}/">{open_topic}</a></p>
   <hr class="rule">
   <p class="tagline">{tagline}</p>
@@ -610,22 +613,42 @@ pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> Stri
     }}
     document.getElementById('fallback').hidden = false;
   }};
-  // The ticket is spent first, whatever is shown after: a page that gave up
-  // before its request would leave it redeemable until it expires.
-  const redeem = async () => {{
+  // The account by name, as text, then the reader's go spends the ticket.
+  const ask = (c) => {{
+    if (!c || typeof c.handle !== 'string' || !/^[0-9]{{1,19}}$/.test(String(c.topic_id))) {{
+      expired();
+      return;
+    }}
+    el.textContent = el.dataset.confirmAs
+      .replace('{{handle}}', c.handle)
+      .replace('{{topic}}', String(c.topic_id));
+    confirmBox.hidden = false;
+    document.getElementById('continue').addEventListener('click', () => {{
+      confirmBox.hidden = true;
+      el.textContent = el.dataset.working;
+      redeem('confirmed');
+    }}, {{ once: true }});
+  }};
+  const redeem = async (intent) => {{
     let next = '';
+    let confirm = null;
     try {{
       const r = await fetch('/v1/report-login', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ token }}),
+        body: JSON.stringify({{ token, intent }}),
         signal: AbortSignal.timeout(10000),
       }});
       if (r.ok) {{
         const s = await r.json();
-        if (typeof s.next === 'string' && s.next.startsWith('{forum}/')) {{ next = s.next; }}
+        if (typeof s.next === 'string' && s.next.startsWith('{forum}/')) {{
+          next = s.next;
+        }} else if (s.confirm && intent !== 'confirmed') {{
+          confirm = s.confirm;
+        }}
       }}
     }} catch (e) {{}}
+    if (confirm) {{ ask(confirm); return; }}
     // Without the cookie the forum round trip would meet the approval page.
     if (next && navigator.cookieEnabled) {{ location.replace(next); return; }}
     expired();
@@ -633,13 +656,9 @@ pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> Stri
   if (!/^[A-Za-z0-9_-]{{43}}$/.test(token)) {{
     expired();
   }} else if (document.getElementById('card').dataset.mode === 'auto') {{
-    redeem();
+    redeem('auto');
   }} else {{
-    document.getElementById('continue').addEventListener('click', () => {{
-      confirmBox.hidden = true;
-      el.textContent = el.dataset.working;
-      redeem();
-    }}, {{ once: true }});
+    redeem('peek');
   }}
 </script>
 </body>
@@ -651,6 +670,7 @@ pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> Stri
         heading = s.r_heading,
         working = s.r_working,
         continue_label = s.r_continue,
+        confirm_as = s.r_confirm_as,
         expired_heading = s.r_expired_heading,
         expired = s.r_expired,
         open_topic = s.r_open_topic,
@@ -1496,22 +1516,59 @@ mod tests {
             "no cookie check ahead of the redeem"
         );
         assert_eq!(page.matches("fetch(").count(), 1);
-        assert_eq!(page.matches("redeem();").count(), 2, "auto, and the click");
+        for call in ["redeem('auto')", "redeem('peek')", "redeem('confirmed')"] {
+            assert_eq!(page.matches(call).count(), 1, "{call}");
+        }
     }
 
     #[test]
-    fn the_report_login_page_shows_its_button_only_in_confirm_mode() {
+    fn the_report_login_page_shows_its_button_only_once_the_account_is_named() {
+        // The button would otherwise sign a reader in before they could see
+        // whose account the link opens.
         let auto = report_login_page(Lang::En, ReportLoginMode::Auto, NONCE);
-        assert!(auto.contains(r#"<p id="confirm" hidden><button"#));
         assert!(auto.contains(&format!(">{}</p>", Lang::En.strings().r_working)));
         for lang in [Lang::En, Lang::Fr, Lang::Ro] {
             let confirm = report_login_page(lang, ReportLoginMode::Confirm, NONCE);
             let text = lang.strings().r_confirm;
-            assert!(confirm.contains(r#"<p id="confirm"><button"#), "{lang:?}");
             assert!(confirm.contains(&format!(">{text}</p>")), "{lang:?}");
             assert!(!text.contains('"'), "{lang:?}");
-            assert!(confirm.contains(r#"addEventListener('click'"#));
+            for page in [&auto, &confirm] {
+                assert!(
+                    page.contains(r#"<p id="confirm" hidden><button"#),
+                    "{lang:?}"
+                );
+                assert_eq!(page.matches("confirmBox.hidden = false").count(), 1);
+                let shown = page.find("confirmBox.hidden = false").expect("shown");
+                let ask = page.find("const ask = ").expect("ask");
+                let redeem = page.find("const redeem = ").expect("redeem");
+                assert!(ask < shown && shown < redeem, "only `ask` shows it");
+            }
         }
+    }
+
+    #[test]
+    fn the_report_login_page_names_the_account_in_every_language() {
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let text = lang.strings().r_confirm_as;
+            assert!(
+                text.contains("{handle}") && text.contains("{topic}"),
+                "{lang:?}"
+            );
+            assert!(!text.contains('"'), "it sits in an attribute: {lang:?}");
+            let page = report_login_page(lang, ReportLoginMode::Auto, NONCE);
+            assert!(
+                page.contains(&format!(r#"data-confirm-as="{text}""#)),
+                "{lang:?}"
+            );
+        }
+        assert_ne!(
+            Lang::Fr.strings().r_confirm_as,
+            Lang::En.strings().r_confirm_as
+        );
+        assert_ne!(
+            Lang::Ro.strings().r_confirm_as,
+            Lang::En.strings().r_confirm_as
+        );
     }
 
     #[test]

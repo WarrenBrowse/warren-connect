@@ -1763,6 +1763,42 @@ fn redeem_with(token: &str, fetch_site: Option<&str>, content_type: Option<&str>
         .expect("request")
 }
 
+/// The page's redeem with its `intent` (`auto`, `peek` or `confirmed`).
+fn redeem_as(token: &str, intent: &str) -> Request<Body> {
+    Request::post("/v1/report-login")
+        .header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"token": token, "intent": intent}).to_string(),
+        ))
+        .expect("request")
+}
+
+/// A ticket for `key`'s report on topic 4242, issued `age` seconds ago.
+fn ticket_issued(state: &Arc<AppState>, key: &SigningKey, age: u64) -> String {
+    let handle = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username;
+    let login = warren_connect::report_login::ReportLogin {
+        user: warren_connect::discourse::SsoUser {
+            external_id: "ext".into(),
+            username: handle,
+            email: "x@users.invalid".into(),
+            member: true,
+            subscriber: true,
+            admin: false,
+        },
+        locale: None,
+        topic_id: 4242,
+    };
+    state
+        .report
+        .as_ref()
+        .expect("reports configured")
+        .logins
+        .issue(login, now_unix() - age)
+        .as_str()
+        .to_owned()
+}
+
 /// The forum's DiscourseConnect redirect to `/sso`, under its own `nonce`
 /// (one per browser: a nonce another browser opened is refused).
 fn sso_request(nonce: &str, cookie: Option<&str>) -> Request<Body> {
@@ -1868,6 +1904,80 @@ async fn a_redeemed_ticket_sets_the_binding_cookie_and_names_the_forum_sso_on_th
             "next": "https://forum.warrenbrowse.com/session/sso?return_path=%2Ft%2F4242"
         })
     );
+}
+
+#[tokio::test]
+async fn a_page_opened_right_after_the_report_signs_in_by_itself() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x50);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x50; 16]).await);
+
+    let response = send(&state, redeem_as(&ticket, "auto")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "set-cookie").starts_with("__Host-warren_report_login="));
+    assert_eq!(
+        body_json(response).await["next"],
+        "https://forum.warrenbrowse.com/session/sso?return_path=%2Ft%2F4242"
+    );
+}
+
+#[tokio::test]
+async fn a_link_opened_later_names_the_account_and_signs_in_only_once_confirmed() {
+    // A chat app hands a link to the browser exactly as the app does, so an
+    // attacker's own link sent to a victim reads like the reporter's; only
+    // its age tells them apart, and past it the reader is asked by name.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x51);
+    let state = state_with_staff(&url, &key, false);
+    let handle = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username;
+    let ticket = ticket_issued(
+        &state,
+        &key,
+        warren_connect::report_login::AUTO_SIGN_IN_SECS + 5,
+    );
+
+    let asked = send(&state, redeem_as(&ticket, "auto")).await;
+
+    assert_eq!(asked.status(), StatusCode::OK);
+    assert!(
+        header(&asked, "set-cookie").is_empty(),
+        "nothing signs in yet"
+    );
+    assert_eq!(header(&asked, "cache-control"), "no-store");
+    assert_eq!(
+        body_json(asked).await,
+        serde_json::json!({"confirm": {"handle": handle, "topic_id": 4242}})
+    );
+    let confirmed = send(&state, redeem_as(&ticket, "confirmed")).await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    assert!(header(&confirmed, "set-cookie").starts_with("__Host-warren_report_login="));
+}
+
+#[tokio::test]
+async fn a_peek_names_the_account_and_leaves_the_ticket_live() {
+    // The page a web page navigated to asks before anything, so it names
+    // the account first, however fresh the ticket.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x52);
+    let state = state_with_staff(&url, &key, false);
+    let handle = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username;
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x52; 16]).await);
+
+    let peeked = send(&state, redeem_as(&ticket, "peek")).await;
+
+    assert_eq!(peeked.status(), StatusCode::OK);
+    assert!(header(&peeked, "set-cookie").is_empty());
+    assert_eq!(
+        body_json(peeked).await,
+        serde_json::json!({"confirm": {"handle": handle, "topic_id": 4242}})
+    );
+    let confirmed = send(&state, redeem_as(&ticket, "confirmed")).await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -2117,6 +2227,13 @@ async fn the_report_login_page_reads_its_fragment_under_its_own_csp() {
     assert!(html.contains("history.replaceState"));
     assert!(html.contains("'/v1/report-login'"));
     assert!(html.contains("location.replace"));
+    for intent in ["'auto'", "'peek'", "'confirmed'"] {
+        assert!(html.contains(intent), "the page sends {intent}");
+    }
+    assert!(
+        html.contains("data-confirm-as="),
+        "the account's name has its sentence"
+    );
     assert!(
         html.contains("/^[0-9]{1,19}$/"),
         "the topic is checked as digits"
