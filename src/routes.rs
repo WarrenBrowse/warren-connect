@@ -20,6 +20,7 @@ use crate::error::AuthError;
 use crate::forum_api::{self, ForumApi};
 use crate::gate::GateBusy;
 use crate::nonces::NonceStore;
+use crate::report_login::{PENDING_TTL_SECS, REPORT_LOGIN_COOKIE, ReportLogin, ReportLoginStore};
 use crate::sessions::{
     Approach, BrowserKey, BrowserSecret, CancelReason, CompletionCode, ConfirmOutcome, Consumed,
     SESSION_TTL_SECS, SessionStatus, SessionStore,
@@ -198,6 +199,14 @@ fn binding_cookie_header(
     .expect("the cookie is ASCII by construction")
 }
 
+/// `Set-Cookie` that removes a binding cookie, with the attributes it was set
+/// with, which a browser needs to match it.
+fn cleared_cookie_header(cookie: &str) -> axum::http::HeaderValue {
+    format!("{cookie}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax")
+        .parse()
+        .expect("the cookie is ASCII by construction")
+}
+
 /// Everything the in-app report endpoint needs; absent = feature disabled.
 pub struct ReportState {
     /// Discourse client on an all-users key scoped to topic writes, acting as
@@ -215,6 +224,12 @@ pub struct ReportState {
     /// decode creates no topic and hands its topic slot back; this is what
     /// bounds the gunzip work such a wallet can still buy.
     pub decode_failures: crate::intake::RateLimiter<String>,
+    /// Per-wallet + global budget of `POST /v1/forum/report/logs`, same key,
+    /// separate from [`Self::limiter`] so sending logs to a report never
+    /// spends the budget of opening one.
+    pub logs_limiter: crate::intake::RateLimiter<String>,
+    /// The one-shot browser sign-ins the reports hand out.
+    pub logins: ReportLoginStore,
 }
 
 /// Everything the guest intake endpoint needs; absent = feature disabled.
@@ -415,6 +430,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/v1/session/{sid}/complete", get(session_complete))
         .route("/handoff", get(handoff))
+        .route("/report-login", get(report_login_page))
+        .route(
+            "/v1/report-login",
+            // The body is `{"token":"<43 chars>"}`.
+            post(report_login_redeem).layer(axum::extract::DefaultBodyLimit::max(256)),
+        )
         .route("/attach", get(attach_entry))
         .route(
             "/v1/forum/attach-logs",
@@ -430,6 +451,11 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             // the same base64 gzip field, and the layer has to sit above
             // MAX_LOG_GZ_B64_CHARS or it, not the constant, is the ceiling.
             post(forum_report).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/forum/report/logs",
+            // Same figure and same reason again: the same base64 gzip field.
+            post(forum_report_logs).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)),
         )
         .route(
             "/v1/forum/notifications",
@@ -475,6 +501,9 @@ async fn sso_entry(
         &state.connect_secret,
         crate::FORUM_PUBLIC_URL,
     )?;
+    if let Some(completed) = complete_report_login(&state, &headers, &incoming) {
+        return Ok(completed);
+    }
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
     let secret = held_or_fresh_secret(&headers, LOGIN_COOKIE);
     let ids = match state.sessions.create(
@@ -500,6 +529,44 @@ async fn sso_entry(
         binding_cookie_header(LOGIN_COOKIE, &secret, SESSION_TTL_SECS),
     );
     Ok(page)
+}
+
+/// The DiscourseConnect answer for a browser that carries a live report
+/// sign-in, completed at once the way [`session_complete`] completes an
+/// approved login, with the cookie cleared. `None` sends the browser down the
+/// ordinary approval page: no cookie, a stranger's, or a spent one.
+fn complete_report_login(
+    state: &AppState,
+    headers: &HeaderMap,
+    incoming: &discourse::IncomingSso,
+) -> Option<Response> {
+    let report = state.report.as_ref()?;
+    let PresentedCookie::Secret(secret) = presented_cookie(headers, REPORT_LOGIN_COOKIE) else {
+        return None;
+    };
+    let login = report.logins.take_pending(&secret.key(), now_unix())?;
+    let locale = login
+        .locale
+        .or_else(|| crate::i18n::preferred_locale_subtag(accept_language(headers)));
+    let (sso, sig) = discourse::build_outgoing(
+        &incoming.nonce,
+        &login.user,
+        locale.as_deref(),
+        &state.connect_secret,
+    );
+    let url = format!(
+        "{}?sso={}&sig={}",
+        incoming.return_sso_url,
+        urlencoding::encode(&sso),
+        sig
+    );
+    let mut response = Redirect::to(&url).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cleared_cookie_header(REPORT_LOGIN_COOKIE),
+    );
+    tracing::info!("report sign-in completed");
+    Some(response)
 }
 
 /// Extracts the raw `User-Agent` header value, if present and valid UTF-8.
@@ -1444,6 +1511,75 @@ async fn handoff(headers: HeaderMap) -> Response {
     html_page(|nonce| pages::handoff_page(lang, nonce), false)
 }
 
+/// The page a report's `login_url` opens. Like the handoff page it carries
+/// nothing in its markup: the ticket arrives in the fragment, which no
+/// browser sends to a server, and only the page's script reads it.
+async fn report_login_page(headers: HeaderMap) -> Response {
+    let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
+    html_page(|nonce| pages::report_login_page(lang, nonce), false)
+}
+
+/// Where a report's sign-in starts: the ticket in the fragment of a page on
+/// this host, so it never reaches an access log or a `Referer`.
+fn report_login_url(
+    host: &str,
+    ticket: &crate::report_login::LoginTicket,
+    topic_id: u64,
+) -> String {
+    format!(
+        "https://{host}/report-login#t={}&topic={topic_id}",
+        ticket.as_str()
+    )
+}
+
+/// Where the redeemed browser goes next: the forum's own DiscourseConnect
+/// entry, which keeps `return_path` server-side under its nonce and sends the
+/// browser there once `/session/sso_login` has signed it in.
+fn report_login_next(topic_id: u64) -> String {
+    format!(
+        "{}/session/sso?return_path=%2Ft%2F{topic_id}",
+        crate::FORUM_PUBLIC_URL
+    )
+}
+
+#[derive(Deserialize)]
+struct RedeemBody {
+    token: String,
+}
+
+/// Trades a report's login ticket for the binding cookie the forum round
+/// trip presents at `/sso`. A malformed body, an unknown ticket, an expired
+/// one and a spent one all answer `expired`.
+async fn report_login_redeem(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Response, AuthError> {
+    let report = state.report.as_ref().ok_or(AuthError::FeatureDisabled)?;
+    let now = now_unix();
+    report.logins.redeems.admit((), now)?;
+    let login = serde_json::from_slice::<RedeemBody>(&body)
+        .ok()
+        .and_then(|body| report.logins.redeem(&body.token, now))
+        .ok_or_else(|| {
+            // Debug: the route is public, an info line per guess amplifies.
+            tracing::debug!("report sign-in refused: ticket unknown, expired or used");
+            AuthError::LoginTicketExpired
+        })?;
+    let next = report_login_next(login.topic_id);
+    let secret = report.logins.park(login, now);
+    let mut response = Json(serde_json::json!({ "next": next })).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::SET_COOKIE,
+        binding_cookie_header(REPORT_LOGIN_COOKIE, &secret, PENDING_TTL_SECS),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
 /// Requires the Discourse admin API to be configured; every attach-logs
 /// surface is disabled as a unit when the key is absent.
 fn forum_api_enabled(state: &AppState) -> Result<&ForumApi, AuthError> {
@@ -1568,58 +1704,26 @@ async fn forum_attach_logs(
             .into_response());
     }
 
-    // Only the topic author may attach logs to it: the wallet proves itself
-    // via the signature, the topic proves its author via Discourse, and the
-    // deterministic handle bridges the two. The author has a forum account,
-    // so a forum link: a wallet without one is refused before the fetch.
-    admit_linked_signer(&state, identity, &forum).await?;
-    // Charged before the fetch and given back unless the author check fails.
-    let signer = forum.external_id.as_str();
-    state
-        .gates
-        .author_misses
-        .admit(signer.to_owned(), now)
-        .inspect_err(|_| {
-            tracing::info!(
-                topic_id = req.topic_id,
-                "attach-logs refused: the signer failed too many author checks"
-            );
-        })?;
-    let fetch = async {
-        // Charged once the gate lets the fetch run, so a saturated gate
-        // spends none of the session's fetches.
-        state
-            .attach
-            .charge_topic_fetch(&req.sid, now)
-            .inspect_err(|_| {
-                tracing::info!(
-                    topic_id = req.topic_id,
-                    "attach-logs refused: the session has no topic fetch left"
-                );
-            })?;
-        Ok::<_, AuthError>(api.topic(req.topic_id).await?)
-    };
-    let topic = match state.gates.topic.run(fetch).await {
-        Ok(Ok(topic)) => topic,
-        Ok(Err(err)) => {
-            state.gates.author_misses.release(signer);
-            return Err(err);
-        }
-        Err(GateBusy) => {
-            state.gates.author_misses.release(signer);
-            return Err(AuthError::Forum);
-        }
-    };
-    if !topic.author_username.eq_ignore_ascii_case(&forum.username) {
-        // The topic alone: it is public, so a wallet next to it, even
-        // redacted, is the link the pairwise handle exists to break.
-        tracing::info!(
-            topic_id = req.topic_id,
-            "attach-logs refused: signer is not the topic author"
-        );
-        return Err(AuthError::NotAuthor);
-    }
-    state.gates.author_misses.release(signer);
+    let topic = authored_topic(
+        &state,
+        api,
+        identity,
+        &forum,
+        req.topic_id,
+        "attach-logs",
+        || {
+            state
+                .attach
+                .charge_topic_fetch(&req.sid, now)
+                .inspect_err(|_| {
+                    tracing::info!(
+                        topic_id = req.topic_id,
+                        "attach-logs refused: the session has no topic fetch left"
+                    );
+                })
+        },
+    )
+    .await?;
     let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
         tracing::info!(
             topic_id = req.topic_id,
@@ -1658,6 +1762,65 @@ async fn forum_attach_logs(
         Json(serde_json::json!({"status": "attached"})),
     )
         .into_response())
+}
+
+/// The checks an upload to an existing topic passes before anything is
+/// written, shared by attach-logs and the in-app logs route: the signer's
+/// forum link, the author-miss budget, the topic fetch through its gate, and
+/// the author check. `charge_fetch` runs once the gate lets the fetch go, for
+/// a caller that meters fetches of its own.
+///
+/// Only the topic author may add logs to it: the wallet proves itself via the
+/// signature, the topic proves its author via Discourse, and the
+/// deterministic handle bridges the two. The author has a forum account, so a
+/// forum link: a wallet without one is refused before the fetch.
+async fn authored_topic(
+    state: &AppState,
+    api: &ForumApi,
+    identity: &crate::verify::VerifiedIdentity,
+    forum: &handle::ForumHandle,
+    topic_id: u64,
+    route: &'static str,
+    charge_fetch: impl FnOnce() -> Result<(), AuthError>,
+) -> Result<forum_api::TopicInfo, AuthError> {
+    admit_linked_signer(state, identity, forum).await?;
+    // Charged before the fetch and given back unless the author check fails.
+    let signer = forum.external_id.as_str();
+    state
+        .gates
+        .author_misses
+        .admit(signer.to_owned(), now_unix())
+        .inspect_err(|_| {
+            tracing::info!(
+                topic_id,
+                "{route} refused: the signer failed too many author checks"
+            );
+        })?;
+    let fetch = async {
+        // Charged once the gate lets the fetch run, so a saturated gate
+        // spends none of the caller's fetches.
+        charge_fetch()?;
+        Ok::<_, AuthError>(api.topic(topic_id).await?)
+    };
+    let topic = match state.gates.topic.run(fetch).await {
+        Ok(Ok(topic)) => topic,
+        Ok(Err(err)) => {
+            state.gates.author_misses.release(signer);
+            return Err(err);
+        }
+        Err(GateBusy) => {
+            state.gates.author_misses.release(signer);
+            return Err(AuthError::Forum);
+        }
+    };
+    if !topic.author_username.eq_ignore_ascii_case(&forum.username) {
+        // The topic alone: it is public, so a wallet next to it, even
+        // redacted, is the link the pairwise handle exists to break.
+        tracing::info!(topic_id, "{route} refused: signer is not the topic author");
+        return Err(AuthError::NotAuthor);
+    }
+    state.gates.author_misses.release(signer);
+    Ok(topic)
 }
 
 /// The first gate of an upload: the signer must have a forum link.
@@ -2013,14 +2176,25 @@ async fn forum_report(
         }
     };
 
+    let login_url = issue_report_login(
+        &state,
+        report_state,
+        &request.identity,
+        user,
+        req.locale.clone(),
+        topic_id,
+    )
+    .await;
+
     // No wallet on this line: the topic is public and the log is retained, so
     // a pubkey next to it, even redacted, is the wallet-to-forum link the
     // pairwise handle exists to break.
     tracing::info!(
         topic_id,
         platform,
-        area = req.area.short(),
+        area = req.area.map_or("none", crate::report::Area::short),
         logs,
+        sign_in = login_url.is_some(),
         "in-app report topic created"
     );
     let mut body = identity_fields(&admitted.forum.username, admitted.notify_slot);
@@ -2031,7 +2205,134 @@ async fn forum_report(
         format!("{}/t/{topic_id}", crate::forum_api::FORUM_PUBLIC_URL).into(),
     );
     body.insert("logs".into(), logs.into());
+    if let Some(login_url) = login_url {
+        body.insert("login_url".into(), login_url.into());
+    }
     Ok((StatusCode::CREATED, Json(serde_json::Value::Object(body))).into_response())
+}
+
+/// A one-shot browser sign-in for the reporter that lands on `topic_id`, or
+/// `None` for a staff account and for one whose standing cannot be read now.
+///
+/// Discourse keeps an admin or moderator grant whatever the payload asserts,
+/// so a ticket for a staff account would mint a staff session for whoever
+/// holds the bearer link; staff sign in through the approval page. Nothing
+/// here fails the report: the topic already exists.
+async fn issue_report_login(
+    state: &AppState,
+    report_state: &ReportState,
+    identity: &crate::verify::VerifiedIdentity,
+    user: SsoUser,
+    locale: Option<String>,
+    topic_id: u64,
+) -> Option<String> {
+    if state.admins.is_admin(&identity.pubkey_ss58) {
+        return None;
+    }
+    match state.gates.open.run(is_forum_staff(state, identity)).await {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) | Err(GateBusy) => return None,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                kind = sqlx_error_kind(&err),
+                "forum staff status unreadable: report issued without a sign-in"
+            );
+            return None;
+        }
+    }
+    let ticket = report_state.logins.issue(
+        ReportLogin {
+            user,
+            locale,
+            topic_id,
+        },
+        now_unix(),
+    );
+    Some(report_login_url(&state.public_host, &ticket, topic_id))
+}
+
+#[derive(Deserialize)]
+struct ReportLogsBody {
+    topic_id: u64,
+    log_gz_b64: String,
+}
+
+/// Wallet-signed new logs for a topic the signer authored, from the app, with
+/// no browser and no attach session: the topic-mode checks of attach-logs,
+/// then a closed-topic refusal, the nonce, the wallet's logs budget, the
+/// decode, and the same staff delivery.
+async fn forum_report_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, AuthError> {
+    let report_state = state.report.as_ref().ok_or(AuthError::FeatureDisabled)?;
+    let api = forum_api_enabled(&state)?;
+    let signed = extract_signed_headers(&headers)?;
+    let now = now_unix();
+    let request = verify_signed_request(&signed, "POST", "/v1/forum/report/logs", &body, now)
+        .inspect_err(|err| {
+            if matches!(err, AuthError::Clock) {
+                tracing::info!(
+                    drift_secs = now.abs_diff(signed.timestamp),
+                    "report logs refused: client clock outside window"
+                );
+            } else {
+                tracing::debug!(error = %err, "report logs auth refused");
+            }
+        })?;
+    let identity = &request.identity;
+    let req: ReportLogsBody = serde_json::from_slice(&body).map_err(|_| {
+        tracing::info!("report logs refused: body is not valid JSON");
+        AuthError::InvalidReport
+    })?;
+    if req.log_gz_b64.len() > attach::MAX_LOG_GZ_B64_CHARS {
+        tracing::info!(
+            b64_chars = req.log_gz_b64.len(),
+            "report logs refused: base64 field over the size cap"
+        );
+        return Err(AuthError::PayloadTooLarge);
+    }
+    let forum = handle::derive(&state.handle_secret, &identity.pubkey);
+    let topic = authored_topic(
+        &state,
+        api,
+        identity,
+        &forum,
+        req.topic_id,
+        "report logs",
+        || Ok(()),
+    )
+    .await?;
+    // Discourse would take the system account's posts on a closed topic, but
+    // staff closed it: new logs there would reopen a conversation they ended.
+    if topic.locked {
+        tracing::info!(
+            topic_id = req.topic_id,
+            "report logs refused: the topic is closed"
+        );
+        return Err(AuthError::TopicClosed);
+    }
+    let _admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+        tracing::info!(
+            topic_id = req.topic_id,
+            "report logs refused: nonce not admitted"
+        );
+    })?;
+    // Charged past the author check and the nonce, as the report is: a
+    // stranger's or a replayed request must not burn the author's budget.
+    // Never refunded, so it also bounds the gunzips a wallet can order.
+    report_state
+        .logs_limiter
+        .admit(forum.external_id.clone(), now)?;
+    let (log_text, meta) = decode_report(&req.log_gz_b64, Some(req.topic_id))?;
+    deliver_to_staff(api, req.topic_id, &topic, log_text, meta, now).await?;
+    tracing::info!(topic_id = req.topic_id, "report logs attached");
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "attached"})),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

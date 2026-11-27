@@ -235,6 +235,14 @@ async fn main() -> anyhow::Result<()> {
                     env_usize("REPORT_MAX_GLOBAL", 20),
                     3_600,
                 ),
+                // New logs to one's own topic: a reporter resends after a
+                // retry or a reproduction, rarely more than a few times.
+                logs_limiter: warren_connect::intake::RateLimiter::new(
+                    env_usize("REPORT_LOGS_MAX_PER_WALLET", 6),
+                    env_usize("REPORT_LOGS_MAX_GLOBAL", 30),
+                    3_600,
+                ),
+                logins: warren_connect::report_login::ReportLoginStore::default(),
             })
         }
     };

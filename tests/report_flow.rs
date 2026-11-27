@@ -31,6 +31,8 @@ mod forum_vector;
 use forum_vector::{assert_answer, assert_signed_by_the_contract, observe, verify_at_vector_clock};
 
 const HANDLE_SECRET: &[u8] = b"a-test-handle-secret-32-bytes!!!";
+/// The per-wallet budget of `POST /v1/forum/report/logs`, as deployed.
+const LOGS_PER_WALLET: usize = 6;
 const CONNECT_SECRET: &[u8] = b"a-test-connect-secret-32-bytes!!";
 
 #[derive(Debug)]
@@ -52,6 +54,9 @@ struct StubState {
     topic_fails: bool,
     /// Makes the whisper answer 500, after the topic exists.
     whisper_fails: bool,
+    /// The topic `GET /t/{id}.json` serves: author and closed flag. `None`
+    /// answers 404.
+    topic: Option<(String, bool)>,
 }
 
 fn api_username(headers: &HeaderMap) -> String {
@@ -157,13 +162,33 @@ async fn stub_topic_update(
     Json(serde_json::json!({"basic_topic": {"id": 4242}}))
 }
 
+async fn stub_topic(State(s): State<Arc<StubState>>) -> axum::response::Response {
+    s.calls.lock().expect("stub mutex").push(StubCall {
+        op: "topic_fetch".into(),
+        api_username: String::new(),
+        body: serde_json::Value::Null,
+    });
+    match &s.topic {
+        None => StatusCode::NOT_FOUND.into_response(),
+        // The live shape: tags as objects, `details.created_by`.
+        Some((author, closed)) => Json(serde_json::json!({
+            "title": "[macOS] It drops every hour. #abc123",
+            "details": {"created_by": {"username": author}},
+            "tags": [{"id": 1, "name": "macos", "slug": "macos"}],
+            "closed": closed,
+            "archived": false,
+        }))
+        .into_response(),
+    }
+}
+
 async fn spawn_stub(state: Arc<StubState>) -> String {
     let app = axum::Router::new()
         .route("/admin/users/sync_sso", post(stub_sync_sso))
         .route("/uploads.json", post(stub_upload))
         .route("/posts.json", post(stub_posts))
         .route("/t/-/{topic_id}", axum::routing::put(stub_topic_update))
-        .route("/t/{topic_json}", get(|| async { StatusCode::NOT_FOUND }))
+        .route("/t/{topic_json}", get(stub_topic))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -237,6 +262,8 @@ fn state_with_nonces(
                 category_id: 13,
                 limiter: RateLimiter::new(per_wallet, 20, 3_600),
                 decode_failures: RateLimiter::new(3, 20, 3_600),
+                logs_limiter: RateLimiter::new(LOGS_PER_WALLET, 30, 3_600),
+                logins: Default::default(),
             }),
         ),
         None => (None, None),
@@ -280,15 +307,18 @@ fn gz_b64(text: &str) -> String {
 }
 
 fn signed_report(key: &SigningKey, body: &str, nonce: [u8; 16], timestamp: u64) -> Request<Body> {
-    let s = sign_request(
-        key,
-        "POST",
-        "/v1/forum/report",
-        body.as_bytes(),
-        timestamp,
-        nonce,
-    );
-    Request::post("/v1/forum/report")
+    signed_post(key, "/v1/forum/report", body, nonce, timestamp)
+}
+
+fn signed_post(
+    key: &SigningKey,
+    path: &str,
+    body: &str,
+    nonce: [u8; 16],
+    timestamp: u64,
+) -> Request<Body> {
+    let s = sign_request(key, "POST", path, body.as_bytes(), timestamp, nonce);
+    Request::post(path)
         .header(HEADER_PUBKEY, s.pubkey_ss58)
         .header(HEADER_SIGNATURE, s.signature_hex)
         .header(HEADER_TIMESTAMP, s.timestamp.to_string())
@@ -1455,4 +1485,593 @@ async fn a_warren_database_outage_is_a_retryable_error_not_a_subscription_refusa
     )
     .await;
     assert_eq!(retry.status(), StatusCode::CREATED);
+}
+
+// ---------------------------------------------------------------------------
+// The one-shot browser sign-in a report hands back (`login_url`).
+
+/// A paid wallet whose forum account the Discourse database reads as `staff`.
+fn state_with_staff(stub_url: &str, key: &SigningKey, staff: bool) -> Arc<AppState> {
+    let state = test_state(Some(stub_url), Some(key), 3);
+    let handle = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes()).username;
+    *memory(&state).forum_staff.lock().expect("mutex") =
+        Some([(handle, staff)].into_iter().collect());
+    state
+}
+
+fn header(response: &axum::response::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Files a report and returns its `login_url`.
+async fn report_login_url(state: &Arc<AppState>, key: &SigningKey, nonce: [u8; 16]) -> String {
+    let response = send(
+        state,
+        signed_report(key, &report_body(None), nonce, now_unix()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    body["login_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a member's report carries a login_url: {body}"))
+        .to_owned()
+}
+
+fn ticket_of(login_url: &str) -> String {
+    login_url
+        .split_once("#t=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("the ticket rides in the fragment")
+        .to_owned()
+}
+
+fn redeem(token: &str) -> Request<Body> {
+    Request::post("/v1/report-login")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"token": token}).to_string()))
+        .expect("request")
+}
+
+/// The forum's DiscourseConnect redirect to `/sso`, under its own `nonce`
+/// (one per browser: a nonce another browser opened is refused).
+fn sso_request(nonce: &str, cookie: Option<&str>) -> Request<Body> {
+    use hmac::Mac as _;
+    let payload = format!(
+        "nonce={nonce}&return_sso_url=https%3A%2F%2Fforum.warrenbrowse.com%2Fsession%2Fsso_login"
+    );
+    let sso = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        payload.as_bytes(),
+    );
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(CONNECT_SECRET).expect("key");
+    mac.update(sso.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+    let mut builder = Request::get(format!("/sso?sso={}&sig={sig}", urlencoding::encode(&sso)));
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    builder.body(Body::empty()).expect("request")
+}
+
+#[tokio::test]
+async fn a_members_report_answers_a_login_url_carrying_the_ticket_in_its_fragment() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x41);
+    let state = state_with_staff(&url, &key, false);
+
+    let login_url = report_login_url(&state, &key, [0x41; 16]).await;
+
+    let ticket = ticket_of(&login_url);
+    assert_eq!(ticket.len(), 43, "{login_url}");
+    assert_eq!(
+        login_url,
+        format!("https://connect.test/report-login#t={ticket}&topic=4242")
+    );
+}
+
+#[tokio::test]
+async fn a_staff_reporter_gets_no_login_url() {
+    // Discourse keeps an admin grant whatever the payload says, so a bearer
+    // ticket for a staff account would mint a staff session.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x42);
+    let state = state_with_staff(&url, &key, true);
+
+    let response = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x42; 16], now_unix()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_json(response).await;
+    assert!(body.get("login_url").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn an_unreadable_staff_status_issues_no_login_url() {
+    // No Discourse database wired: nobody's standing can be read, so no
+    // ticket, and the report itself still succeeds.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x43);
+    let state = test_state(Some(&url), Some(&key), 3);
+
+    let response = send(
+        &state,
+        signed_report(&key, &report_body(None), [0x43; 16], now_unix()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(body_json(response).await.get("login_url").is_none());
+}
+
+#[tokio::test]
+async fn a_redeemed_ticket_sets_the_binding_cookie_and_names_the_forum_sso_on_the_topic() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x44);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x44; 16]).await);
+
+    let response = send(&state, redeem(&ticket)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = header(&response, "set-cookie");
+    let (pair, attributes) = cookie.split_once("; ").expect("attributes");
+    let (name, value) = pair.split_once('=').expect("name=value");
+    assert_eq!(name, "__Host-warren_report_login");
+    assert_eq!(value.len(), 64, "a fresh 32-byte secret, hex");
+    assert_ne!(value, ticket, "the cookie is never the ticket");
+    assert_eq!(
+        attributes,
+        "Max-Age=60; Path=/; Secure; HttpOnly; SameSite=Lax"
+    );
+    assert_eq!(header(&response, "cache-control"), "no-store");
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({
+            "next": "https://forum.warrenbrowse.com/session/sso?return_path=%2Ft%2F4242"
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_ticket_redeems_once_and_an_unknown_one_reads_as_expired() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x45);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x45; 16]).await);
+    assert_eq!(send(&state, redeem(&ticket)).await.status(), StatusCode::OK);
+
+    for token in [ticket.as_str(), &"A".repeat(43), "garbage"] {
+        let again = send(&state, redeem(token)).await;
+        assert_eq!(again.status(), StatusCode::NOT_FOUND, "{token}");
+        assert!(header(&again, "set-cookie").is_empty());
+        assert_eq!(
+            body_json(again).await,
+            serde_json::json!({"error": "expired"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_forum_round_trip_with_the_cookie_completes_as_the_reporter_once() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x46);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x46; 16]).await);
+    let redeemed = send(&state, redeem(&ticket)).await;
+    let cookie = header(&redeemed, "set-cookie")
+        .split(';')
+        .next()
+        .expect("pair")
+        .to_owned();
+
+    let completed = send(&state, sso_request("n-report", Some(&cookie))).await;
+
+    assert!(
+        completed.status().is_redirection(),
+        "{}",
+        completed.status()
+    );
+    let location = header(&completed, "location");
+    let query = location
+        .strip_prefix("https://forum.warrenbrowse.com/session/sso_login?")
+        .unwrap_or_else(|| panic!("back to the forum's own return url: {location}"));
+    let params: Vec<(String, String)> = serde_urlencoded::from_str(query).expect("query");
+    let sso = &params.iter().find(|(k, _)| k == "sso").expect("sso").1;
+    assert!(params.iter().any(|(k, _)| k == "sig"));
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sso).expect("b64");
+    let payload: std::collections::BTreeMap<String, String> =
+        serde_urlencoded::from_bytes(&raw).expect("payload");
+    let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    assert_eq!(payload["nonce"], "n-report");
+    assert_eq!(payload["external_id"], forum.external_id);
+    assert_eq!(payload["username"], forum.username);
+    assert_eq!(payload.get("locale").map(String::as_str), Some("fr"));
+    assert!(!payload.contains_key("admin"), "never a staff claim");
+    assert_eq!(
+        header(&completed, "set-cookie"),
+        "__Host-warren_report_login=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax"
+    );
+
+    // Spent: the same cookie now meets the ordinary approval page.
+    let again = send(&state, sso_request("n-again", Some(&cookie))).await;
+    assert_eq!(again.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        again
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert!(html.contains("forum-login?sid="), "the approval page");
+}
+
+#[tokio::test]
+async fn the_forum_round_trip_without_the_cookie_shows_the_approval_page() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x47);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x47; 16]).await);
+    assert_eq!(send(&state, redeem(&ticket)).await.status(), StatusCode::OK);
+
+    let stranger = send(
+        &state,
+        sso_request(
+            "n-stranger",
+            Some(&format!("__Host-warren_report_login={}", "a".repeat(64))),
+        ),
+    )
+    .await;
+    let bare = send(&state, sso_request("n-bare", None)).await;
+
+    for response in [stranger, bare] {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !header(&response, "set-cookie").contains("warren_report_login"),
+            "the approval page leaves the report cookie alone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_report_login_page_reads_its_fragment_under_its_own_csp() {
+    let state = test_state(None, None, 3);
+
+    let response = send(
+        &state,
+        Request::get("/report-login")
+            .header("accept-language", "fr-FR,fr;q=0.9")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "cache-control"), "no-store");
+    let csp = header(&response, "content-security-policy");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(csp.contains("connect-src 'self'"), "{csp}");
+    let nonce = csp
+        .split("script-src 'nonce-")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .expect("a script nonce")
+        .to_owned();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert!(html.contains(&format!(r#"<script nonce="{nonce}">"#)));
+    assert!(html.contains(&format!(r#"<style nonce="{nonce}">"#)));
+    assert!(html.contains(r#"<html lang="fr">"#));
+    assert!(html.contains("history.replaceState"));
+    assert!(html.contains("'/v1/report-login'"));
+    assert!(html.contains("location.replace"));
+    assert!(
+        html.contains("/^[0-9]{1,19}$/"),
+        "the topic is checked as digits"
+    );
+}
+
+#[tokio::test]
+async fn a_report_without_area_or_frequency_and_a_short_description_is_filed() {
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x48);
+    let state = test_state(Some(&url), Some(&key), 3);
+    let body = serde_json::json!({
+        "platform": "macos",
+        "what_happened": "No traffic",
+    })
+    .to_string();
+
+    let response = send(&state, signed_report(&key, &body, [0x48; 16], now_unix())).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let calls = stub.calls.lock().expect("stub mutex");
+    let topic = calls
+        .iter()
+        .find(|c| c.op == "topic_create")
+        .expect("a topic");
+    let title = topic.body["title"].as_str().expect("title");
+    assert!(title.starts_with("[macOS] No traffic #"), "{title}");
+    let raw = topic.body["raw"].as_str().expect("raw");
+    assert!(!raw.contains("### Where does the problem happen?"), "{raw}");
+    assert!(!raw.contains("### How often does it happen?"), "{raw}");
+}
+
+// ---------------------------------------------------------------------------
+// `POST /v1/forum/report/logs`: new logs to one's own topic, signed.
+
+const LOGS_PATH: &str = "/v1/forum/report/logs";
+
+/// A paid wallet with a forum link, the topic served as `author`'s.
+async fn logs_setup(
+    seed: u8,
+    author: Option<&str>,
+    closed: bool,
+) -> (Arc<StubState>, Arc<AppState>, SigningKey) {
+    let key = signer(seed);
+    let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    let stub = Arc::new(StubState {
+        topic: Some((author.unwrap_or(&forum.username).to_owned(), closed)),
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 3);
+    memory(&state)
+        .links
+        .lock()
+        .expect("mutex")
+        .insert(forum.external_id, (forum.username, None));
+    (stub, state, key)
+}
+
+fn logs_body(topic_id: u64, log_gz_b64: &str) -> String {
+    format!(r#"{{"log_gz_b64":"{log_gz_b64}","topic_id":{topic_id}}}"#)
+}
+
+#[tokio::test]
+async fn new_logs_from_the_topic_author_are_delivered_to_the_staff() {
+    let (stub, state, key) = logs_setup(0x51, None, false).await;
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &gz_b64(REPORT)),
+            [0x51; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"status": "attached"})
+    );
+    assert_eq!(
+        ops(&stub),
+        vec![
+            "topic_fetch",
+            "upload",
+            "pm",
+            "whisper",
+            "reply",
+            "author_pm",
+            "tag"
+        ]
+    );
+    let calls = stub.calls.lock().expect("stub mutex");
+    assert_eq!(calls[1].body["contains_report"], true);
+    assert_eq!(calls[3].body["topic_id"], 4242);
+}
+
+#[tokio::test]
+async fn new_logs_from_anyone_but_the_author_are_refused_before_any_write() {
+    let (stub, state, key) = logs_setup(0x52, Some("someone-else"), false).await;
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &gz_b64(REPORT)),
+            [0x52; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"error": "not_author"})
+    );
+    assert_eq!(ops(&stub), vec!["topic_fetch"]);
+}
+
+#[tokio::test]
+async fn new_logs_from_a_wallet_with_no_forum_link_fetch_no_topic() {
+    let key = signer(0x53);
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 3);
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &gz_b64(REPORT)),
+            [0x53; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn new_logs_to_a_closed_topic_are_refused_with_their_own_token() {
+    let (stub, state, key) = logs_setup(0x54, None, true).await;
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &gz_b64(REPORT)),
+            [0x54; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"error": "topic_closed"})
+    );
+    assert_eq!(ops(&stub), vec!["topic_fetch"]);
+}
+
+#[tokio::test]
+async fn new_logs_over_the_size_cap_are_413_before_any_forum_call() {
+    let (stub, state, key) = logs_setup(0x55, None, false).await;
+    let oversized = "A".repeat(warren_connect::attach::MAX_LOG_GZ_B64_CHARS + 1);
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &oversized),
+            [0x55; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn a_malformed_logs_body_is_422_invalid_report() {
+    let (stub, state, key) = logs_setup(0x56, None, false).await;
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            r#"{"topic_id":"x"}"#,
+            [0x56; 16],
+            now_unix(),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"error": "invalid_report"})
+    );
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn the_seventh_logs_upload_of_a_wallet_in_the_hour_is_rate_limited() {
+    let (stub, state, key) = logs_setup(0x57, None, false).await;
+    let body = logs_body(4242, &gz_b64(REPORT));
+    for n in 0..LOGS_PER_WALLET {
+        let response = send(
+            &state,
+            signed_post(&key, LOGS_PATH, &body, [n as u8; 16], now_unix()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "upload {n}");
+    }
+
+    let over = send(
+        &state,
+        signed_post(&key, LOGS_PATH, &body, [0xff; 16], now_unix()),
+    )
+    .await;
+
+    assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        ops(&stub).iter().filter(|op| *op == "upload").count(),
+        LOGS_PER_WALLET
+    );
+}
+
+#[tokio::test]
+async fn an_unsigned_logs_upload_is_refused() {
+    let (stub, state, _key) = logs_setup(0x58, None, false).await;
+
+    let response = send(
+        &state,
+        Request::post(LOGS_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(logs_body(4242, "AAAA")))
+            .expect("request"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(ops(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn a_logs_upload_with_a_skewed_clock_answers_the_frozen_token() {
+    let (stub, state, key) = logs_setup(0x59, None, false).await;
+
+    let response = send(
+        &state,
+        signed_post(
+            &key,
+            LOGS_PATH,
+            &logs_body(4242, &gz_b64(REPORT)),
+            [0x59; 16],
+            now_unix() - 3_600,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({"error": "clock_skew"})
+    );
+    assert!(ops(&stub).is_empty());
 }

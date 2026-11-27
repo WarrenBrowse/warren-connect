@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::error::AuthError;
 use crate::forum_api::{escape_md_inline, is_bidi_control};
-use crate::intake::{MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS, defang_mentions, quote_block};
+use crate::intake::{MAX_MESSAGE_CHARS, defang_mentions, quote_block};
 
 /// Longest optional title the reporter may set; the server derives one
 /// otherwise.
@@ -25,6 +25,11 @@ pub const MIN_TITLE_CHARS: usize = 5;
 pub const MAX_FACT_CHARS: usize = crate::attach::MAX_FACT_CHARS;
 /// Cap on the locale tag handed to Discourse at account creation.
 pub const MAX_LOCALE_CHARS: usize = 10;
+/// Shortest description this route accepts, counted on the trimmed text.
+/// Lower than the guest intake's minimum: the reporter is a signed-in member
+/// and the logs usually carry the substance, so the app asks for a sentence,
+/// not a paragraph.
+pub const MIN_REPORT_DESCRIPTION_CHARS: usize = 10;
 /// Characters of the reporter's text kept in a derived title.
 const TITLE_EXCERPT_CHARS: usize = 60;
 
@@ -144,10 +149,13 @@ impl Frequency {
 pub struct ReportRequest {
     /// Platform, also the topic tag.
     pub platform: Platform,
-    /// Where the problem happens.
-    pub area: Area,
-    /// How often it happens.
-    pub frequency: Frequency,
+    /// Where the problem happens. Older clients always send it; the desktop
+    /// form no longer asks.
+    #[serde(default)]
+    pub area: Option<Area>,
+    /// How often it happens, optional for the same reason.
+    #[serde(default)]
+    pub frequency: Option<Frequency>,
     /// The reporter's description.
     pub what_happened: String,
     /// Steps to reproduce.
@@ -176,7 +184,9 @@ pub struct ReportRequest {
 /// [`AuthError::InvalidReport`] on any violation.
 pub fn validate(req: &ReportRequest) -> Result<(), AuthError> {
     let chars = |s: &str| s.chars().count();
-    if !(MIN_MESSAGE_CHARS..=MAX_MESSAGE_CHARS).contains(&chars(&req.what_happened)) {
+    if chars(req.what_happened.trim()) < MIN_REPORT_DESCRIPTION_CHARS
+        || chars(&req.what_happened) > MAX_MESSAGE_CHARS
+    {
         return Err(AuthError::InvalidReport);
     }
     if req
@@ -234,7 +244,8 @@ fn title_excerpt(text: &str) -> String {
     collapsed.trim().to_owned()
 }
 
-/// Topic title: `[Android] Connection: cannot connect after update #a1b2c3`.
+/// Topic title: `[Android] Connection: cannot connect after update #a1b2c3`,
+/// or `[macOS] cannot connect after update #a1b2c3` when no area was given.
 /// The random suffix is what makes two reports with the same text distinct,
 /// since the forum refuses duplicate titles.
 #[must_use]
@@ -245,11 +256,14 @@ pub fn topic_title(req: &ReportRequest, shortid: &str) -> String {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map_or_else(|| title_excerpt(&req.what_happened), title_excerpt);
-    format!(
-        "[{}] {}: {excerpt} #{shortid}",
-        req.platform.label(),
-        req.area.short()
-    )
+    match req.area {
+        Some(area) => format!(
+            "[{}] {}: {excerpt} #{shortid}",
+            req.platform.label(),
+            area.short()
+        ),
+        None => format!("[{}] {excerpt} #{shortid}", req.platform.label()),
+    }
 }
 
 /// Topic body: the form template's sections, in its order and wording, with
@@ -258,9 +272,12 @@ pub fn topic_title(req: &ReportRequest, shortid: &str) -> String {
 #[must_use]
 pub fn topic_raw(req: &ReportRequest) -> String {
     let mut raw = String::new();
-    raw.push_str("### Where does the problem happen?\n");
-    raw.push_str(req.area.label());
-    raw.push_str("\n\n### Your device\n");
+    if let Some(area) = req.area {
+        raw.push_str("### Where does the problem happen?\n");
+        raw.push_str(area.label());
+        raw.push_str("\n\n");
+    }
+    raw.push_str("### Your device\n");
     raw.push_str(req.platform.tag());
     raw.push_str("\n\n### Warren version (optional)\n");
     match req
@@ -283,8 +300,10 @@ pub fn topic_raw(req: &ReportRequest) -> String {
         raw.push_str("\n\n### How can we make it happen too? (optional)\n");
         raw.push_str(&quote_block(steps));
     }
-    raw.push_str("\n\n### How often does it happen?\n");
-    raw.push_str(req.frequency.label());
+    if let Some(frequency) = req.frequency {
+        raw.push_str("\n\n### How often does it happen?\n");
+        raw.push_str(frequency.label());
+    }
     if let Some(os) = req
         .os_version
         .as_deref()
@@ -308,8 +327,8 @@ mod tests {
     fn base() -> ReportRequest {
         ReportRequest {
             platform: Platform::Android,
-            area: Area::Connection,
-            frequency: Frequency::Always,
+            area: Some(Area::Connection),
+            frequency: Some(Frequency::Always),
             what_happened: "I tap Connect, the rabbit spins, then nothing happens.".into(),
             steps: None,
             title: None,
@@ -412,8 +431,8 @@ mod tests {
         )
         .expect("lowercase tokens parse, unknown fields are ignored");
         assert_eq!(req.platform, Platform::Macos);
-        assert_eq!(req.area, Area::Install);
-        assert_eq!(req.frequency, Frequency::Once);
+        assert_eq!(req.area, Some(Area::Install));
+        assert_eq!(req.frequency, Some(Frequency::Once));
         assert!(
             serde_json::from_str::<ReportRequest>(
                 r#"{"platform":"Android","area":"install","frequency":"once","what_happened":"long enough description here"}"#
@@ -500,5 +519,61 @@ Filed from the Warren app. Technical logs, when included, are visible to the sup
         assert!(!raw.contains("](https://evil)"));
         assert!(!raw.contains('\u{202E}'));
         assert!(!raw.contains('\u{2028}'));
+    }
+
+    #[test]
+    fn area_and_frequency_may_be_absent_but_never_unknown() {
+        let req: ReportRequest =
+            serde_json::from_str(r#"{"platform":"macos","what_happened":"It drops every hour."}"#)
+                .expect("a report without area and frequency parses");
+        assert_eq!(req.area, None);
+        assert_eq!(req.frequency, None);
+        for unknown in [
+            r#"{"platform":"macos","area":"dns","what_happened":"It drops every hour."}"#,
+            r#"{"platform":"macos","frequency":"daily","what_happened":"It drops every hour."}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ReportRequest>(unknown).is_err(),
+                "an unknown token is still refused: {unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_description_minimum_is_ten_chars_for_this_route() {
+        let mut req = base();
+        req.what_happened = "x".repeat(MIN_REPORT_DESCRIPTION_CHARS - 1);
+        assert!(matches!(validate(&req), Err(AuthError::InvalidReport)));
+        req.what_happened = "  ".to_owned() + &"x".repeat(MIN_REPORT_DESCRIPTION_CHARS - 1) + "  ";
+        assert!(
+            matches!(validate(&req), Err(AuthError::InvalidReport)),
+            "surrounding whitespace does not count toward the minimum"
+        );
+        req.what_happened = "\u{e9}".repeat(MIN_REPORT_DESCRIPTION_CHARS);
+        validate(&req).expect("ten chars is enough");
+    }
+
+    #[test]
+    fn a_title_without_an_area_drops_the_area() {
+        let mut req = base();
+        req.platform = Platform::Macos;
+        req.area = None;
+        req.what_happened = "It drops every hour.".into();
+        assert_eq!(
+            topic_title(&req, "abc123"),
+            "[macOS] It drops every hour. #abc123"
+        );
+    }
+
+    #[test]
+    fn body_without_area_or_frequency_omits_both_sections() {
+        let mut req = base();
+        req.area = None;
+        req.frequency = None;
+        let raw = topic_raw(&req);
+        assert!(raw.starts_with("### Your device\nandroid\n\n"), "{raw}");
+        assert!(!raw.contains("### Where does the problem happen?"));
+        assert!(!raw.contains("### How often does it happen?"));
+        assert!(raw.contains("### What happened?\n> I tap Connect"));
     }
 }

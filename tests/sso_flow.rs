@@ -140,6 +140,8 @@ fn build_state(setup: Setup<'_>) -> Arc<AppState> {
             category_id: 13,
             limiter: RateLimiter::new(3, 20, 3_600),
             decode_failures: RateLimiter::new(3, 20, 3_600),
+            logs_limiter: RateLimiter::new(6, 30, 3_600),
+            logins: Default::default(),
         }),
     })
 }

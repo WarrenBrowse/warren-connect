@@ -40,6 +40,7 @@ pub mod nonces;
 pub mod notifications;
 pub mod pages;
 pub mod report;
+pub mod report_login;
 pub mod routes;
 pub mod sessions;
 pub mod store;

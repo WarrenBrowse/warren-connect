@@ -65,6 +65,13 @@ pub enum AuthError {
     /// Another bind holds the pre-topic session.
     #[error("bind_in_progress")]
     BindInProgress,
+    /// The topic new logs are aimed at is closed or archived.
+    #[error("topic_closed")]
+    TopicClosed,
+    /// A report login ticket that is unknown, expired or already used: the
+    /// three answer the same.
+    #[error("expired")]
+    LoginTicketExpired,
     /// The Discourse-backed feature is not configured (no API key).
     #[error("feature disabled")]
     FeatureDisabled,
@@ -142,6 +149,22 @@ impl IntoResponse for AuthError {
             return (
                 StatusCode::CONFLICT,
                 axum::Json(serde_json::json!({"error": "no_log"})),
+            )
+                .into_response();
+        }
+        // The app tells the reporter to open a new report; the report-login
+        // page falls back to a signed-out link to the topic.
+        if matches!(self, AuthError::TopicClosed) {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({"error": "topic_closed"})),
+            )
+                .into_response();
+        }
+        if matches!(self, AuthError::LoginTicketExpired) {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "expired"})),
             )
                 .into_response();
         }

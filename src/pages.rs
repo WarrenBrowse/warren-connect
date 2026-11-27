@@ -536,6 +536,96 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
     )
 }
 
+/// The page a report's sign-in link opens in the default browser
+/// (`/report-login#t=<ticket>&topic=<id>`).
+///
+/// Like the handoff page it carries nothing in its markup: the ticket and the
+/// topic arrive in the fragment, and the script drops it from the address bar
+/// and the history before its one request. On any failure the reporter still
+/// gets a link to their topic, signed out, the topic checked as digits so the
+/// fragment cannot point the link anywhere else.
+#[must_use]
+pub fn report_login_page(lang: Lang, nonce: &str) -> String {
+    let s = lang.strings();
+    format!(
+        r##"<!doctype html>
+<html lang="{code}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{tab}</title>
+<style nonce="{nonce}">{style}{notice}
+  a.button{{display:inline-block;background:var(--primary);color:var(--primary-fg);
+    padding:.75rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:600;
+    margin:1.1rem 0 .3rem;transition:background .15s ease;}}
+  a.button:hover{{background:var(--primary-hover);}}
+</style>
+</head>
+<body>
+<div class="card">
+  <span class="brand">Warren</span>
+  <div class="spark">&#10022;</div>
+  <h1 id="heading" data-expired="{expired_heading}">{heading}</h1>
+  <p id="state" aria-live="polite" data-expired="{expired}">{working}</p>
+  <p id="fallback" hidden><a class="button" id="topic" href="{forum}/">{open_topic}</a></p>
+  <hr class="rule">
+  <p class="tagline">{tagline}</p>
+</div>
+<script nonce="{nonce}">
+  const heading = document.getElementById('heading');
+  const el = document.getElementById('state');
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const token = params.get('t') || '';
+  const topic = params.get('topic') || '';
+  // Out of the address bar and the history before anything can read it.
+  history.replaceState(null, '', window.location.pathname);
+  const expired = () => {{
+    heading.textContent = heading.dataset.expired;
+    el.textContent = el.dataset.expired;
+    if (/^[0-9]{{1,19}}$/.test(topic)) {{
+      document.getElementById('topic').href = '{forum}/t/' + topic;
+    }}
+    document.getElementById('fallback').hidden = false;
+  }};
+  const run = async () => {{
+    if (!navigator.cookieEnabled || !/^[A-Za-z0-9_-]{{43}}$/.test(token)) {{ expired(); return; }}
+    try {{
+      const r = await fetch('/v1/report-login', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ token }}),
+        signal: AbortSignal.timeout(10000),
+      }});
+      if (!r.ok) {{ expired(); return; }}
+      const s = await r.json();
+      if (typeof s.next === 'string' && s.next.startsWith('{forum}/')) {{
+        location.replace(s.next);
+        return;
+      }}
+      expired();
+    }} catch (e) {{
+      expired();
+    }}
+  }};
+  run();
+</script>
+</body>
+</html>"##,
+        code = lang.code(),
+        tab = s.r_tab,
+        style = STYLE,
+        notice = NOTICE_STYLE,
+        heading = s.r_heading,
+        working = s.r_working,
+        expired_heading = s.r_expired_heading,
+        expired = s.r_expired,
+        open_topic = s.r_open_topic,
+        forum = FORUM_PUBLIC_URL,
+        tagline = s.tagline,
+    )
+}
+
 /// The attach-logs deep link on an explicit scheme. FROZEN shape past the
 /// scheme: the app parses it verbatim. Topic 0 means "new report being
 /// composed" (pre-topic session).
@@ -1308,6 +1398,40 @@ mod tests {
                 "no id is rendered, the fragment is the only carrier"
             );
         }
+    }
+
+    #[test]
+    fn the_report_login_page_speaks_every_language_and_drops_its_fragment_first() {
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let page = report_login_page(lang, NONCE);
+            let s = lang.strings();
+            assert!(page.contains(&format!(r#"lang="{}""#, lang.code())));
+            for text in [
+                s.r_heading,
+                s.r_working,
+                s.r_expired_heading,
+                s.r_expired,
+                s.r_open_topic,
+            ] {
+                assert!(page.contains(text), "{lang:?}: {text}");
+                assert!(!text.is_empty() && !text.contains('"'), "{lang:?}");
+            }
+            assert!(page.contains(&format!(r#"<script nonce="{NONCE}">"#)));
+            let dropped = page
+                .find("history.replaceState")
+                .expect("drops the fragment");
+            let posted = page.find("fetch(").expect("redeems the ticket");
+            assert!(
+                dropped < posted,
+                "the fragment leaves the history before any request"
+            );
+            assert!(
+                page.contains("https://forum.warrenbrowse.com/t/' + topic"),
+                "the fallback names the topic on the forum"
+            );
+        }
+        assert_ne!(Lang::Fr.strings().r_expired, Lang::En.strings().r_expired);
+        assert_ne!(Lang::Ro.strings().r_expired, Lang::En.strings().r_expired);
     }
 
     #[test]
