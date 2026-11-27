@@ -2220,6 +2220,14 @@ async fn forum_report(
                 }
             }
         }
+        // Discourse spaces two topics of one account (`rate_limit_create_topic`,
+        // 15 s on this forum). Nothing was filed, so the reporter is told to
+        // try again, and the report is not charged to the wallet's budget.
+        Err(forum_api::ForumApiError::Status { status: 429, .. }) => {
+            tracing::info!("report refused: the forum paces this account's topics");
+            report_state.limiter.release(wallet);
+            return Err(AuthError::RateLimited);
+        }
         Err(err) => return Err(err.into()),
     };
 

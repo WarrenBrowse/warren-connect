@@ -64,6 +64,9 @@ struct StubState {
     first_post_is_the_posted_raw: bool,
     /// The raw of the last topic creation the stub saw.
     posted_raw: Mutex<Option<String>>,
+    /// How many topic creations still answer 429, as Discourse does to a
+    /// second topic within `rate_limit_create_topic` seconds of the first.
+    topics_rate_limited: Mutex<u32>,
     /// Makes the whisper answer 500, after the topic exists.
     whisper_fails: bool,
     /// The topic `GET /t/{id}.json` serves: author and closed flag. `None`
@@ -154,6 +157,21 @@ async fn stub_posts(
     if op == "topic_create" {
         *s.posted_raw.lock().expect("stub mutex") =
             body.get("raw").and_then(|v| v.as_str()).map(str::to_owned);
+    }
+    if op == "topic_create" {
+        let mut left = s.topics_rate_limited.lock().expect("stub mutex");
+        if *left > 0 {
+            *left -= 1;
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "errors": ["You've performed this action too many times. Please wait 3 seconds before trying again."],
+                    "error_type": "rate_limit",
+                    "extras": {"wait_seconds": 3},
+                })),
+            )
+                .into_response();
+        }
     }
     if op == "topic_create" && s.topic_too_similar {
         // The live answer. Discourse names the reason in the acting user's
@@ -907,6 +925,42 @@ async fn an_identical_topic_older_than_the_forums_window_is_not_answered() {
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(ops(&stub), vec!["sync_sso", "topic_create", "own_topics"]);
+}
+
+#[tokio::test]
+async fn a_report_the_forum_paces_is_rate_limited_and_hands_its_budget_back() {
+    // Discourse spaces two topics of one account by `rate_limit_create_topic`
+    // seconds: nothing was filed, so the app says to try again, and the
+    // wallet's budget is not spent on it.
+    let key = signer(44);
+    let stub = Arc::new(StubState {
+        topics_rate_limited: Mutex::new(1),
+        ..Default::default()
+    });
+    let url = spawn_stub(stub.clone()).await;
+    let state = test_state(Some(&url), Some(&key), 1);
+
+    let paced = send(
+        &state,
+        signed_report(&key, &report_body(None), [44; 16], now_unix()),
+    )
+    .await;
+
+    assert_eq!(
+        paced.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the app reads 429 as: too many reports for now, try again later"
+    );
+    let retried = send(
+        &state,
+        signed_report(&key, &report_body(None), [45; 16], now_unix()),
+    )
+    .await;
+    assert_eq!(
+        retried.status(),
+        StatusCode::CREATED,
+        "the one report of the budget is still there"
+    );
 }
 
 #[tokio::test]
