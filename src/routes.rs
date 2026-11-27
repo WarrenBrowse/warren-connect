@@ -1514,9 +1514,39 @@ async fn handoff(headers: HeaderMap) -> Response {
 /// The page a report's `login_url` opens. Like the handoff page it carries
 /// nothing in its markup: the ticket arrives in the fragment, which no
 /// browser sends to a server, and only the page's script reads it.
+///
+/// It signs in by itself only on a navigation no web page started
+/// (`Sec-Fetch-Site: none`: the desktop app's `shell.openExternal`, or the
+/// address bar). Any page can navigate a browser to a link, and the link
+/// signs whoever opens it in as the reporter: an attacker's page carrying
+/// the link of his own report would sign its visitor into his account with
+/// no click. Every other navigation, and a browser that sends no such
+/// header, gets a button and a line saying what it does.
 async fn report_login_page(headers: HeaderMap) -> Response {
     let lang = crate::i18n::Lang::from_accept_language(accept_language(&headers));
-    html_page(|nonce| pages::report_login_page(lang, nonce), false)
+    let mode = if sec_fetch_site(&headers) == Some("none") {
+        pages::ReportLoginMode::Auto
+    } else {
+        pages::ReportLoginMode::Confirm
+    };
+    html_page(|nonce| pages::report_login_page(lang, mode, nonce), false)
+}
+
+fn sec_fetch_site(headers: &HeaderMap) -> Option<&str> {
+    headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+}
+
+/// The report-login page's own redeem: a same-origin fetch of a JSON body.
+/// A form on another site can POST `text/plain` with no preflight, so both
+/// are required, and a browser that does not say where the request comes
+/// from is refused with them: its page falls back to the signed-out link.
+fn is_same_origin_json(headers: &HeaderMap) -> bool {
+    let json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+    json && sec_fetch_site(headers) == Some("same-origin")
 }
 
 /// Where a report's sign-in starts: the ticket in the fragment of a page on
@@ -1550,11 +1580,19 @@ struct RedeemBody {
 /// Trades a report's login ticket for the binding cookie the forum round
 /// trip presents at `/sso`. A malformed body, an unknown ticket, an expired
 /// one and a spent one all answer `expired`.
+///
+/// Anything but the page's own same-origin JSON fetch answers `cross_site`
+/// and spends neither the ticket nor the redeem budget.
 async fn report_login_redeem(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AuthError> {
     let report = state.report.as_ref().ok_or(AuthError::FeatureDisabled)?;
+    if !is_same_origin_json(&headers) {
+        tracing::debug!("report sign-in refused: not a same-origin JSON fetch");
+        return Err(AuthError::CrossSite);
+    }
     let now = now_unix();
     report.logins.redeems.admit((), now)?;
     let login = serde_json::from_slice::<RedeemBody>(&body)
@@ -1704,25 +1742,18 @@ async fn forum_attach_logs(
             .into_response());
     }
 
-    let topic = authored_topic(
-        &state,
-        api,
-        identity,
-        &forum,
-        req.topic_id,
-        "attach-logs",
-        || {
-            state
-                .attach
-                .charge_topic_fetch(&req.sid, now)
-                .inspect_err(|_| {
-                    tracing::info!(
-                        topic_id = req.topic_id,
-                        "attach-logs refused: the session has no topic fetch left"
-                    );
-                })
-        },
-    )
+    admit_linked_signer(&state, identity, &forum).await?;
+    let topic = authored_topic(&state, api, &forum, req.topic_id, "attach-logs", || {
+        state
+            .attach
+            .charge_topic_fetch(&req.sid, now)
+            .inspect_err(|_| {
+                tracing::info!(
+                    topic_id = req.topic_id,
+                    "attach-logs refused: the session has no topic fetch left"
+                );
+            })
+    })
     .await?;
     let admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
         tracing::info!(
@@ -1765,10 +1796,10 @@ async fn forum_attach_logs(
 }
 
 /// The checks an upload to an existing topic passes before anything is
-/// written, shared by attach-logs and the in-app logs route: the signer's
-/// forum link, the author-miss budget, the topic fetch through its gate, and
-/// the author check. `charge_fetch` runs once the gate lets the fetch go, for
-/// a caller that meters fetches of its own.
+/// written, shared by attach-logs and the in-app logs route, past the
+/// caller's [`admit_linked_signer`]: the author-miss budget, the topic fetch
+/// through its gate, and the author check. `charge_fetch` runs once the gate
+/// lets the fetch go, for a caller that meters fetches of its own.
 ///
 /// Only the topic author may add logs to it: the wallet proves itself via the
 /// signature, the topic proves its author via Discourse, and the
@@ -1777,13 +1808,11 @@ async fn forum_attach_logs(
 async fn authored_topic(
     state: &AppState,
     api: &ForumApi,
-    identity: &crate::verify::VerifiedIdentity,
     forum: &handle::ForumHandle,
     topic_id: u64,
     route: &'static str,
     charge_fetch: impl FnOnce() -> Result<(), AuthError>,
 ) -> Result<forum_api::TopicInfo, AuthError> {
-    admit_linked_signer(state, identity, forum).await?;
     // Charged before the fetch and given back unless the author check fails.
     let signer = forum.external_id.as_str();
     state
@@ -2258,9 +2287,14 @@ struct ReportLogsBody {
 }
 
 /// Wallet-signed new logs for a topic the signer authored, from the app, with
-/// no browser and no attach session: the topic-mode checks of attach-logs,
-/// then a closed-topic refusal, the nonce, the wallet's logs budget, the
-/// decode, and the same staff delivery.
+/// no browser and no attach session: the forum link, the nonce, the wallet's
+/// logs budget, the topic-mode checks of attach-logs, a closed-topic refusal,
+/// the decode, and the same staff delivery.
+///
+/// No session meters these fetches, so the nonce and the budget come before
+/// the topic fetch: otherwise a member looping fresh nonces at his own topic,
+/// or at one that does not exist, orders a Discourse read per request and
+/// holds the topic gate that attach-logs and bind share.
 async fn forum_report_logs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2294,16 +2328,39 @@ async fn forum_report_logs(
         return Err(AuthError::PayloadTooLarge);
     }
     let forum = handle::derive(&state.handle_secret, &identity.pubkey);
-    let topic = authored_topic(
-        &state,
-        api,
-        identity,
-        &forum,
-        req.topic_id,
-        "report logs",
-        || Ok(()),
-    )
-    .await?;
+    // Before the nonce: a wallet that costs nothing to mint never reaches the
+    // nonce store.
+    admit_linked_signer(&state, identity, &forum).await?;
+    let _admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
+        tracing::info!(
+            topic_id = req.topic_id,
+            "report logs refused: nonce not admitted"
+        );
+    })?;
+    let signer = forum.external_id.as_str();
+    // Charged once the gate lets the fetch go, so a saturated gate spends
+    // none of it. Kept on a failed fetch: it is the one bound on the reads at
+    // a topic that does not exist, since the author-miss slot is given back
+    // then. Given back on a refused author check, which the author-miss
+    // budget bounds. Never refunded past the author check, so it also bounds
+    // the gunzips a wallet can order.
+    let topic = authored_topic(&state, api, &forum, req.topic_id, "report logs", || {
+        report_state
+            .logs_limiter
+            .admit(signer.to_owned(), now)
+            .inspect_err(|_| {
+                tracing::info!(
+                    topic_id = req.topic_id,
+                    "report logs refused: the wallet is over its logs budget"
+                );
+            })
+    })
+    .await
+    .inspect_err(|err| {
+        if matches!(err, AuthError::NotAuthor) {
+            report_state.logs_limiter.release(signer);
+        }
+    })?;
     // Discourse would take the system account's posts on a closed topic, but
     // staff closed it: new logs there would reopen a conversation they ended.
     if topic.locked {
@@ -2313,18 +2370,6 @@ async fn forum_report_logs(
         );
         return Err(AuthError::TopicClosed);
     }
-    let _admission = request.admit(&state.nonces, now_unix()).inspect_err(|_| {
-        tracing::info!(
-            topic_id = req.topic_id,
-            "report logs refused: nonce not admitted"
-        );
-    })?;
-    // Charged past the author check and the nonce, as the report is: a
-    // stranger's or a replayed request must not burn the author's budget.
-    // Never refunded, so it also bounds the gunzips a wallet can order.
-    report_state
-        .logs_limiter
-        .admit(forum.external_id.clone(), now)?;
     let (log_text, meta) = decode_report(&req.log_gz_b64, Some(req.topic_id))?;
     deliver_to_staff(api, req.topic_id, &topic, log_text, meta, now).await?;
     tracing::info!(topic_id = req.topic_id, "report logs attached");

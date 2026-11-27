@@ -72,6 +72,11 @@ pub enum AuthError {
     /// three answer the same.
     #[error("expired")]
     LoginTicketExpired,
+    /// A report login redeem that is not the report-login page's own
+    /// same-origin JSON fetch: a form or a script on another site, or a
+    /// browser that does not say where the request comes from.
+    #[error("cross_site")]
+    CrossSite,
     /// The Discourse-backed feature is not configured (no API key).
     #[error("feature disabled")]
     FeatureDisabled,
@@ -165,6 +170,13 @@ impl IntoResponse for AuthError {
             return (
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": "expired"})),
+            )
+                .into_response();
+        }
+        if matches!(self, AuthError::CrossSite) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "cross_site"})),
             )
                 .into_response();
         }

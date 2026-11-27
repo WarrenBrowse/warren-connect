@@ -1531,9 +1531,21 @@ fn ticket_of(login_url: &str) -> String {
         .to_owned()
 }
 
+/// The redeem the report-login page's own script sends: a same-origin fetch
+/// with a JSON body.
 fn redeem(token: &str) -> Request<Body> {
-    Request::post("/v1/report-login")
-        .header("content-type", "application/json")
+    redeem_with(token, Some("same-origin"), Some("application/json"))
+}
+
+fn redeem_with(token: &str, fetch_site: Option<&str>, content_type: Option<&str>) -> Request<Body> {
+    let mut builder = Request::post("/v1/report-login");
+    if let Some(site) = fetch_site {
+        builder = builder.header("sec-fetch-site", site);
+    }
+    if let Some(kind) = content_type {
+        builder = builder.header("content-type", kind);
+    }
+    builder
         .body(Body::from(serde_json::json!({"token": token}).to_string()))
         .expect("request")
 }
@@ -1752,6 +1764,107 @@ async fn the_forum_round_trip_without_the_cookie_shows_the_approval_page() {
 }
 
 #[tokio::test]
+async fn a_redeem_that_is_not_a_same_origin_json_fetch_is_refused_and_spends_nothing() {
+    // A web page anywhere can POST a form at this route (text/plain needs no
+    // preflight): honoured, it would sign the victim's browser into the
+    // account of whoever filed the report.
+    let stub = Arc::new(StubState::default());
+    let url = spawn_stub(stub.clone()).await;
+    let key = signer(0x49);
+    let state = state_with_staff(&url, &key, false);
+    let ticket = ticket_of(&report_login_url(&state, &key, [0x49; 16]).await);
+
+    for (site, kind) in [
+        (None, Some("application/json")),
+        (Some("cross-site"), Some("application/json")),
+        (Some("same-site"), Some("application/json")),
+        (Some("none"), Some("application/json")),
+        (Some("same-origin"), Some("text/plain")),
+        (
+            Some("same-origin"),
+            Some("application/x-www-form-urlencoded"),
+        ),
+        (Some("same-origin"), None),
+    ] {
+        let refused = send(&state, redeem_with(&ticket, site, kind)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{site:?} {kind:?}");
+        assert!(
+            header(&refused, "set-cookie").is_empty(),
+            "{site:?} {kind:?}"
+        );
+        assert_eq!(
+            body_json(refused).await,
+            serde_json::json!({"error": "cross_site"}),
+            "{site:?} {kind:?}"
+        );
+    }
+
+    let accepted = send(
+        &state,
+        redeem_with(
+            &ticket,
+            Some("same-origin"),
+            Some("application/json; charset=utf-8"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::OK,
+        "the ticket is still live"
+    );
+}
+
+/// `GET /report-login`, with the `Sec-Fetch-Site` the browser sent if any.
+async fn report_login_page_html(state: &Arc<AppState>, fetch_site: Option<&str>) -> String {
+    let mut builder = Request::get("/report-login");
+    if let Some(site) = fetch_site {
+        builder = builder.header("sec-fetch-site", site);
+    }
+    let response = send(state, builder.body(Body::empty()).expect("request")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("utf8")
+}
+
+#[tokio::test]
+async fn the_report_login_page_signs_in_by_itself_only_on_a_navigation_no_page_started() {
+    // `none` is what a browser sends for a URL handed over by the OS or an
+    // app (the desktop app's `shell.openExternal`) or typed in the address
+    // bar. Every other navigation was started by some web page, which may be
+    // an attacker's, carrying the link of his own report.
+    let state = test_state(None, None, 3);
+
+    let auto = report_login_page_html(&state, Some("none")).await;
+    assert!(auto.contains(r#"data-mode="auto""#), "{auto}");
+
+    for site in [
+        Some("cross-site"),
+        Some("same-site"),
+        Some("same-origin"),
+        Some("None"),
+        None,
+    ] {
+        let html = report_login_page_html(&state, site).await;
+        assert!(html.contains(r#"data-mode="confirm""#), "{site:?}");
+        assert!(!html.contains(r#"data-mode="auto""#), "{site:?}");
+        assert!(
+            html.contains("Continue only if you filed it from the Warren app"),
+            "{site:?}"
+        );
+        assert!(html.contains("Continue to your report"), "{site:?}");
+    }
+}
+
+#[tokio::test]
 async fn the_report_login_page_reads_its_fragment_under_its_own_csp() {
     let state = test_state(None, None, 3);
 
@@ -1835,10 +1948,20 @@ async fn logs_setup(
     author: Option<&str>,
     closed: bool,
 ) -> (Arc<StubState>, Arc<AppState>, SigningKey) {
+    let forum = handle::derive(HANDLE_SECRET, &signer(seed).verifying_key().to_bytes());
+    let topic = Some((author.unwrap_or(&forum.username).to_owned(), closed));
+    logs_setup_serving(seed, topic).await
+}
+
+/// A paid wallet with a forum link, the stub serving `topic` (`None`: 404).
+async fn logs_setup_serving(
+    seed: u8,
+    topic: Option<(String, bool)>,
+) -> (Arc<StubState>, Arc<AppState>, SigningKey) {
     let key = signer(seed);
     let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
     let stub = Arc::new(StubState {
-        topic: Some((author.unwrap_or(&forum.username).to_owned(), closed)),
+        topic,
         ..Default::default()
     });
     let url = spawn_stub(stub.clone()).await;
@@ -2029,10 +2152,87 @@ async fn the_seventh_logs_upload_of_a_wallet_in_the_hour_is_rate_limited() {
     .await;
 
     assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(count(&stub, "upload"), LOGS_PER_WALLET);
     assert_eq!(
-        ops(&stub).iter().filter(|op| *op == "upload").count(),
-        LOGS_PER_WALLET
+        count(&stub, "topic_fetch"),
+        LOGS_PER_WALLET,
+        "a request over the budget fetches no topic"
     );
+}
+
+fn count(stub: &StubState, op: &str) -> usize {
+    ops(stub).iter().filter(|o| *o == op).count()
+}
+
+#[tokio::test]
+async fn new_logs_aimed_at_a_topic_whose_fetch_fails_cost_the_budget_and_stop_there() {
+    // A failed fetch gives the author-miss slot back, so the logs budget is
+    // the one bound on the Discourse reads a member can order at a topic
+    // that does not exist, and on the shared topic gate they hold.
+    let (stub, state, key) = logs_setup_serving(0x5a, None).await;
+    let body = logs_body(4242, &gz_b64(REPORT));
+
+    for n in 0..LOGS_PER_WALLET + 4 {
+        let response = send(
+            &state,
+            signed_post(&key, LOGS_PATH, &body, [0x60 + n as u8; 16], now_unix()),
+        )
+        .await;
+        assert!(response.status().is_client_error() || response.status().is_server_error());
+    }
+
+    assert_eq!(count(&stub, "topic_fetch"), LOGS_PER_WALLET);
+    assert_eq!(count(&stub, "upload"), 0);
+}
+
+#[tokio::test]
+async fn new_logs_refused_as_not_the_author_give_the_budget_back_and_stop_at_the_miss_budget() {
+    let (stub, state, key) = logs_setup(0x5b, Some("someone-else"), false).await;
+    let body = logs_body(4242, &gz_b64(REPORT));
+
+    for n in 0..LOGS_PER_WALLET + 10 {
+        send(
+            &state,
+            signed_post(&key, LOGS_PATH, &body, [0x80 + n as u8; 16], now_unix()),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        count(&stub, "topic_fetch"),
+        10,
+        "the author-miss budget bounds a non-author's fetches"
+    );
+    let forum = handle::derive(HANDLE_SECRET, &key.verifying_key().to_bytes());
+    let logs = &state.report.as_ref().expect("report state").logs_limiter;
+    for n in 0..LOGS_PER_WALLET {
+        assert!(
+            logs.admit(forum.external_id.clone(), now_unix()).is_ok(),
+            "slot {n} of the logs budget is still free"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_replayed_logs_request_fetches_no_topic() {
+    let (stub, state, key) = logs_setup(0x5c, None, false).await;
+    let body = logs_body(4242, &gz_b64(REPORT));
+    let timestamp = now_unix();
+    let first = send(
+        &state,
+        signed_post(&key, LOGS_PATH, &body, [0x5c; 16], timestamp),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replay = send(
+        &state,
+        signed_post(&key, LOGS_PATH, &body, [0x5c; 16], timestamp),
+    )
+    .await;
+
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(count(&stub, "topic_fetch"), 1);
 }
 
 #[tokio::test]

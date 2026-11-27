@@ -536,6 +536,15 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
     )
 }
 
+/// Whether the report-login page spends its ticket by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportLoginMode {
+    /// A navigation no web page started: the page signs in at once.
+    Auto,
+    /// Any other navigation: the reader confirms with a button first.
+    Confirm,
+}
+
 /// The page a report's sign-in link opens in the default browser
 /// (`/report-login#t=<ticket>&topic=<id>`).
 ///
@@ -544,9 +553,18 @@ pub fn handoff_page(lang: Lang, nonce: &str) -> String {
 /// and the history before its one request. On any failure the reporter still
 /// gets a link to their topic, signed out, the topic checked as digits so the
 /// fragment cannot point the link anywhere else.
+///
+/// The redeem spends the ticket before the page decides what to show, so a
+/// page that ends on the expired state (cookies blocked, a refused redeem)
+/// never leaves a live ticket behind it. In [`ReportLoginMode::Confirm`] the
+/// ticket is spent at the click.
 #[must_use]
-pub fn report_login_page(lang: Lang, nonce: &str) -> String {
+pub fn report_login_page(lang: Lang, mode: ReportLoginMode, nonce: &str) -> String {
     let s = lang.strings();
+    let (mode_attr, state, confirm_hidden) = match mode {
+        ReportLoginMode::Auto => ("auto", s.r_working, " hidden"),
+        ReportLoginMode::Confirm => ("confirm", s.r_confirm, ""),
+    };
     format!(
         r##"<!doctype html>
 <html lang="{code}">
@@ -556,18 +574,20 @@ pub fn report_login_page(lang: Lang, nonce: &str) -> String {
 <meta name="robots" content="noindex">
 <title>{tab}</title>
 <style nonce="{nonce}">{style}{notice}
-  a.button{{display:inline-block;background:var(--primary);color:var(--primary-fg);
+  .button{{display:inline-block;background:var(--primary);color:var(--primary-fg);
     padding:.75rem 1.6rem;border-radius:10px;text-decoration:none;font-weight:600;
     margin:1.1rem 0 .3rem;transition:background .15s ease;}}
-  a.button:hover{{background:var(--primary-hover);}}
+  button.button{{border:0;font:inherit;font-weight:600;cursor:pointer;}}
+  .button:hover{{background:var(--primary-hover);}}
 </style>
 </head>
 <body>
-<div class="card">
+<div class="card" id="card" data-mode="{mode_attr}">
   <span class="brand">Warren</span>
   <div class="spark">&#10022;</div>
   <h1 id="heading" data-expired="{expired_heading}">{heading}</h1>
-  <p id="state" aria-live="polite" data-expired="{expired}">{working}</p>
+  <p id="state" aria-live="polite" data-expired="{expired}" data-working="{working}">{state}</p>
+  <p id="confirm"{confirm_hidden}><button class="button" id="continue" type="button">{continue_label}</button></p>
   <p id="fallback" hidden><a class="button" id="topic" href="{forum}/">{open_topic}</a></p>
   <hr class="rule">
   <p class="tagline">{tagline}</p>
@@ -575,12 +595,14 @@ pub fn report_login_page(lang: Lang, nonce: &str) -> String {
 <script nonce="{nonce}">
   const heading = document.getElementById('heading');
   const el = document.getElementById('state');
+  const confirmBox = document.getElementById('confirm');
   const params = new URLSearchParams(window.location.hash.slice(1));
   const token = params.get('t') || '';
   const topic = params.get('topic') || '';
   // Out of the address bar and the history before anything can read it.
   history.replaceState(null, '', window.location.pathname);
   const expired = () => {{
+    confirmBox.hidden = true;
     heading.textContent = heading.dataset.expired;
     el.textContent = el.dataset.expired;
     if (/^[0-9]{{1,19}}$/.test(topic)) {{
@@ -588,8 +610,10 @@ pub fn report_login_page(lang: Lang, nonce: &str) -> String {
     }}
     document.getElementById('fallback').hidden = false;
   }};
-  const run = async () => {{
-    if (!navigator.cookieEnabled || !/^[A-Za-z0-9_-]{{43}}$/.test(token)) {{ expired(); return; }}
+  // The ticket is spent first, whatever is shown after: a page that gave up
+  // before its request would leave it redeemable until it expires.
+  const redeem = async () => {{
+    let next = '';
     try {{
       const r = await fetch('/v1/report-login', {{
         method: 'POST',
@@ -597,18 +621,26 @@ pub fn report_login_page(lang: Lang, nonce: &str) -> String {
         body: JSON.stringify({{ token }}),
         signal: AbortSignal.timeout(10000),
       }});
-      if (!r.ok) {{ expired(); return; }}
-      const s = await r.json();
-      if (typeof s.next === 'string' && s.next.startsWith('{forum}/')) {{
-        location.replace(s.next);
-        return;
+      if (r.ok) {{
+        const s = await r.json();
+        if (typeof s.next === 'string' && s.next.startsWith('{forum}/')) {{ next = s.next; }}
       }}
-      expired();
-    }} catch (e) {{
-      expired();
-    }}
+    }} catch (e) {{}}
+    // Without the cookie the forum round trip would meet the approval page.
+    if (next && navigator.cookieEnabled) {{ location.replace(next); return; }}
+    expired();
   }};
-  run();
+  if (!/^[A-Za-z0-9_-]{{43}}$/.test(token)) {{
+    expired();
+  }} else if (document.getElementById('card').dataset.mode === 'auto') {{
+    redeem();
+  }} else {{
+    document.getElementById('continue').addEventListener('click', () => {{
+      confirmBox.hidden = true;
+      el.textContent = el.dataset.working;
+      redeem();
+    }}, {{ once: true }});
+  }}
 </script>
 </body>
 </html>"##,
@@ -618,6 +650,7 @@ pub fn report_login_page(lang: Lang, nonce: &str) -> String {
         notice = NOTICE_STYLE,
         heading = s.r_heading,
         working = s.r_working,
+        continue_label = s.r_continue,
         expired_heading = s.r_expired_heading,
         expired = s.r_expired,
         open_topic = s.r_open_topic,
@@ -1402,13 +1435,19 @@ mod tests {
 
     #[test]
     fn the_report_login_page_speaks_every_language_and_drops_its_fragment_first() {
-        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
-            let page = report_login_page(lang, NONCE);
+        for (lang, mode) in [Lang::En, Lang::Fr, Lang::Ro].into_iter().flat_map(|lang| {
+            [
+                (lang, ReportLoginMode::Auto),
+                (lang, ReportLoginMode::Confirm),
+            ]
+        }) {
+            let page = report_login_page(lang, mode, NONCE);
             let s = lang.strings();
             assert!(page.contains(&format!(r#"lang="{}""#, lang.code())));
             for text in [
                 s.r_heading,
                 s.r_working,
+                s.r_continue,
                 s.r_expired_heading,
                 s.r_expired,
                 s.r_open_topic,
@@ -1432,6 +1471,47 @@ mod tests {
         }
         assert_ne!(Lang::Fr.strings().r_expired, Lang::En.strings().r_expired);
         assert_ne!(Lang::Ro.strings().r_expired, Lang::En.strings().r_expired);
+        assert_ne!(Lang::Fr.strings().r_confirm, Lang::En.strings().r_confirm);
+        assert_ne!(Lang::Ro.strings().r_confirm, Lang::En.strings().r_confirm);
+    }
+
+    #[test]
+    fn the_report_login_page_spends_its_ticket_before_it_decides_what_to_show() {
+        // A page that gave up before its request (cookies blocked) left the
+        // ticket redeemable for its whole lifetime.
+        let page = report_login_page(Lang::En, ReportLoginMode::Auto, NONCE);
+        let redeem = page.find("const redeem").expect("one redeem");
+        let posted = page[redeem..].find("fetch(").expect("posts") + redeem;
+        let cookies = page[redeem..]
+            .find("navigator.cookieEnabled")
+            .expect("checks cookies")
+            + redeem;
+        assert!(
+            posted < cookies,
+            "the ticket is spent before the cookie check"
+        );
+        assert_eq!(
+            page.matches("navigator.cookieEnabled").count(),
+            1,
+            "no cookie check ahead of the redeem"
+        );
+        assert_eq!(page.matches("fetch(").count(), 1);
+        assert_eq!(page.matches("redeem();").count(), 2, "auto, and the click");
+    }
+
+    #[test]
+    fn the_report_login_page_shows_its_button_only_in_confirm_mode() {
+        let auto = report_login_page(Lang::En, ReportLoginMode::Auto, NONCE);
+        assert!(auto.contains(r#"<p id="confirm" hidden><button"#));
+        assert!(auto.contains(&format!(">{}</p>", Lang::En.strings().r_working)));
+        for lang in [Lang::En, Lang::Fr, Lang::Ro] {
+            let confirm = report_login_page(lang, ReportLoginMode::Confirm, NONCE);
+            let text = lang.strings().r_confirm;
+            assert!(confirm.contains(r#"<p id="confirm"><button"#), "{lang:?}");
+            assert!(confirm.contains(&format!(">{text}</p>")), "{lang:?}");
+            assert!(!text.contains('"'), "{lang:?}");
+            assert!(confirm.contains(r#"addEventListener('click'"#));
+        }
     }
 
     #[test]
